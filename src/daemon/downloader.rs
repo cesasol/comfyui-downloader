@@ -424,6 +424,46 @@ async fn download_preview(url: &str, path: &PathBuf) {
     }
 }
 
+/// Write metadata and/or download a preview image for a model file that was not
+/// downloaded by this daemon (e.g. discovered by the startup scanner).
+/// Pass `write_meta = false` to skip metadata if it already exists.
+/// Pass `write_preview = false` to skip preview if it already exists.
+pub(crate) async fn save_artifacts(
+    dest: &PathBuf,
+    version: ModelVersion,
+    sha256: &str,
+    write_meta: bool,
+    write_preview: bool,
+) {
+    let model_name = version.model.as_ref().map(|m| m.name.clone());
+    let base_model = version.base_model.clone();
+    let preview_image_url = version.images.first().map(|img| img.url.clone());
+    let preview_nsfw_level = version.images.first().and_then(|img| img.nsfw_level);
+    let preview_path = preview_image_url.as_deref().map(|url| {
+        let ext = url.split('?').next().unwrap_or(url).rsplit('.').next().unwrap_or("jpg");
+        dest.with_extension(format!("preview.{ext}"))
+    });
+    let resolution = VersionResolution {
+        download_url: String::new(),
+        expected_hash: None,
+        model_type_subdir: None,
+        base_model,
+        filename: None,
+        model_name,
+        preview_image_url: preview_image_url.clone(),
+        preview_nsfw_level,
+        model_version: Some(version),
+    };
+    if write_meta {
+        write_metadata(dest, &resolution, sha256, preview_path.as_ref()).await;
+    }
+    if write_preview {
+        if let (Some(url), Some(path)) = (preview_image_url.as_deref(), preview_path.as_ref()) {
+            download_preview(url, path).await;
+        }
+    }
+}
+
 fn check_disk_space(dir: &PathBuf) -> Result<()> {
     let stat = free_disk_bytes(dir)?;
     if stat < 1024 * 1024 * 1024 {

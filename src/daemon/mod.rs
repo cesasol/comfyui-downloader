@@ -1,6 +1,7 @@
 pub mod downloader;
 pub mod notifier;
 pub mod queue;
+pub mod scanner;
 pub mod updater;
 
 use crate::catalog::Catalog;
@@ -30,6 +31,14 @@ pub async fn run() -> Result<()> {
     let active: ActiveTasks = Arc::new(Mutex::new(HashMap::new()));
     let progress: ProgressMap = Arc::new(Mutex::new(HashMap::new()));
     let update_wake: Arc<Notify> = Arc::new(Notify::new());
+
+    let scanner_handle = {
+        let cfg = config.clone();
+        let civ = civitai.clone();
+        tokio::spawn(async move {
+            scanner::run(cfg, civ).await;
+        })
+    };
 
     let queue_handle = {
         let cfg = config.clone();
@@ -69,6 +78,7 @@ pub async fn run() -> Result<()> {
         })
         .await?;
 
+    scanner_handle.abort();
     queue_handle.abort();
     updater_handle.abort();
     Ok(())

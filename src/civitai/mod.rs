@@ -32,6 +32,11 @@ impl CivitaiClient {
         self.get_json(&url).await
     }
 
+    pub async fn get_model_version_by_hash(&self, sha256: &str) -> Result<ModelVersion> {
+        let url = format!("{BASE_URL}/model-versions/by-hash/{sha256}");
+        self.get_json(&url).await
+    }
+
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
         let key = self.api_key.as_deref()
             .ok_or_else(|| anyhow::anyhow!("CivitAI API key is not configured (set civitai.api_key in config.toml)"))?;
