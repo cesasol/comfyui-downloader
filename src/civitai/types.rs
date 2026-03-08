@@ -29,6 +29,14 @@ pub struct ModelVersion {
     pub files: Vec<ModelFile>,
     /// Nested model info (present in /model-versions/{id} responses).
     pub model: Option<ModelVersionModel>,
+    #[serde(default)]
+    pub images: Vec<ModelImage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelImage {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,14 +99,22 @@ impl ModelType {
         }
     }
 
-    /// Like `models_subdir` but routes checkpoints based on the file's `metadata.size`:
-    /// - "pruned" → `diffusion_models` (quantised / pruned weights)
-    /// - "full" or unknown → `checkpoints`
-    pub fn models_subdir_for_file(&self, file: &ModelFile) -> &'static str {
+    /// Like `models_subdir` but routes Flux checkpoints with `metadata.size == "pruned"`
+    /// to `diffusion_models`; all other checkpoints go to `checkpoints`.
+    pub fn models_subdir_for_file(&self, file: &ModelFile, base_model: Option<&str>) -> &'static str {
         if matches!(self, Self::Checkpoint) {
-            match file.metadata.as_ref().and_then(|m| m.size.as_deref()) {
-                Some("pruned") => "diffusion_models",
-                _ => "checkpoints",
+            let is_flux = base_model
+                .map(|b| b.to_ascii_lowercase().contains("flux"))
+                .unwrap_or(false);
+            let is_pruned = file
+                .metadata
+                .as_ref()
+                .and_then(|m| m.size.as_deref())
+                == Some("pruned");
+            if is_flux && is_pruned {
+                "diffusion_models"
+            } else {
+                "checkpoints"
             }
         } else {
             self.models_subdir()

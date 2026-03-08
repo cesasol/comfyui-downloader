@@ -25,6 +25,7 @@ struct VersionResolution {
     version_id: Option<u64>,
     model_name: Option<String>,
     version_name: Option<String>,
+    preview_image_url: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -57,13 +58,13 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 .find(|f| f.primary == Some(true))
                 .or_else(|| version.files.first())
                 .context("no files in version metadata")?;
-            let model_type_subdir = Some(model_info.r#type.models_subdir_for_file(file).to_string());
             let base_model = model_info
                 .model_versions
                 .iter()
                 .find(|v| v.id == version_id)
                 .and_then(|v| v.base_model.clone())
                 .or_else(|| version.base_model.clone());
+            let model_type_subdir = Some(model_info.r#type.models_subdir_for_file(file, base_model.as_deref()).to_string());
             let download_url = file
                 .download_url
                 .clone()
@@ -79,6 +80,7 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 version_id: Some(version_id),
                 model_name: Some(model_info.name),
                 version_name: Some(version.name),
+                preview_image_url: version.images.first().map(|img| img.url.clone()),
             })
         }
 
@@ -94,11 +96,11 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 .find(|f| f.primary == Some(true))
                 .or_else(|| version.files.first())
                 .context("no files in version metadata")?;
+            let base_model = version.base_model.clone();
             let model_type_subdir = version
                 .model
                 .as_ref()
-                .map(|m| m.r#type.models_subdir_for_file(file).to_string());
-            let base_model = version.base_model.clone();
+                .map(|m| m.r#type.models_subdir_for_file(file, base_model.as_deref()).to_string());
             let model_name = version.model.as_ref().map(|m| m.name.clone());
             let version_name = Some(version.name.clone());
             let download_url = file
@@ -116,6 +118,7 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 version_id: Some(version_id),
                 model_name,
                 version_name,
+                preview_image_url: version.images.first().map(|img| img.url.clone()),
             })
         }
 
@@ -143,7 +146,7 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 .find(|f| f.primary == Some(true))
                 .or_else(|| version.files.first())
                 .context("no files in latest version")?;
-            let model_type_subdir = Some(model_info.r#type.models_subdir_for_file(file).to_string());
+            let model_type_subdir = Some(model_info.r#type.models_subdir_for_file(file, base_model.as_deref()).to_string());
             let download_url = file
                 .download_url
                 .clone()
@@ -159,6 +162,7 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 version_id: Some(version_id),
                 model_name: Some(model_info.name),
                 version_name,
+                preview_image_url: version.images.first().map(|img| img.url.clone()),
             })
         }
 
@@ -174,6 +178,7 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 version_id: None,
                 model_name: None,
                 version_name: None,
+                preview_image_url: None,
             })
         }
     }
@@ -323,6 +328,9 @@ pub async fn download(
 
     fs::rename(&tmp, &dest).await?;
     write_metadata(&dest, &resolution, &digest, &job.url).await;
+    if let Some(ref url) = resolution.preview_image_url {
+        download_preview(&dest, url).await;
+    }
     Ok((dest, resolution.model_type_subdir))
 }
 
@@ -346,6 +354,31 @@ async fn write_metadata(dest: &PathBuf, resolution: &VersionResolution, sha256: 
             }
         }
         Err(e) => warn!("Failed to serialise metadata: {e}"),
+    }
+}
+
+async fn download_preview(dest: &PathBuf, url: &str) {
+    let ext = url.split('?').next().unwrap_or(url).rsplit('.').next().unwrap_or("jpg");
+    let preview_path = dest.with_extension(format!("preview.{ext}"));
+    if preview_path.exists() {
+        return;
+    }
+    let http = reqwest::Client::new();
+    match http.get(url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.bytes().await {
+                Ok(bytes) => {
+                    if let Err(e) = tokio::fs::write(&preview_path, &bytes).await {
+                        warn!("Failed to write preview image {}: {e}", preview_path.display());
+                    } else {
+                        info!("Preview saved: {}", preview_path.display());
+                    }
+                }
+                Err(e) => warn!("Failed to read preview image bytes: {e}"),
+            }
+        }
+        Ok(resp) => warn!("Preview image request failed with status {}", resp.status()),
+        Err(e) => warn!("Failed to fetch preview image: {e}"),
     }
 }
 
