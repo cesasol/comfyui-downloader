@@ -11,13 +11,13 @@ Scaffolded code that needs to be finished.
 - [ ] **[high]** Implement update checker: query `CivitaiClient::get_model`, compare
   `model_versions[0].id` with stored `version_id`, enqueue newer version and call
   `notify_update_available` (`src/daemon/updater.rs`)
-- [ ] **[high]** Honour `max_concurrent_downloads` config: replace sequential queue loop
+- [x] **[high]** Honour `max_concurrent_downloads` config: replace sequential queue loop
   with a semaphore-bounded pool (`src/daemon/queue.rs`, `tokio::sync::Semaphore`)
-- [ ] **[medium]** Persist `dest_path` to catalog after successful download
+- [x] **[medium]** Persist `dest_path` to catalog after successful download
   (`src/daemon/queue.rs` → `src/daemon/downloader.rs` return value)
-- [ ] **[medium]** Implement `GetStatus` response with real data: queue length, active
+- [x] **[medium]** Implement `GetStatus` response with real data: queue length, active
   download progress, free disk space (`src/daemon/mod.rs`)
-- [ ] **[medium]** Implement download cancellation: signal the in-flight downloader task
+- [x] **[medium]** Implement download cancellation: signal the in-flight downloader task
   to abort when `Cancel { id }` is received (currently only sets the DB flag)
 - [ ] **[low]** Wire `CheckUpdates` IPC command to immediately wake the updater task
   instead of waiting for the next poll interval

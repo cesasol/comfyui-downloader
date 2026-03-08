@@ -3,7 +3,6 @@ use crate::civitai::CivitaiClient;
 use crate::config::Config;
 use crate::daemon::queue::{DownloadProgress, ProgressMap};
 use anyhow::{bail, Context, Result};
-use bytes::Bytes;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -17,7 +16,7 @@ pub async fn download(
     job: &DownloadJob,
     config: &Config,
     civitai: &CivitaiClient,
-    _token: CancellationToken,
+    token: CancellationToken,
     progress: ProgressMap,
 ) -> Result<PathBuf> {
     // Parse model/version IDs from the URL if not already resolved.
@@ -67,15 +66,29 @@ pub async fn download(
     let mut stream = resp.bytes_stream();
     let mut bytes_received: u64 = 0;
 
-    while let Some(chunk) = stream.next().await {
-        let chunk: Bytes = chunk.context("reading chunk")?;
-        bytes_received += chunk.len() as u64;
-        hasher.update(&chunk);
-        file.write_all(&chunk).await?;
-        {
-            let mut prog = progress.lock().await;
-            if let Some(entry) = prog.get_mut(&job.id) {
-                entry.bytes_received = bytes_received;
+    loop {
+        tokio::select! {
+            chunk = stream.next() => {
+                match chunk {
+                    Some(Ok(chunk)) => {
+                        bytes_received += chunk.len() as u64;
+                        hasher.update(&chunk);
+                        file.write_all(&chunk).await?;
+                        {
+                            let mut prog = progress.lock().await;
+                            if let Some(entry) = prog.get_mut(&job.id) {
+                                entry.bytes_received = bytes_received;
+                            }
+                        }
+                    }
+                    Some(Err(e)) => return Err(anyhow::Error::from(e)).context("reading chunk"),
+                    None => break,
+                }
+            }
+            _ = token.cancelled() => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&tmp).await;
+                bail!("download cancelled");
             }
         }
     }
@@ -119,4 +132,26 @@ fn parse_filename_from_cd(header: &str) -> Option<String> {
             part.strip_prefix("filename=")
                 .map(|s| s.trim_matches('"').to_string())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn test_cancellation_token_stops_loop() {
+        use tokio::time::{timeout, Duration};
+        use tokio_util::sync::CancellationToken;
+
+        let token = CancellationToken::new();
+        let t = token.clone();
+
+        let result = timeout(Duration::from_millis(200), async move {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(60)) => "slept",
+                _ = t.cancelled() => "cancelled",
+            }
+        });
+
+        token.cancel();
+        assert_eq!(result.await.unwrap(), "cancelled");
+    }
 }
