@@ -87,10 +87,11 @@ pub async fn run(
                     let _ = cat.set_status(job_id, JobStatus::Cancelled, None);
                 }
                 Err(e) => {
-                    error!("Job {job_id} failed: {e}");
+                    let msg = format!("{e:#}");
+                    error!("Job {job_id} failed: {msg}");
                     let cat = cat.lock().await;
-                    let _ = cat.set_status(job_id, JobStatus::Failed, Some(&e.to_string()));
-                    let _ = notifier::notify_error(&e.to_string());
+                    let _ = cat.set_status(job_id, JobStatus::Failed, Some(&msg));
+                    let _ = notifier::notify_error(&msg);
                 }
             }
 
