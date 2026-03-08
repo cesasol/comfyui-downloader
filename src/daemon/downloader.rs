@@ -31,7 +31,38 @@ pub async fn download(
         .ok_or_else(|| anyhow::anyhow!("CivitAI API key is not configured (set civitai.api_key in config.toml)"))?;
 
     let http = reqwest::Client::new();
-    let resp = http.get(&job.url).bearer_auth(key).send().await.context("starting download")?;
+
+    // When we know the version_id, resolve the real download URL and expected hash from
+    // the CivitAI API rather than using whatever URL the user provided (which may be a
+    // model page URL that returns HTML instead of the model file).
+    let (download_url, expected_hash) = if let Some(version_id) = job.version_id {
+        let version = civitai
+            .get_model_version(version_id)
+            .await
+            .context("fetching version metadata")?;
+        let file = version
+            .files
+            .iter()
+            .find(|f| f.primary == Some(true))
+            .or_else(|| version.files.first())
+            .context("no files in version metadata")?;
+        let url = file
+            .download_url
+            .clone()
+            .with_context(|| format!("no downloadUrl for file {} in version {version_id}", file.name))?;
+        info!("Resolved download URL for version {version_id}: {url}");
+        (url, file.hashes.sha256.clone())
+    } else {
+        tracing::warn!("No version_id for job {}; using stored URL without checksum verification", job.id);
+        (job.url.clone(), None)
+    };
+
+    let resp = http
+        .get(&download_url)
+        .bearer_auth(key)
+        .send()
+        .await
+        .context("starting download")?;
     if !resp.status().is_success() {
         bail!("download failed with status {}", resp.status());
     }
@@ -42,14 +73,14 @@ pub async fn download(
         prog.insert(job.id, DownloadProgress { bytes_received: 0, total_bytes });
     }
 
-    // Derive filename from Content-Disposition or URL.
+    // Derive filename from Content-Disposition or the download URL.
     let filename = resp
         .headers()
         .get("content-disposition")
         .and_then(|v| v.to_str().ok())
         .and_then(parse_filename_from_cd)
         .unwrap_or_else(|| {
-            job.url
+            download_url
                 .split('/')
                 .last()
                 .unwrap_or("model.bin")
@@ -96,34 +127,14 @@ pub async fn download(
     let digest = hex::encode(hasher.finalize());
     info!("SHA-256: {digest}");
 
-    if let Some(version_id) = job.version_id {
-        let version = civitai
-            .get_model_version(version_id)
-            .await
-            .context("fetching version metadata for checksum")?;
-        let matched_file = version
-            .files
-            .iter()
-            .find(|f| f.name == filename)
-            .or_else(|| version.files.iter().find(|f| f.primary == Some(true)))
-            .or_else(|| version.files.first());
-        info!(
-            "Verifying against file: {}",
-            matched_file.map(|f| f.name.as_str()).unwrap_or("<none>")
-        );
-        let expected = matched_file.and_then(|f| f.hashes.sha256.as_deref());
-
-        if expected.is_none() {
-            tracing::warn!("No SHA-256 hash available for version {version_id}, skipping verification");
-        } else if !checksums_match(&digest, expected) {
+    if let Some(expected) = expected_hash.as_deref() {
+        if !checksums_match(&digest, Some(expected)) {
             fs::remove_file(&tmp).await?;
-            bail!(
-                "checksum mismatch: computed {digest}, expected {}",
-                expected.unwrap_or("unknown")
-            );
-        } else {
-            info!("Checksum verified");
+            bail!("checksum mismatch: computed {digest}, expected {expected}");
         }
+        info!("Checksum verified");
+    } else {
+        tracing::warn!("No SHA-256 hash available, skipping verification");
     }
 
     fs::rename(&tmp, &dest).await?;

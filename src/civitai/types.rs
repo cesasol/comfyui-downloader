@@ -28,6 +28,7 @@ pub struct ModelFile {
     pub size_kb: f64,
     pub hashes: FileHashes,
     pub primary: Option<bool>,
+    pub download_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
