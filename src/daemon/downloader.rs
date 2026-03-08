@@ -27,13 +27,11 @@ pub async fn download(
 
     check_disk_space(&dest_dir)?;
 
-    let http = reqwest::Client::new();
-    let mut req = http.get(&job.url);
-    if let Some(key) = &config.civitai.api_key {
-        req = req.bearer_auth(key);
-    }
+    let key = config.civitai.api_key.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("CivitAI API key is not configured (set civitai.api_key in config.toml)"))?;
 
-    let resp = req.send().await.context("starting download")?;
+    let http = reqwest::Client::new();
+    let resp = http.get(&job.url).bearer_auth(key).send().await.context("starting download")?;
     if !resp.status().is_success() {
         bail!("download failed with status {}", resp.status());
     }

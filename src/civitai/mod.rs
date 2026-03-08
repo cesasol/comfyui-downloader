@@ -33,13 +33,11 @@ impl CivitaiClient {
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
+        let key = self.api_key.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("CivitAI API key is not configured (set civitai.api_key in config.toml)"))?;
         let mut attempts = 0u32;
         loop {
-            let mut req = self.http.get(url);
-            if let Some(key) = &self.api_key {
-                req = req.bearer_auth(key);
-            }
-            let resp = req.send().await.context("sending request")?;
+            let resp = self.http.get(url).bearer_auth(key).send().await.context("sending request")?;
 
             match resp.status() {
                 StatusCode::TOO_MANY_REQUESTS => {
