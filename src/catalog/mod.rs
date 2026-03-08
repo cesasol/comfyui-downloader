@@ -76,6 +76,17 @@ impl Catalog {
         self.get_job(id)?.context("job not found after insert")
     }
 
+    /// Enqueue a new version of an already-downloaded model.
+    pub fn enqueue_version_update(
+        &self,
+        _model_id: u64,
+        new_version_id: u64,
+        model_type: Option<&str>,
+    ) -> Result<DownloadJob> {
+        let url = format!("https://civitai.com/api/download/models/{new_version_id}");
+        self.enqueue(&url, model_type)
+    }
+
     pub fn get_job(&self, id: Uuid) -> Result<Option<DownloadJob>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, url, model_id, version_id, model_type, dest_path, status,
@@ -218,5 +229,17 @@ mod tests {
             parse_civitai_url("https://civitai.com/download/models/99999");
         assert_eq!(model_id, None);
         assert_eq!(version_id, Some(99999));
+    }
+
+    #[test]
+    fn test_enqueue_version_update() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog
+            .enqueue_version_update(12345, 67890, Some("checkpoints"))
+            .unwrap();
+        assert_eq!(job.model_id, None); // URL-parsed: download URL only has version_id
+        assert_eq!(job.version_id, Some(67890));
+        assert_eq!(job.model_type.as_deref(), Some("checkpoints"));
+        assert_eq!(job.status, JobStatus::Queued);
     }
 }
