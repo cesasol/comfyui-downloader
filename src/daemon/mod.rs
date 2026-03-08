@@ -21,8 +21,7 @@ pub async fn run() -> Result<()> {
     let config = Arc::new(config);
 
     let catalog = Arc::new(Mutex::new(Catalog::open(
-        &dirs::data_local_dir()
-            .unwrap_or_default()
+        &crate::config::xdg_data_home()
             .join("comfyui-downloader")
             .join("catalog.db"),
     )?));

@@ -37,6 +37,8 @@ pub struct ModelVersion {
 #[serde(rename_all = "camelCase")]
 pub struct ModelImage {
     pub url: String,
+    #[serde(default)]
+    pub nsfw_level: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

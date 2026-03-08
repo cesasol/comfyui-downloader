@@ -40,10 +40,8 @@ impl Default for CivitaiConfig {
 
 impl Default for PathsConfig {
     fn default() -> Self {
-        let base = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("~/.local/share"));
         Self {
-            models_dir: base.join("comfyui").join("models"),
+            models_dir: xdg_data_home().join("comfyui").join("models"),
         }
     }
 }
@@ -105,8 +103,27 @@ fn default_true() -> bool {
 }
 
 fn config_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
+    xdg_config_home()
         .join("comfyui-downloader")
         .join("config.toml")
+}
+
+/// Returns `$XDG_CONFIG_HOME`, falling back to `$HOME/.config`.
+pub fn xdg_config_home() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".config"))
+}
+
+/// Returns `$XDG_DATA_HOME`, falling back to `$HOME/.local/share`.
+pub fn xdg_data_home() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".local/share"))
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/root"))
 }
