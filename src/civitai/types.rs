@@ -16,7 +16,7 @@ pub struct ModelVersion {
     pub name: String,
     pub model_id: u64,
     pub created_at: String,
-    pub download_url: String,
+    pub download_url: Option<String>,
     pub files: Vec<ModelFile>,
 }
 
@@ -24,6 +24,7 @@ pub struct ModelVersion {
 #[serde(rename_all = "camelCase")]
 pub struct ModelFile {
     pub name: String,
+    #[serde(rename = "sizeKB")]
     pub size_kb: f64,
     pub hashes: FileHashes,
     pub primary: Option<bool>,
