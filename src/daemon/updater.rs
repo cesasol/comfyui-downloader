@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::daemon::notifier;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
@@ -12,6 +12,7 @@ pub async fn run(
     config: Arc<Config>,
     catalog: Arc<Mutex<Catalog>>,
     civitai: Arc<CivitaiClient>,
+    wake: Arc<Notify>,
 ) {
     let interval = Duration::from_secs(config.daemon.update_interval_hours * 3600);
     loop {
@@ -19,7 +20,12 @@ pub async fn run(
         if let Err(e) = check_updates(&catalog, &civitai).await {
             error!("Update check failed: {e}");
         }
-        sleep(interval).await;
+        tokio::select! {
+            _ = sleep(interval) => {}
+            _ = wake.notified() => {
+                info!("Update check woken by CheckUpdates command");
+            }
+        }
     }
 }
 
@@ -84,5 +90,26 @@ mod tests {
         assert!(super::is_newer(200, 100));
         assert!(!super::is_newer(100, 100));
         assert!(!super::is_newer(50, 100));
+    }
+
+    #[tokio::test]
+    async fn test_notify_wakes_select() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+        use tokio::time::{timeout, Duration};
+
+        let notify = Arc::new(Notify::new());
+        let n = notify.clone();
+
+        // Race: notified() vs a 1-hour sleep. After cancel, notified should win.
+        let result = timeout(Duration::from_millis(200), async move {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(3600)) => "sleep",
+                _ = n.notified() => "notified",
+            }
+        });
+
+        notify.notify_one();
+        assert_eq!(result.await.unwrap(), "notified");
     }
 }
