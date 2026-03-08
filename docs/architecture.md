@@ -19,12 +19,13 @@ The CLI binary does **not** share in-process state with the daemon. It connects 
 
 `daemon::run()` (`src/daemon/mod.rs`):
 
-1. Load `Config` from TOML (`src/config.rs`).
-2. Open SQLite catalog at `~/.local/share/comfyui-downloader/catalog.db` and run schema migrations.
+1. Load `Config` from TOML (`src/config.rs`); immediately re-save it to sync any new fields added since last run.
+2. Open SQLite catalog at `$XDG_DATA_HOME/comfyui-downloader/catalog.db` and run schema migrations.
 3. Construct a `CivitaiClient` wrapping a `reqwest::Client`.
-4. Spawn **queue task** (`daemon::queue::run`) — processes pending download jobs.
-5. Spawn **updater task** (`daemon::updater::run`) — periodically checks for newer model versions.
-6. Bind the Unix socket and enter the IPC accept loop.
+4. Spawn **scanner task** (`daemon::scanner::run`) — walks existing model files and backfills missing metadata/preview images.
+5. Spawn **queue task** (`daemon::queue::run`) — processes pending download jobs.
+6. Spawn **updater task** (`daemon::updater::run`) — periodically checks for newer model versions.
+7. Bind the Unix socket and enter the IPC accept loop.
 
 The three shared resources (`Config`, `Catalog`, `CivitaiClient`) are wrapped in `Arc` and cloned into each task. `Catalog` additionally uses `tokio::sync::Mutex` because the lock is held across `.await` points.
 
@@ -51,8 +52,8 @@ Communication between the CLI and daemon uses a Unix domain socket at `/run/user
 | `add_download` | `url`, `model_type?` | Enqueue a CivitAI URL |
 | `list_queue` | — | Return all jobs from the catalog |
 | `check_updates` | — | Trigger an immediate update scan |
-| `get_status` | — | Daemon health ping |
-| `cancel` | `id` (UUID) | Set a job to `cancelled` |
+| `get_status` | — | Queue length, active progress, free disk bytes |
+| `cancel` | `id` (UUID) | Cancel a queued or active download |
 
 ### Server (`server.rs`)
 
@@ -74,8 +75,8 @@ A SQLite database accessed through `rusqlite` (compiled with the `bundled` featu
 CREATE TABLE jobs (
     id          TEXT PRIMARY KEY,   -- UUID v4 as string
     url         TEXT NOT NULL,
-    model_id    INTEGER,            -- CivitAI model ID (resolved later)
-    version_id  INTEGER,            -- CivitAI version ID (resolved later)
+    model_id    INTEGER,            -- CivitAI model ID (resolved from URL)
+    version_id  INTEGER,            -- CivitAI version ID (resolved from URL)
     model_type  TEXT,               -- subdirectory name, e.g. "loras"
     dest_path   TEXT,               -- absolute path after download
     status      TEXT NOT NULL,      -- see JobStatus below
@@ -110,41 +111,76 @@ Queued → Downloading → Verifying → Done
 
 ### Queue task (`queue.rs`)
 
-Polls `catalog.next_queued()` in a tight loop (sleeping 5 s when idle). For each job:
+A `Semaphore` with `max_concurrent_downloads` permits bounds concurrency. The loop acquires a permit before polling `catalog.next_queued()` (sleeping 5 s when idle). For each job:
 
 1. Sets status → `Downloading`.
-2. Calls `downloader::download`.
-3. On success: sets status → `Done`, fires `notify_success`.
-4. On failure: sets status → `Failed` with error text, fires `notify_error`.
+2. Creates a `CancellationToken` and registers it in `ActiveTasks`.
+3. Spawns a task that calls `downloader::download`.
+4. On success: persists `dest_path` and resolved `model_type`, sets status → `Done`, fires `notify_success`.
+5. On cancellation: sets status → `Cancelled`.
+6. On failure: sets status → `Failed` with error text, fires `notify_error`.
 
-Currently processes one job at a time (concurrency enforcement is a TODO).
+The semaphore permit is held by the spawned task and released automatically when it finishes, allowing the next job to start.
 
 ### Downloader (`downloader.rs`)
 
-1. Resolves the destination directory: `models_dir / model_type` (falls back to `other`).
-2. Checks available disk space via `libc::statvfs` — aborts if < 1 GiB free.
-3. Sends a `GET` request with optional `Bearer` auth; streams bytes to a `.tmp` file while computing a running SHA-256 hash.
-4. On stream completion, logs the digest and atomically renames `.tmp` → final path.
+**API resolution** (`resolve_version`): Before any HTTP download, the downloader calls the CivitAI API to obtain the authoritative download URL, expected SHA-256 hash, model type subdirectory, base model name, and preview image URL. Three resolution paths:
 
-Filename is derived from the `Content-Disposition` response header (`filename=` parameter) or the last URL path segment.
+- Both `model_id` + `version_id` known → parallel `get_model` + `get_model_version` calls.
+- Only `version_id` → single `get_model_version` call.
+- Only `model_id` → `get_model` then `get_model_version` for the latest non-EarlyAccess version.
+- Neither → falls back to the stored URL with no hash verification.
 
-> **Note:** Checksum comparison against the CivitAI-reported hash is implemented as a TODO — the hash is computed but not yet validated.
+**Download path**: `models_dir / model_type_subdir / base_model / filename`
+
+- `model_type_subdir` is derived from the CivitAI `ModelType` (see mapping table below).
+- `base_model` is the CivitAI base model string (e.g. `"Flux.1 D"`), sanitised for filesystem use.
+- Spaces are preserved in directory names.
+
+**Download steps**:
+
+1. Check if the target file already exists — skip the entire download if so.
+2. Check available disk space via `libc::statvfs` — abort if < 1 GiB free.
+3. Stream bytes from the download URL (Bearer auth) to a `.tmp` file, computing a running SHA-256 hash.
+4. On stream completion, compare the computed hash against the CivitAI-reported value; delete the `.tmp` file and bail on mismatch.
+5. Atomically rename `.tmp` → final path.
+6. Write a `.metadata.json` sidecar with file info, SHA-256, base model, and the full CivitAI API response.
+7. Download the preview image to `filename.preview.{ext}` alongside the model file.
+
+Progress notifications are updated every 10% via `notify_download_start` / `update_download_progress` / `close_download_notification`.
+
+### Scanner (`scanner.rs`)
+
+Runs once at daemon startup. Walks every known model subdirectory (`checkpoints`, `diffusion_models`, `loras`, `vae`, `controlnet`, `embeddings`, `upscale_models`, `other`) looking for model files (`.safetensors`, `.gguf`, `.pt`, `.pth`, `.bin`, `.ckpt`) that are missing a `.metadata.json` or `.preview.*` sidecar. For each such file:
+
+1. Computes the SHA-256 hash of the file (blocking task pool).
+2. Calls `CivitaiClient::get_model_version_by_hash` to identify the model.
+3. Writes missing metadata and/or preview image via `downloader::save_artifacts`.
+
+The scanner skips silently if no API key is configured.
 
 ### Updater task (`updater.rs`)
 
-Sleeps for `update_interval_hours` between runs. On each run, iterates all `Done` jobs that have a `version_id`, compares against the CivitAI API to find newer versions, and would enqueue them.
+Runs immediately, then sleeps for `update_interval_hours` between runs (can be woken early by the `CheckUpdates` IPC command via a `tokio::sync::Notify`).
 
-> **Note:** The comparison logic is a stub — the structure is in place but API calls are not yet wired up.
+On each run, iterates all `Done` jobs that have both a `model_id` and `version_id`. One representative job per `model_id` is checked. For each:
+
+1. Calls `civitai.get_model(model_id)` to fetch the current version list.
+2. Compares the latest version ID against the stored `version_id` (newer = larger integer, as CivitAI assigns monotonically increasing IDs).
+3. If a newer version exists: calls `catalog.enqueue_version_update`, fires `notify_update_available`.
 
 ### Notifier (`notifier.rs`)
 
-Thin wrapper around `notify-rust`. Three notification types:
+Thin wrapper around `notify-rust`:
 
 | Function | Icon | Trigger |
 |---|---|---|
 | `notify_success` | `dialog-information` | Download complete |
 | `notify_error` | `dialog-error` | Download or update failure |
 | `notify_update_available` | `software-update-available` | New model version found |
+| `notify_download_start` | `document-save` | Download begins (persistent, returns notification ID) |
+| `update_download_progress` | `document-save` | Every 10% progress (replaces notification by ID) |
+| `close_download_notification` | — | Download finished or cancelled |
 
 ---
 
@@ -157,36 +193,43 @@ Thin wrapper around `notify-rust`. Three notification types:
 | Method | URL | Returns |
 |---|---|---|
 | `get_model(id)` | `/api/v1/models/{id}` | `ModelInfo` (name, type, versions list) |
-| `get_model_version(id)` | `/api/v1/model-versions/{id}` | `ModelVersion` (download URL, file hashes) |
+| `get_model_version(id)` | `/api/v1/model-versions/{id}` | `ModelVersion` (download URL, file hashes, images) |
+| `get_model_version_by_hash(sha256)` | `/api/v1/model-versions/by-hash/{sha256}` | `ModelVersion` (used by startup scanner) |
 
 ### CivitAI model type → ComfyUI directory mapping (`types.rs`)
 
-| `ModelType` | `models_subdir()` |
-|---|---|
-| `Checkpoint` | `checkpoints` |
-| `LORA` / `LoCon` | `loras` |
-| `Controlnet` | `controlnet` |
-| `Vae` | `vae` |
-| `Embedding` (TextualInversion) | `embeddings` |
-| `Upscaler` | `upscale_models` |
-| anything else | `other` |
+`ModelType::models_subdir_for_file` applies extra routing logic for checkpoints:
+
+| `ModelType` | Condition | `models_subdir` |
+|---|---|---|
+| `Checkpoint` | Flux base model + `metadata.size == "pruned"` | `diffusion_models` |
+| `Checkpoint` | all other cases | `checkpoints` |
+| `LORA` / `LoCon` | — | `loras` |
+| `Controlnet` | — | `controlnet` |
+| `Vae` | — | `vae` |
+| `Embedding` (TextualInversion) | — | `embeddings` |
+| `Upscaler` | — | `upscale_models` |
+| anything else | — | `other` |
 
 ---
 
 ## Configuration (`src/config.rs`)
 
-Read from `~/.config/comfyui-downloader/config.toml`; falls back to built-in defaults if the file is absent. All three sections (`[civitai]`, `[paths]`, `[daemon]`) are optional.
+Read from `$XDG_CONFIG_HOME/comfyui-downloader/config.toml` (default: `~/.config/comfyui-downloader/config.toml`). Falls back to built-in defaults if the file is absent; the daemon re-saves the file on startup to persist any newly added default fields.
 
 | Key | Default |
 |---|---|
 | `civitai.api_key` | `None` |
-| `paths.models_dir` | `~/.local/share/comfyui/models` |
+| `paths.models_dir` | `$XDG_DATA_HOME/comfyui/models` |
 | `daemon.update_interval_hours` | `24` |
-| `daemon.max_concurrent_downloads` | `2` |
+| `daemon.max_concurrent_downloads` | `1` |
 | `daemon.socket_path` | `/run/user/<UID>/comfyui-downloader.sock` |
+| `daemon.skip_early_access` | `true` |
+
+XDG base directories are read from `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME`, falling back to `$HOME/.config` / `$HOME/.local/share`.
 
 ---
 
 ## SystemD integration
 
-The unit file (`systemd/comfyui-downloader.service`) is a **user service** (`WantedBy=default.target`). It starts after `network-online.target`, sets `RUST_LOG=info`, and restarts on failure with a 5 s back-off. The binary is expected at `~/.local/bin/comfyui-downloader`.
+The unit file (`systemd/comfyui-downloader.service`) is a **user service** (`WantedBy=default.target`). It starts after `network-online.target`, sets `RUST_LOG=info`, and restarts on failure with a 5 s back-off. The binary must be on `$PATH` (the service uses a bare `ExecStart=comfyui-downloader`).
