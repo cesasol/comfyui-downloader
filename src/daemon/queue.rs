@@ -14,11 +14,20 @@ use uuid::Uuid;
 /// Map of active download job IDs to their cancellation tokens.
 pub type ActiveTasks = Arc<Mutex<HashMap<Uuid, CancellationToken>>>;
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DownloadProgress {
+    pub bytes_received: u64,
+    pub total_bytes: Option<u64>,
+}
+
+pub type ProgressMap = Arc<Mutex<HashMap<Uuid, DownloadProgress>>>;
+
 pub async fn run(
     config: Arc<Config>,
     catalog: Arc<Mutex<Catalog>>,
     civitai: Arc<CivitaiClient>,
     active: ActiveTasks,
+    progress: ProgressMap,
 ) {
     let max = config.daemon.max_concurrent_downloads.max(1) as usize;
     let sem = Arc::new(Semaphore::new(max));
@@ -59,11 +68,12 @@ pub async fn run(
         let civ = civitai.clone();
         let active_ref = active.clone();
         let job_id = job.id;
+        let prog = progress.clone();
 
         tokio::spawn(async move {
             let _permit = permit; // released when task finishes
 
-            match downloader::download(&job, &cfg, &civ, token).await {
+            match downloader::download(&job, &cfg, &civ, token, prog.clone()).await {
                 Ok(dest) => {
                     info!("Job {job_id} complete: {}", dest.display());
                     let cat = cat.lock().await;
@@ -84,8 +94,8 @@ pub async fn run(
                 }
             }
 
-            let mut tasks = active_ref.lock().await;
-            tasks.remove(&job_id);
+            active_ref.lock().await.remove(&job_id);
+            prog.lock().await.remove(&job_id);
         });
     }
 }

@@ -119,6 +119,15 @@ impl Catalog {
         Ok(())
     }
 
+    pub fn count_by_status(&self, status: JobStatus) -> Result<u64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM jobs WHERE status = ?1",
+            params![status.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
     pub fn next_queued(&self) -> Result<Option<DownloadJob>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, url, model_id, version_id, model_type, dest_path, status,
@@ -137,6 +146,17 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_count_by_status() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        catalog.enqueue("https://civitai.com/models/1", None).unwrap();
+        catalog.enqueue("https://civitai.com/models/2", None).unwrap();
+        let count = catalog.count_by_status(JobStatus::Queued).unwrap();
+        assert_eq!(count, 2);
+        let done_count = catalog.count_by_status(JobStatus::Done).unwrap();
+        assert_eq!(done_count, 0);
+    }
 
     #[test]
     fn test_set_dest_path() {

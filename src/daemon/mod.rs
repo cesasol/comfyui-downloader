@@ -6,7 +6,7 @@ pub mod updater;
 use crate::catalog::Catalog;
 use crate::civitai::CivitaiClient;
 use crate::config::Config;
-use crate::daemon::queue::ActiveTasks;
+use crate::daemon::queue::{ActiveTasks, ProgressMap};
 use crate::ipc::{IpcServer, Request, Response};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -27,14 +27,16 @@ pub async fn run() -> Result<()> {
 
     let civitai = Arc::new(CivitaiClient::new(config.civitai.api_key.clone())?);
     let active: ActiveTasks = Arc::new(Mutex::new(HashMap::new()));
+    let progress: ProgressMap = Arc::new(Mutex::new(HashMap::new()));
 
     let queue_handle = {
         let cfg = config.clone();
         let cat = catalog.clone();
         let civ = civitai.clone();
         let act = active.clone();
+        let prog = progress.clone();
         tokio::spawn(async move {
-            queue::run(cfg, cat, civ, act).await;
+            queue::run(cfg, cat, civ, act, prog).await;
         })
     };
 
@@ -52,11 +54,13 @@ pub async fn run() -> Result<()> {
 
     let cat = catalog.clone();
     let act = active.clone();
+    let prog = progress.clone();
     server
         .serve(move |req| {
             let cat = cat.clone();
             let act = act.clone();
-            async move { handle_request(req, cat, act).await }
+            let prog = prog.clone();
+            async move { handle_request(req, cat, act, prog).await }
         })
         .await?;
 
@@ -69,6 +73,7 @@ async fn handle_request(
     req: Request,
     catalog: Arc<Mutex<Catalog>>,
     active: ActiveTasks,
+    progress: ProgressMap,
 ) -> Response {
     match req {
         Request::AddDownload { url, model_type } => {
@@ -85,7 +90,31 @@ async fn handle_request(
                 Err(e) => Response::err(e.to_string()),
             }
         }
-        Request::GetStatus => Response::ok(serde_json::json!({ "status": "running" })),
+        Request::GetStatus => {
+            let queued = {
+                let cat = catalog.lock().await;
+                cat.count_by_status(crate::catalog::JobStatus::Queued).unwrap_or(0)
+            };
+            let active_jobs: Vec<serde_json::Value> = {
+                let prog = progress.lock().await;
+                prog.iter()
+                    .map(|(id, p)| serde_json::json!({
+                        "id": id,
+                        "bytes_received": p.bytes_received,
+                        "total_bytes": p.total_bytes,
+                    }))
+                    .collect()
+            };
+            let free_bytes = crate::config::Config::load()
+                .ok()
+                .map(|c| crate::daemon::downloader::free_disk_bytes(&c.paths.models_dir).unwrap_or(0))
+                .unwrap_or(0);
+            Response::ok(serde_json::json!({
+                "queued": queued,
+                "active": active_jobs,
+                "free_bytes": free_bytes,
+            }))
+        }
         Request::CheckUpdates => {
             Response::ok(serde_json::json!({ "message": "update check triggered" }))
         }
