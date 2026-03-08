@@ -1,0 +1,48 @@
+[package]
+name = "comfyui-downloader"
+version = "0.1.0"
+edition = "2024"
+description = "CivitAI model downloader daemon for ComfyUI"
+license = "MIT"
+
+[[bin]]
+name = "comfyui-downloader"
+path = "src/main.rs"
+
+[[bin]]
+name = "comfyui-dl"
+path = "src/cli_main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+# CLI parsing
+clap = { version = "4", features = ["derive"] }
+# Serialisation
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Config
+toml = "0.8"
+# Database
+rusqlite = { version = "0.31", features = ["bundled"] }
+# Desktop notifications
+notify-rust = "4"
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Async channel / utilities
+tokio-util = { version = "0.7", features = ["io"] }
+futures = "0.3"
+# Error handling
+anyhow = "1"
+thiserror = "2"
+# Misc
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+sha2 = "0.10"
+hex = "0.4"
+bytes = "1"
+libc = "0.2"

@@ -1,0 +1,14 @@
+[Unit]
+Description=ComfyUI model downloader daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/comfyui-downloader
+Restart=on-failure
+RestartSec=5s
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target
