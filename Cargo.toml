@@ -3,7 +3,7 @@ name = "comfyui-downloader"
 version = "0.1.0"
 edition = "2024"
 description = "CivitAI model downloader daemon for ComfyUI"
-license = "MIT"
+license = "GPL-3.0-only"
 
 [lib]
 name = "comfyui_downloader"

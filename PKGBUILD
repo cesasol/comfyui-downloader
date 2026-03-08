@@ -1,11 +1,11 @@
-# Maintainer: cesasol <cesasol@gitlab.com>
+# Maintainer: cesasol <cesasol@pm.me>
 pkgname=comfyui-downloader-git
 pkgver=r1.820762d
 pkgrel=1
 pkgdesc="CivitAI model downloader daemon for ComfyUI"
 arch=('x86_64')
 url="https://gitlab.com/cesasol/comfyui-downloader"
-license=('MIT')
+license=('GPL-3.0-only')
 depends=('gcc-libs' 'glibc' 'libnotify')
 makedepends=('cargo' 'rust')
 provides=('comfyui-downloader' 'comfyui-dl')
