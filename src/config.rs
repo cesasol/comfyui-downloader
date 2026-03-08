@@ -53,7 +53,7 @@ impl Default for DaemonConfig {
         let uid = unsafe { libc::getuid() };
         Self {
             update_interval_hours: 24,
-            max_concurrent_downloads: 2,
+            max_concurrent_downloads: 1,
             skip_early_access: true,
             socket_path: PathBuf::from(format!(
                 "/run/user/{}/comfyui-downloader.sock",
