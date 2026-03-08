@@ -67,6 +67,7 @@ pub async fn run(
                 Ok(dest) => {
                     info!("Job {job_id} complete: {}", dest.display());
                     let cat = cat.lock().await;
+                    let _ = cat.set_dest_path(job_id, &dest);
                     let _ = cat.set_status(job_id, JobStatus::Done, None);
                     let _ = notifier::notify_success(&dest.display().to_string());
                 }

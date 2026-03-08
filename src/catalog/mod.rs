@@ -110,6 +110,15 @@ impl Catalog {
         Ok(())
     }
 
+    pub fn set_dest_path(&self, id: Uuid, path: &std::path::Path) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE jobs SET dest_path = ?1, updated_at = ?2 WHERE id = ?3",
+            params![path.to_string_lossy().as_ref(), now, id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn next_queued(&self) -> Result<Option<DownloadJob>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, url, model_id, version_id, model_type, dest_path, status,
@@ -122,6 +131,25 @@ impl Catalog {
         } else {
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_set_dest_path() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog.enqueue("https://civitai.com/models/1", None).unwrap();
+        catalog
+            .set_dest_path(job.id, std::path::Path::new("/tmp/model.safetensors"))
+            .unwrap();
+        let updated = catalog.get_job(job.id).unwrap().unwrap();
+        assert_eq!(
+            updated.dest_path.as_deref(),
+            Some("/tmp/model.safetensors")
+        );
     }
 }
 
