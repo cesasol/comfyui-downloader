@@ -15,8 +15,10 @@ use tokio::sync::{Mutex, Notify};
 use tracing::info;
 
 pub async fn run() -> Result<()> {
-    let config = Arc::new(Config::load()?);
-    info!("Loaded config");
+    let config = Config::load()?;
+    config.save()?; // Persist any new fields added since the config was last written.
+    info!("Loaded config from {}", Config::config_path().display());
+    let config = Arc::new(config);
 
     let catalog = Arc::new(Mutex::new(Catalog::open(
         &dirs::data_local_dir()
