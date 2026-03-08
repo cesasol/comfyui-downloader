@@ -1,6 +1,6 @@
-pub mod catalog;
-pub mod civitai;
+pub(crate) mod catalog;
+pub(crate) mod civitai;
 pub mod cli;
-pub mod config;
+pub(crate) mod config;
 pub mod daemon;
-pub mod ipc;
+pub(crate) mod ipc;

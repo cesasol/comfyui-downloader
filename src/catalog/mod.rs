@@ -127,12 +127,12 @@ impl Catalog {
 }
 
 /// Extract (model_id, version_id) from a CivitAI URL.
-pub fn parse_civitai_url(url: &str) -> (Option<u64>, Option<u64>) {
+pub(crate) fn parse_civitai_url(url: &str) -> (Option<u64>, Option<u64>) {
     let (path, query) = url.split_once('?').unwrap_or((url, ""));
     let segments: Vec<&str> = path.trim_end_matches('/').split('/').collect();
 
     if let Some(pos) = segments.iter().position(|&s| s == "models") {
-        if segments.get(pos.wrapping_sub(1)) == Some(&"download") {
+        if pos.checked_sub(1).and_then(|i| segments.get(i)).copied() == Some("download") {
             let version_id = segments.get(pos + 1).and_then(|s| s.parse().ok());
             return (None, version_id);
         }
@@ -208,5 +208,15 @@ mod tests {
         let (model_id, version_id) = parse_civitai_url("https://example.com/file.safetensors");
         assert_eq!(model_id, None);
         assert_eq!(version_id, None);
+    }
+
+    #[test]
+    fn test_parse_ambiguous_download_segment() {
+        // A URL where "download" appears before "models" but is NOT the CivitAI API path.
+        // Should still be treated as a download URL (same structural check).
+        let (model_id, version_id) =
+            parse_civitai_url("https://civitai.com/download/models/99999");
+        assert_eq!(model_id, None);
+        assert_eq!(version_id, Some(99999));
     }
 }
