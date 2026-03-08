@@ -1,6 +1,4 @@
-mod cli;
-mod ipc;
-mod config;
+use comfyui_downloader::cli;
 
 use anyhow::Result;
 

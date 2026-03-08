@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::ipc::{IpcServer, Request, Response};
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tracing::info;
 
 pub async fn run() -> Result<()> {
@@ -24,9 +24,10 @@ pub async fn run() -> Result<()> {
     )?));
 
     let civitai = Arc::new(CivitaiClient::new(config.civitai.api_key.clone())?);
-    let cfg = config.clone();
     let cat = catalog.clone();
     let civ = civitai.clone();
+
+    let update_wake: Arc<Notify> = Arc::new(Notify::new());
 
     // Spawn the download queue worker.
     let queue_handle = {
@@ -42,9 +43,10 @@ pub async fn run() -> Result<()> {
     let updater_handle = {
         let cfg = config.clone();
         let cat = catalog.clone();
-        let civ = civitai.clone();
+        let civ = civ.clone();
+        let wake = update_wake.clone();
         tokio::spawn(async move {
-            updater::run(cfg, cat, civ).await;
+            updater::run(cfg, cat, civ, wake).await;
         })
     };
 
@@ -52,10 +54,12 @@ pub async fn run() -> Result<()> {
     let server = IpcServer::bind(&config.daemon.socket_path)?;
     info!("Daemon ready");
 
+    let wake = update_wake.clone();
     server
         .serve(move |req| {
             let cat = cat.clone();
-            async move { handle_request(req, cat).await }
+            let wake = wake.clone();
+            async move { handle_request(req, cat, wake).await }
         })
         .await?;
 
@@ -67,6 +71,7 @@ pub async fn run() -> Result<()> {
 async fn handle_request(
     req: Request,
     catalog: Arc<Mutex<Catalog>>,
+    update_wake: Arc<Notify>,
 ) -> Response {
     match req {
         Request::AddDownload { url, model_type } => {
@@ -85,7 +90,7 @@ async fn handle_request(
         }
         Request::GetStatus => Response::ok(serde_json::json!({ "status": "running" })),
         Request::CheckUpdates => {
-            // Signal handled by the updater task; for now acknowledge.
+            update_wake.notify_one();
             Response::ok(serde_json::json!({ "message": "update check triggered" }))
         }
         Request::Cancel { id } => {

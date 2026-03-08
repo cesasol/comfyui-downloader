@@ -67,12 +67,24 @@ impl Catalog {
     pub fn enqueue(&self, url: &str, model_type: Option<&str>) -> Result<DownloadJob> {
         let id = Uuid::new_v4();
         let now = Utc::now().to_rfc3339();
+        let (model_id, version_id) = parse_civitai_url(url);
         self.conn.execute(
-            "INSERT INTO jobs (id, url, model_type, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'queued', ?4, ?4)",
-            params![id.to_string(), url, model_type, now],
+            "INSERT INTO jobs (id, url, model_id, version_id, model_type, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6)",
+            params![id.to_string(), url, model_id, version_id, model_type, now],
         )?;
         self.get_job(id)?.context("job not found after insert")
+    }
+
+    /// Enqueue a new version of an already-downloaded model.
+    pub fn enqueue_version_update(
+        &self,
+        _model_id: u64,
+        new_version_id: u64,
+        model_type: Option<&str>,
+    ) -> Result<DownloadJob> {
+        let url = format!("https://civitai.com/api/download/models/{new_version_id}");
+        self.enqueue(&url, model_type)
     }
 
     pub fn get_job(&self, id: Uuid) -> Result<Option<DownloadJob>> {
@@ -125,6 +137,27 @@ impl Catalog {
     }
 }
 
+/// Extract (model_id, version_id) from a CivitAI URL.
+pub(crate) fn parse_civitai_url(url: &str) -> (Option<u64>, Option<u64>) {
+    let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    let segments: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+
+    if let Some(pos) = segments.iter().position(|&s| s == "models") {
+        if pos.checked_sub(1).and_then(|i| segments.get(i)).copied() == Some("download") {
+            let version_id = segments.get(pos + 1).and_then(|s| s.parse().ok());
+            return (None, version_id);
+        }
+        let model_id: Option<u64> = segments.get(pos + 1).and_then(|s| s.parse().ok());
+        let version_id: Option<u64> = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("modelVersionId="))
+            .and_then(|v| v.parse().ok());
+        return (model_id, version_id);
+    }
+
+    (None, None)
+}
+
 fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadJob> {
     let status_str: String = row.get(6)?;
     let status = match status_str.as_str() {
@@ -152,4 +185,61 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadJob> {
             .with_timezone(&Utc),
         error: row.get(9)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_model_page_url() {
+        let (model_id, version_id) = parse_civitai_url("https://civitai.com/models/12345");
+        assert_eq!(model_id, Some(12345));
+        assert_eq!(version_id, None);
+    }
+
+    #[test]
+    fn test_parse_model_page_url_with_version() {
+        let (model_id, version_id) =
+            parse_civitai_url("https://civitai.com/models/12345?modelVersionId=67890");
+        assert_eq!(model_id, Some(12345));
+        assert_eq!(version_id, Some(67890));
+    }
+
+    #[test]
+    fn test_parse_download_url() {
+        let (model_id, version_id) =
+            parse_civitai_url("https://civitai.com/api/download/models/67890");
+        assert_eq!(model_id, None);
+        assert_eq!(version_id, Some(67890));
+    }
+
+    #[test]
+    fn test_parse_unknown_url() {
+        let (model_id, version_id) = parse_civitai_url("https://example.com/file.safetensors");
+        assert_eq!(model_id, None);
+        assert_eq!(version_id, None);
+    }
+
+    #[test]
+    fn test_parse_ambiguous_download_segment() {
+        // A URL where "download" appears before "models" but is NOT the CivitAI API path.
+        // Should still be treated as a download URL (same structural check).
+        let (model_id, version_id) =
+            parse_civitai_url("https://civitai.com/download/models/99999");
+        assert_eq!(model_id, None);
+        assert_eq!(version_id, Some(99999));
+    }
+
+    #[test]
+    fn test_enqueue_version_update() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog
+            .enqueue_version_update(12345, 67890, Some("checkpoints"))
+            .unwrap();
+        assert_eq!(job.model_id, None); // URL-parsed: download URL only has version_id
+        assert_eq!(job.version_id, Some(67890));
+        assert_eq!(job.model_type.as_deref(), Some("checkpoints"));
+        assert_eq!(job.status, JobStatus::Queued);
+    }
 }

@@ -1,4 +1,4 @@
-use crate::catalog::{DownloadJob, JobStatus};
+use crate::catalog::DownloadJob;
 use crate::civitai::CivitaiClient;
 use crate::config::Config;
 use anyhow::{bail, Context, Result};
@@ -67,7 +67,30 @@ pub async fn download(
     let digest = hex::encode(hasher.finalize());
     info!("SHA-256: {digest}");
 
-    // TODO: compare against CivitAI-reported hash once version metadata is resolved.
+    if let Some(version_id) = job.version_id {
+        let version = civitai
+            .get_model_version(version_id)
+            .await
+            .context("fetching version metadata for checksum")?;
+        let expected = version
+            .files
+            .iter()
+            .find(|f| f.primary == Some(true))
+            .or_else(|| version.files.first())
+            .and_then(|f| f.hashes.sha256.as_deref());
+
+        if expected.is_none() {
+            tracing::warn!("No SHA-256 hash available for version {version_id}, skipping verification");
+        } else if !checksums_match(&digest, expected) {
+            fs::remove_file(&tmp).await?;
+            bail!(
+                "checksum mismatch: computed {digest}, expected {}",
+                expected.unwrap_or("unknown")
+            );
+        } else {
+            info!("Checksum verified");
+        }
+    }
 
     fs::rename(&tmp, &dest).await?;
     Ok(dest)
@@ -75,7 +98,6 @@ pub async fn download(
 
 fn check_disk_space(dir: &PathBuf) -> Result<()> {
     // Require at least 1 GiB free.
-    use std::os::unix::fs::MetadataExt;
     let stat = nix_statvfs(dir)?;
     if stat < 1024 * 1024 * 1024 {
         bail!("insufficient disk space (< 1 GiB free)");
@@ -102,4 +124,36 @@ fn parse_filename_from_cd(header: &str) -> Option<String> {
             part.strip_prefix("filename=")
                 .map(|s| s.trim_matches('"').to_string())
         })
+}
+
+fn checksums_match(computed: &str, expected: Option<&str>) -> bool {
+    match expected {
+        None => true,
+        Some(h) => h.eq_ignore_ascii_case(computed),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_parse_filename_from_cd_quoted() {
+        let result = super::parse_filename_from_cd(
+            r#"attachment; filename="my_model.safetensors""#,
+        );
+        assert_eq!(result, Some("my_model.safetensors".to_string()));
+    }
+
+    #[test]
+    fn test_parse_filename_from_cd_unquoted() {
+        let result = super::parse_filename_from_cd("attachment; filename=model.bin");
+        assert_eq!(result, Some("model.bin".to_string()));
+    }
+
+    #[test]
+    fn test_checksums_match() {
+        assert!(super::checksums_match("abc123", Some("abc123")));
+        assert!(super::checksums_match("ABC123", Some("abc123"))); // case-insensitive
+        assert!(!super::checksums_match("abc123", Some("deadbeef")));
+        assert!(super::checksums_match("abc123", None)); // no expected hash → pass
+    }
 }

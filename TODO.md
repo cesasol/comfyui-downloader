@@ -4,11 +4,11 @@
 
 Scaffolded code that needs to be finished.
 
-- [ ] **[high]** Parse `model_id` / `version_id` from CivitAI URL on enqueue
+- [x] **[high]** Parse `model_id` / `version_id` from CivitAI URL on enqueue
   (`src/catalog/mod.rs` — populate currently-null columns)
-- [ ] **[high]** Verify downloaded file SHA-256 against `ModelFile.hashes.sha256`
+- [x] **[high]** Verify downloaded file SHA-256 against `ModelFile.hashes.sha256`
   (`src/daemon/downloader.rs` — hash is computed but discarded)
-- [ ] **[high]** Implement update checker: query `CivitaiClient::get_model`, compare
+- [x] **[high]** Implement update checker: query `CivitaiClient::get_model`, compare
   `model_versions[0].id` with stored `version_id`, enqueue newer version and call
   `notify_update_available` (`src/daemon/updater.rs`)
 - [ ] **[high]** Honour `max_concurrent_downloads` config: replace sequential queue loop
@@ -19,7 +19,7 @@ Scaffolded code that needs to be finished.
   download progress, free disk space (`src/daemon/mod.rs`)
 - [ ] **[medium]** Implement download cancellation: signal the in-flight downloader task
   to abort when `Cancel { id }` is received (currently only sets the DB flag)
-- [ ] **[low]** Wire `CheckUpdates` IPC command to immediately wake the updater task
+- [x] **[low]** Wire `CheckUpdates` IPC command to immediately wake the updater task
   instead of waiting for the next poll interval
 
 ## Feature work
