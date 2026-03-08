@@ -101,12 +101,17 @@ pub async fn download(
             .get_model_version(version_id)
             .await
             .context("fetching version metadata for checksum")?;
-        let expected = version
+        let matched_file = version
             .files
             .iter()
-            .find(|f| f.primary == Some(true))
-            .or_else(|| version.files.first())
-            .and_then(|f| f.hashes.sha256.as_deref());
+            .find(|f| f.name == filename)
+            .or_else(|| version.files.iter().find(|f| f.primary == Some(true)))
+            .or_else(|| version.files.first());
+        info!(
+            "Verifying against file: {}",
+            matched_file.map(|f| f.name.as_str()).unwrap_or("<none>")
+        );
+        let expected = matched_file.and_then(|f| f.hashes.sha256.as_deref());
 
         if expected.is_none() {
             tracing::warn!("No SHA-256 hash available for version {version_id}, skipping verification");
