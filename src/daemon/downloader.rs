@@ -21,6 +21,23 @@ struct VersionResolution {
     base_model: Option<String>,
     /// Filename from the API (file.name). Used to check for an existing file before downloading.
     filename: Option<String>,
+    model_id: Option<u64>,
+    version_id: Option<u64>,
+    model_name: Option<String>,
+    version_name: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ModelMetadata<'a> {
+    civitai_model_id: Option<u64>,
+    civitai_version_id: Option<u64>,
+    model_name: Option<&'a str>,
+    version_name: Option<&'a str>,
+    base_model: Option<&'a str>,
+    model_type: Option<&'a str>,
+    sha256: Option<&'a str>,
+    source_url: &'a str,
+    downloaded_at: String,
 }
 
 /// Resolve the authoritative download URL, expected SHA-256, model type, and base model
@@ -52,7 +69,17 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 .clone()
                 .with_context(|| format!("no downloadUrl for file '{}' in version {version_id}", file.name))?;
             info!("Resolved: type={:?} base_model={:?} file={}", model_type_subdir, base_model, file.name);
-            Ok(VersionResolution { download_url, expected_hash: file.hashes.sha256.clone(), model_type_subdir, base_model, filename: Some(file.name.clone()) })
+            Ok(VersionResolution {
+                download_url,
+                expected_hash: file.hashes.sha256.clone(),
+                model_type_subdir,
+                base_model,
+                filename: Some(file.name.clone()),
+                model_id: Some(model_id),
+                version_id: Some(version_id),
+                model_name: Some(model_info.name),
+                version_name: Some(version.name),
+            })
         }
 
         (Some(version_id), None) => {
@@ -72,12 +99,24 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 .as_ref()
                 .map(|m| m.r#type.models_subdir_for_file(file).to_string());
             let base_model = version.base_model.clone();
+            let model_name = version.model.as_ref().map(|m| m.name.clone());
+            let version_name = Some(version.name.clone());
             let download_url = file
                 .download_url
                 .clone()
                 .with_context(|| format!("no downloadUrl for file '{}' in version {version_id}", file.name))?;
             info!("Resolved: type={:?} base_model={:?} file={}", model_type_subdir, base_model, file.name);
-            Ok(VersionResolution { download_url, expected_hash: file.hashes.sha256.clone(), model_type_subdir, base_model, filename: Some(file.name.clone()) })
+            Ok(VersionResolution {
+                download_url,
+                expected_hash: file.hashes.sha256.clone(),
+                model_type_subdir,
+                base_model,
+                filename: Some(file.name.clone()),
+                model_id: version.model_id,
+                version_id: Some(version_id),
+                model_name,
+                version_name,
+            })
         }
 
         (None, Some(model_id)) => {
@@ -93,6 +132,7 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 .context("no publicly available version (all versions are EarlyAccess)")?;
             let base_model = latest.base_model.clone();
             let version_id = latest.id;
+            let version_name = Some(latest.name.clone());
             let version = civitai
                 .get_model_version(version_id)
                 .await
@@ -109,12 +149,32 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 .clone()
                 .with_context(|| format!("no downloadUrl for file '{}' in version {version_id}", file.name))?;
             info!("Resolved: type={:?} base_model={:?} file={}", model_type_subdir, base_model, file.name);
-            Ok(VersionResolution { download_url, expected_hash: file.hashes.sha256.clone(), model_type_subdir, base_model, filename: Some(file.name.clone()) })
+            Ok(VersionResolution {
+                download_url,
+                expected_hash: file.hashes.sha256.clone(),
+                model_type_subdir,
+                base_model,
+                filename: Some(file.name.clone()),
+                model_id: Some(model_id),
+                version_id: Some(version_id),
+                model_name: Some(model_info.name),
+                version_name,
+            })
         }
 
         (None, None) => {
             warn!("Job {} has no model/version ID; using stored URL without checksum verification", job.id);
-            Ok(VersionResolution { download_url: job.url.clone(), expected_hash: None, model_type_subdir: None, base_model: None, filename: None })
+            Ok(VersionResolution {
+                download_url: job.url.clone(),
+                expected_hash: None,
+                model_type_subdir: None,
+                base_model: None,
+                filename: None,
+                model_id: None,
+                version_id: None,
+                model_name: None,
+                version_name: None,
+            })
         }
     }
 }
@@ -262,7 +322,31 @@ pub async fn download(
     }
 
     fs::rename(&tmp, &dest).await?;
+    write_metadata(&dest, &resolution, &digest, &job.url).await;
     Ok((dest, resolution.model_type_subdir))
+}
+
+async fn write_metadata(dest: &PathBuf, resolution: &VersionResolution, sha256: &str, source_url: &str) {
+    let meta_path = dest.with_extension("metadata.json");
+    let meta = ModelMetadata {
+        civitai_model_id: resolution.model_id,
+        civitai_version_id: resolution.version_id,
+        model_name: resolution.model_name.as_deref(),
+        version_name: resolution.version_name.as_deref(),
+        base_model: resolution.base_model.as_deref(),
+        model_type: resolution.model_type_subdir.as_deref(),
+        sha256: Some(sha256),
+        source_url,
+        downloaded_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match serde_json::to_string_pretty(&meta) {
+        Ok(json) => {
+            if let Err(e) = tokio::fs::write(&meta_path, json).await {
+                warn!("Failed to write metadata file {}: {e}", meta_path.display());
+            }
+        }
+        Err(e) => warn!("Failed to serialise metadata: {e}"),
+    }
 }
 
 fn check_disk_space(dir: &PathBuf) -> Result<()> {
