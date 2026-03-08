@@ -19,6 +19,8 @@ struct VersionResolution {
     model_type_subdir: Option<String>,
     /// Base model name used as a subdirectory level (e.g. "SDXL 1.0", "Pony").
     base_model: Option<String>,
+    /// Filename from the API (file.name). Used to check for an existing file before downloading.
+    filename: Option<String>,
 }
 
 /// Resolve the authoritative download URL, expected SHA-256, model type, and base model
@@ -49,8 +51,8 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 .download_url
                 .clone()
                 .with_context(|| format!("no downloadUrl for file '{}' in version {version_id}", file.name))?;
-            info!("Resolved: type={:?} base_model={:?}", model_type_subdir, base_model);
-            Ok(VersionResolution { download_url, expected_hash: file.hashes.sha256.clone(), model_type_subdir, base_model })
+            info!("Resolved: type={:?} base_model={:?} file={}", model_type_subdir, base_model, file.name);
+            Ok(VersionResolution { download_url, expected_hash: file.hashes.sha256.clone(), model_type_subdir, base_model, filename: Some(file.name.clone()) })
         }
 
         (Some(version_id), None) => {
@@ -74,8 +76,8 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 .download_url
                 .clone()
                 .with_context(|| format!("no downloadUrl for file '{}' in version {version_id}", file.name))?;
-            info!("Resolved: type={:?} base_model={:?}", model_type_subdir, base_model);
-            Ok(VersionResolution { download_url, expected_hash: file.hashes.sha256.clone(), model_type_subdir, base_model })
+            info!("Resolved: type={:?} base_model={:?} file={}", model_type_subdir, base_model, file.name);
+            Ok(VersionResolution { download_url, expected_hash: file.hashes.sha256.clone(), model_type_subdir, base_model, filename: Some(file.name.clone()) })
         }
 
         (None, Some(model_id)) => {
@@ -106,13 +108,13 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 .download_url
                 .clone()
                 .with_context(|| format!("no downloadUrl for file '{}' in version {version_id}", file.name))?;
-            info!("Resolved: type={:?} base_model={:?}", model_type_subdir, base_model);
-            Ok(VersionResolution { download_url, expected_hash: file.hashes.sha256.clone(), model_type_subdir, base_model })
+            info!("Resolved: type={:?} base_model={:?} file={}", model_type_subdir, base_model, file.name);
+            Ok(VersionResolution { download_url, expected_hash: file.hashes.sha256.clone(), model_type_subdir, base_model, filename: Some(file.name.clone()) })
         }
 
         (None, None) => {
             warn!("Job {} has no model/version ID; using stored URL without checksum verification", job.id);
-            Ok(VersionResolution { download_url: job.url.clone(), expected_hash: None, model_type_subdir: None, base_model: None })
+            Ok(VersionResolution { download_url: job.url.clone(), expected_hash: None, model_type_subdir: None, base_model: None, filename: None })
         }
     }
 }
@@ -144,6 +146,15 @@ pub async fn download(
     if let Some(ref base_model) = resolution.base_model {
         dest_dir = dest_dir.join(sanitize_dir_name(base_model));
     }
+    // Check if the target file already exists before downloading.
+    if let Some(ref name) = resolution.filename {
+        let existing = dest_dir.join(name);
+        if existing.exists() {
+            info!("File already exists, skipping download: {}", existing.display());
+            return Ok((existing, resolution.model_type_subdir));
+        }
+    }
+
     fs::create_dir_all(&dest_dir).await?;
 
     check_disk_space(&dest_dir)?;
