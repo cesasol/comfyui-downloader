@@ -29,10 +29,6 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
             .get_model_version(version_id)
             .await
             .context("fetching version metadata")?;
-        let model_type_subdir = version
-            .model
-            .as_ref()
-            .map(|m| m.r#type.models_subdir().to_string());
         let base_model = version.base_model.clone();
         let file = version
             .files
@@ -40,6 +36,10 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
             .find(|f| f.primary == Some(true))
             .or_else(|| version.files.first())
             .context("no files in version metadata")?;
+        let model_type_subdir = version
+            .model
+            .as_ref()
+            .map(|m| m.r#type.models_subdir_for_file(file).to_string());
         let download_url = file
             .download_url
             .clone()
@@ -57,7 +57,7 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
             .get_model(model_id)
             .await
             .context("fetching model metadata")?;
-        let model_type_subdir = Some(model_info.r#type.models_subdir().to_string());
+        let model_type = &model_info.r#type;
         let latest = model_info
             .model_versions
             .iter()
@@ -77,6 +77,7 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
             .find(|f| f.primary == Some(true))
             .or_else(|| version.files.first())
             .context("no files in latest version")?;
+        let model_type_subdir = Some(model_type.models_subdir_for_file(file).to_string());
         let download_url = file
             .download_url
             .clone()
@@ -258,11 +259,10 @@ pub(crate) fn free_disk_bytes(path: &std::path::PathBuf) -> Result<u64> {
 }
 
 /// Sanitize a string for use as a directory name component.
-/// Replaces spaces with underscores and strips characters that are unsafe on common filesystems.
+/// Strips characters that are unsafe on common filesystems (slashes, null bytes, etc.).
 fn sanitize_dir_name(s: &str) -> String {
     s.chars()
-        .map(|c| if c == ' ' { '_' } else { c })
-        .filter(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .filter(|c| !matches!(c, '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
         .collect()
 }
 

@@ -32,6 +32,11 @@ pub struct ModelVersion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMetadata {
+    pub size: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelFile {
     pub name: String,
@@ -40,6 +45,7 @@ pub struct ModelFile {
     pub hashes: FileHashes,
     pub primary: Option<bool>,
     pub download_url: Option<String>,
+    pub metadata: Option<FileMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +78,7 @@ pub enum ModelType {
 
 impl ModelType {
     /// Map to the ComfyUI models subdirectory name.
+    /// For checkpoints, use `models_subdir_for_file` instead to account for pruned vs full.
     pub fn models_subdir(&self) -> &'static str {
         match self {
             Self::Checkpoint => "checkpoints",
@@ -81,6 +88,20 @@ impl ModelType {
             Self::Vae => "vae",
             Self::Upscaler => "upscale_models",
             _ => "other",
+        }
+    }
+
+    /// Like `models_subdir` but routes checkpoints based on the file's `metadata.size`:
+    /// - "pruned" → `diffusion_models` (quantised / pruned weights)
+    /// - "full" or unknown → `checkpoints`
+    pub fn models_subdir_for_file(&self, file: &ModelFile) -> &'static str {
+        if matches!(self, Self::Checkpoint) {
+            match file.metadata.as_ref().and_then(|m| m.size.as_deref()) {
+                Some("pruned") => "diffusion_models",
+                _ => "checkpoints",
+            }
+        } else {
+            self.models_subdir()
         }
     }
 }
