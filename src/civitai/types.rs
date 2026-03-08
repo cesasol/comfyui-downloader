@@ -21,7 +21,7 @@ pub struct ModelVersionModel {
 pub struct ModelVersion {
     pub id: u64,
     pub name: String,
-    pub model_id: u64,
+    pub model_id: Option<u64>,
     pub created_at: String,
     pub download_url: Option<String>,
     pub files: Vec<ModelFile>,
