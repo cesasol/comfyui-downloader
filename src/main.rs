@@ -1,8 +1,4 @@
-mod catalog;
-mod civitai;
-mod config;
-mod daemon;
-mod ipc;
+use comfyui_downloader::daemon;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;

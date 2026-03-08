@@ -5,6 +5,10 @@ edition = "2024"
 description = "CivitAI model downloader daemon for ComfyUI"
 license = "MIT"
 
+[lib]
+name = "comfyui_downloader"
+path = "src/lib.rs"
+
 [[bin]]
 name = "comfyui-downloader"
 path = "src/main.rs"
