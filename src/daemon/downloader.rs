@@ -17,6 +17,8 @@ struct VersionResolution {
     expected_hash: Option<String>,
     /// ComfyUI models subdirectory derived from the CivitAI model type (e.g. "checkpoints").
     model_type_subdir: Option<String>,
+    /// Base model name used as a subdirectory level (e.g. "SDXL 1.0", "Pony").
+    base_model: Option<String>,
 }
 
 /// Resolve the authoritative download URL, expected SHA-256, and model type from the CivitAI API.
@@ -31,6 +33,7 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
             .model
             .as_ref()
             .map(|m| m.r#type.models_subdir().to_string());
+        let base_model = version.base_model.clone();
         let file = version
             .files
             .iter()
@@ -45,6 +48,7 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
             download_url,
             expected_hash: file.hashes.sha256.clone(),
             model_type_subdir,
+            base_model,
         });
     }
 
@@ -62,6 +66,7 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                     || v.availability.as_deref() != Some("EarlyAccess")
             })
             .context("no publicly available version (all versions are EarlyAccess)")?;
+        let base_model = latest.base_model.clone();
         let version = civitai
             .get_model_version(latest.id)
             .await
@@ -80,6 +85,7 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
             download_url,
             expected_hash: file.hashes.sha256.clone(),
             model_type_subdir,
+            base_model,
         });
     }
 
@@ -91,6 +97,7 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
         download_url: job.url.clone(),
         expected_hash: None,
         model_type_subdir: None,
+        base_model: None,
     })
 }
 
@@ -117,7 +124,10 @@ pub async fn download(
         .as_deref()
         .or(job.model_type.as_deref())
         .unwrap_or("other");
-    let dest_dir = config.paths.models_dir.join(model_type_str);
+    let mut dest_dir = config.paths.models_dir.join(model_type_str);
+    if let Some(ref base_model) = resolution.base_model {
+        dest_dir = dest_dir.join(sanitize_dir_name(base_model));
+    }
     fs::create_dir_all(&dest_dir).await?;
 
     check_disk_space(&dest_dir)?;
@@ -245,6 +255,15 @@ pub(crate) fn free_disk_bytes(path: &std::path::PathBuf) -> Result<u64> {
         bail!("statvfs failed");
     }
     Ok(stat.f_bavail * stat.f_frsize)
+}
+
+/// Sanitize a string for use as a directory name component.
+/// Replaces spaces with underscores and strips characters that are unsafe on common filesystems.
+fn sanitize_dir_name(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == ' ' { '_' } else { c })
+        .filter(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .collect()
 }
 
 fn parse_filename_from_cd(header: &str) -> Option<String> {
