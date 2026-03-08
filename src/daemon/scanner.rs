@@ -25,11 +25,7 @@ const KNOWN_SUBDIRS: &[&str] = &[
     "other",
 ];
 
-pub async fn run(
-    config: Arc<Config>,
-    civitai: Arc<CivitaiClient>,
-    catalog: Arc<Mutex<Catalog>>,
-) {
+pub async fn run(config: Arc<Config>, civitai: Arc<CivitaiClient>, catalog: Arc<Mutex<Catalog>>) {
     if config.civitai.api_key.is_none() {
         warn!("Skipping startup scan: no CivitAI API key configured");
         return;
@@ -53,7 +49,9 @@ pub async fn run(
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            let Ok(ft) = entry.file_type().await else { continue };
+            let Ok(ft) = entry.file_type().await else {
+                continue;
+            };
             if ft.is_dir() {
                 stack.push(path);
             } else if ft.is_file() && is_model_file(&path) {
@@ -85,11 +83,19 @@ fn needs_metadata(path: &Path) -> bool {
 }
 
 fn needs_preview(path: &Path) -> bool {
-    let Some(stem) = path.file_stem() else { return true };
-    let Some(parent) = path.parent() else { return true };
+    let Some(stem) = path.file_stem() else {
+        return true;
+    };
+    let Some(parent) = path.parent() else {
+        return true;
+    };
     let prefix = format!("{}.preview.", stem.to_string_lossy());
     std::fs::read_dir(parent)
-        .map(|entries| !entries.flatten().any(|e| e.file_name().to_string_lossy().starts_with(&prefix)))
+        .map(|entries| {
+            !entries
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        })
         .unwrap_or(true)
 }
 
@@ -141,7 +147,15 @@ async fn process_file(
 
     downloader::save_artifacts(path, version, &sha256, missing_meta, missing_preview).await;
 
-    let registered = register_in_catalog(path, &download_url, model_id, Some(version_id), catalog, models_dir).await;
+    let registered = register_in_catalog(
+        path,
+        &download_url,
+        model_id,
+        Some(version_id),
+        catalog,
+        models_dir,
+    )
+    .await;
     (true, registered)
 }
 
@@ -226,7 +240,10 @@ mod tests {
     fn test_model_type_from_path_loras() {
         let models_dir = Path::new("/models");
         let path = Path::new("/models/loras/Pony/my_lora.safetensors");
-        assert_eq!(model_type_from_path(models_dir, path), Some("loras".to_string()));
+        assert_eq!(
+            model_type_from_path(models_dir, path),
+            Some("loras".to_string())
+        );
     }
 
     #[test]
@@ -254,6 +271,74 @@ mod tests {
             model_type_from_path(models_dir, path),
             Some("checkpoints".to_string())
         );
+    }
+
+    fn stub_path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/stubs")
+            .join(name)
+    }
+
+    fn load_metadata_value() -> serde_json::Value {
+        let json = std::fs::read_to_string(stub_path("metadata.stub.json")).unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn test_metadata_extraction_for_catalog_registration() {
+        let meta = load_metadata_value();
+
+        let version_id = meta["civitai"]["id"].as_u64();
+        let model_id = meta["civitai"]["modelId"].as_u64();
+        let download_url = meta["civitai"]["downloadUrl"]
+            .as_str()
+            .map(|s| s.to_string())
+            .or_else(|| version_id.map(|v| format!("https://civitai.com/api/download/models/{v}")));
+
+        assert_eq!(version_id, Some(5550001));
+        assert_eq!(model_id, Some(990001));
+        assert_eq!(
+            download_url.as_deref(),
+            Some("https://example.com/api/download/models/5550001")
+        );
+    }
+
+    #[test]
+    fn test_stub_file_sha256_matches_metadata() {
+        let data =
+            std::fs::read(stub_path("model.stub.safetensors")).expect("failed to read stub binary");
+        let digest = hex::encode(Sha256::digest(&data));
+
+        let meta = load_metadata_value();
+        let expected = meta["sha256"].as_str().expect("sha256 field missing");
+
+        assert_eq!(digest, expected);
+    }
+
+    #[test]
+    fn test_stub_file_sha256_matches_model_response() {
+        use crate::civitai::types::ModelInfo;
+
+        let data =
+            std::fs::read(stub_path("model.stub.safetensors")).expect("failed to read stub binary");
+        let digest = hex::encode(Sha256::digest(&data));
+
+        let json = std::fs::read_to_string(stub_path("model_response.stub.json")).unwrap();
+        let info: ModelInfo = serde_json::from_str(&json).unwrap();
+        let file_hash = info.model_versions[1].files[0]
+            .hashes
+            .sha256
+            .as_deref()
+            .expect("SHA256 hash missing");
+
+        assert_eq!(digest, file_hash.to_ascii_lowercase());
+    }
+
+    #[test]
+    fn test_stub_binary_is_small() {
+        let meta =
+            std::fs::metadata(stub_path("model.stub.safetensors")).expect("stub binary missing");
+        assert_eq!(meta.len(), 100);
     }
 }
 

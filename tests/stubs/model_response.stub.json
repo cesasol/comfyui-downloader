@@ -1,0 +1,227 @@
+{
+  "id": 990001,
+  "name": "Dream Weaver",
+  "description": "<p>A synthetic test model for automated testing.</p>",
+  "allowNoCredit": true,
+  "allowCommercialUse": "{Image,Rent,Sell}",
+  "allowDerivatives": true,
+  "allowDifferentLicense": true,
+  "type": "Checkpoint",
+  "minor": false,
+  "sfwOnly": false,
+  "poi": false,
+  "nsfw": false,
+  "nsfwLevel": 1,
+  "availability": "Public",
+  "userId": 99001,
+  "cosmetic": null,
+  "supportsGeneration": false,
+  "stats": {
+    "downloadCount": 5000,
+    "thumbsUpCount": 800,
+    "thumbsDownCount": 5,
+    "commentCount": 42,
+    "tippedAmountCount": 10000
+  },
+  "creator": {
+    "username": "testcreator",
+    "image": "https://example.com/images/testcreator-avatar.jpeg"
+  },
+  "tags": [
+    "test",
+    "checkpoint",
+    "synthetic"
+  ],
+  "modelVersions": [
+    {
+      "id": 5550003,
+      "index": 0,
+      "name": "ZImg V1",
+      "baseModel": "ZImageBase",
+      "baseModelType": "Standard",
+      "createdAt": "2026-02-01T10:00:00.000Z",
+      "publishedAt": "2026-02-01T12:00:00.000Z",
+      "status": "Published",
+      "availability": "EarlyAccess",
+      "nsfwLevel": 1,
+      "description": "<p>Early access version for testing EA filtering.</p>",
+      "covered": false,
+      "stats": {
+        "downloadCount": 50,
+        "thumbsUpCount": 20,
+        "thumbsDownCount": 0
+      },
+      "files": [
+        {
+          "id": 7770003,
+          "sizeKB": 6010713.0,
+          "name": "dreamWeaver_zimgV1.safetensors",
+          "type": "Model",
+          "pickleScanResult": "Success",
+          "pickleScanMessage": "No Pickle imports",
+          "virusScanResult": "Success",
+          "virusScanMessage": null,
+          "scannedAt": "2026-02-01T13:00:00.000Z",
+          "metadata": {
+            "format": "SafeTensor",
+            "size": "pruned",
+            "fp": "fp8"
+          },
+          "hashes": {
+            "AutoV1": "AA110001",
+            "AutoV2": "BB22000011",
+            "SHA256": "AA11BB22CC33DD44EE55FF6600112233445566778899AABBCCDDEEFF00112233",
+            "CRC32": "CC330001",
+            "BLAKE3": "DD44EE55FF6600112233445566778899AABBCCDDEEFF00112233445566778899",
+            "AutoV3": "EE5500110022"
+          },
+          "downloadUrl": "https://example.com/api/download/models/5550003",
+          "primary": true
+        }
+      ],
+      "images": [
+        {
+          "url": "https://example.com/images/test-ea-preview.jpeg",
+          "nsfwLevel": 1,
+          "width": 1024,
+          "height": 1024,
+          "hash": "UTEST10000000000000000000000000000000",
+          "type": "image",
+          "minor": false,
+          "poi": false,
+          "hasMeta": false,
+          "hasPositivePrompt": false,
+          "onSite": false,
+          "remixOfId": null
+        }
+      ],
+      "downloadUrl": "https://example.com/api/download/models/5550003"
+    },
+    {
+      "id": 5550002,
+      "index": 1,
+      "name": "Flux Dev V2",
+      "baseModel": "Flux.1 D",
+      "baseModelType": "Standard",
+      "createdAt": "2025-12-01T10:00:00.000Z",
+      "publishedAt": "2025-12-01T12:00:00.000Z",
+      "status": "Published",
+      "availability": "Public",
+      "nsfwLevel": 1,
+      "covered": false,
+      "stats": {
+        "downloadCount": 2000,
+        "thumbsUpCount": 400,
+        "thumbsDownCount": 2
+      },
+      "files": [
+        {
+          "id": 7770002,
+          "sizeKB": 0.09765625,
+          "name": "dreamWeaver_fluxDevV2.safetensors",
+          "type": "Model",
+          "pickleScanResult": "Success",
+          "pickleScanMessage": "No Pickle imports",
+          "virusScanResult": "Success",
+          "virusScanMessage": null,
+          "scannedAt": "2025-12-01T13:00:00.000Z",
+          "metadata": {
+            "format": "SafeTensor",
+            "size": "pruned",
+            "fp": "fp8"
+          },
+          "hashes": {
+            "AutoV1": "AA110002",
+            "AutoV2": "BB22000022",
+            "SHA256": "16EE9E0BFAE1B44EF42E8805155E3A08264B8B48E3C913D9F75234661EF4E88A",
+            "CRC32": "CC330002",
+            "BLAKE3": "FF66001122334455667788990011223344556677889900AABBCCDDEEFF001122",
+            "AutoV3": "EE5500220033"
+          },
+          "downloadUrl": "https://example.com/api/download/models/5550002",
+          "primary": true
+        }
+      ],
+      "images": [
+        {
+          "url": "https://example.com/images/test-flux-preview.jpeg",
+          "nsfwLevel": 1,
+          "width": 800,
+          "height": 1024,
+          "hash": "UTEST20000000000000000000000000000000",
+          "type": "image",
+          "minor": false,
+          "poi": false,
+          "hasMeta": false,
+          "hasPositivePrompt": false,
+          "onSite": false,
+          "remixOfId": null
+        }
+      ],
+      "downloadUrl": "https://example.com/api/download/models/5550002"
+    },
+    {
+      "id": 5550001,
+      "index": 2,
+      "name": "SDXL V1",
+      "baseModel": "SDXL 1.0",
+      "baseModelType": "Standard",
+      "createdAt": "2025-09-01T10:00:00.000Z",
+      "publishedAt": "2025-09-01T12:00:00.000Z",
+      "status": "Published",
+      "availability": "Public",
+      "nsfwLevel": 1,
+      "covered": false,
+      "stats": {
+        "downloadCount": 3000,
+        "thumbsUpCount": 500,
+        "thumbsDownCount": 3
+      },
+      "files": [
+        {
+          "id": 7770001,
+          "sizeKB": 4500000.0,
+          "name": "dreamWeaver_sdxlV1.safetensors",
+          "type": "Model",
+          "pickleScanResult": "Success",
+          "pickleScanMessage": "No Pickle imports",
+          "virusScanResult": "Success",
+          "virusScanMessage": null,
+          "scannedAt": "2025-09-01T13:00:00.000Z",
+          "metadata": {
+            "format": "SafeTensor",
+            "size": "full",
+            "fp": "fp16"
+          },
+          "hashes": {
+            "AutoV1": "AA110003",
+            "AutoV2": "BB22000033",
+            "SHA256": "AABB00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDD",
+            "CRC32": "CC330003",
+            "BLAKE3": "0011223344556677889900AABBCCDDEEFF00112233445566778899AABBCCDDEEFF",
+            "AutoV3": "EE5500330044"
+          },
+          "downloadUrl": "https://example.com/api/download/models/5550001",
+          "primary": true
+        }
+      ],
+      "images": [
+        {
+          "url": "https://example.com/images/test-sdxl-preview.jpeg",
+          "nsfwLevel": 1,
+          "width": 1024,
+          "height": 1024,
+          "hash": "UTEST30000000000000000000000000000000",
+          "type": "image",
+          "minor": false,
+          "poi": false,
+          "hasMeta": false,
+          "hasPositivePrompt": false,
+          "onSite": false,
+          "remixOfId": null
+        }
+      ],
+      "downloadUrl": "https://example.com/api/download/models/5550001"
+    }
+  ]
+}

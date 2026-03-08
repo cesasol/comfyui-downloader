@@ -1,6 +1,6 @@
 pub mod types;
 
-use crate::civitai::types::{ModelVersion, ModelInfo};
+use crate::civitai::types::{ModelInfo, ModelVersion};
 use anyhow::{Context, Result};
 use reqwest::{Client, StatusCode};
 use std::time::Duration;
@@ -16,9 +16,7 @@ pub struct CivitaiClient {
 
 impl CivitaiClient {
     pub fn new(api_key: Option<String>) -> Result<Self> {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        let http = Client::builder().timeout(Duration::from_secs(30)).build()?;
         Ok(Self { http, api_key })
     }
 
@@ -38,11 +36,20 @@ impl CivitaiClient {
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
-        let key = self.api_key.as_deref()
-            .ok_or_else(|| anyhow::anyhow!("CivitAI API key is not configured (set civitai.api_key in config.toml)"))?;
+        let key = self.api_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "CivitAI API key is not configured (set civitai.api_key in config.toml)"
+            )
+        })?;
         let mut attempts = 0u32;
         loop {
-            let resp = self.http.get(url).bearer_auth(key).send().await.context("sending request")?;
+            let resp = self
+                .http
+                .get(url)
+                .bearer_auth(key)
+                .send()
+                .await
+                .context("sending request")?;
 
             match resp.status() {
                 StatusCode::TOO_MANY_REQUESTS => {

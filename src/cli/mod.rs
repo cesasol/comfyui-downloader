@@ -5,7 +5,10 @@ use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(name = "comfyui-dl", about = "CLI client for the comfyui-downloader daemon")]
+#[command(
+    name = "comfyui-dl",
+    about = "CLI client for the comfyui-downloader daemon"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

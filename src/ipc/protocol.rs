@@ -6,7 +6,10 @@ use uuid::Uuid;
 #[serde(tag = "cmd", content = "payload", rename_all = "snake_case")]
 pub enum Request {
     /// Enqueue a CivitAI model URL for download.
-    AddDownload { url: String, model_type: Option<String> },
+    AddDownload {
+        url: String,
+        model_type: Option<String>,
+    },
     /// Return the current queue state.
     ListQueue,
     /// Trigger an immediate update scan.
@@ -31,6 +34,8 @@ impl Response {
     }
 
     pub fn err(msg: impl Into<String>) -> Self {
-        Self::Err { message: msg.into() }
+        Self::Err {
+            message: msg.into(),
+        }
     }
 }

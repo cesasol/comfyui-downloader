@@ -1,10 +1,10 @@
 use crate::catalog::DownloadJob;
-use crate::civitai::types::ModelVersion;
 use crate::civitai::CivitaiClient;
+use crate::civitai::types::ModelVersion;
 use crate::config::Config;
 use crate::daemon::notifier;
 use crate::daemon::queue::{DownloadProgress, ProgressMap};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -50,7 +50,11 @@ struct ModelMetadata {
 
 /// Resolve the authoritative download URL, expected SHA-256, model type, and base model
 /// from the CivitAI API. Falls back to the stored job URL only when no IDs are available.
-async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Config) -> Result<VersionResolution> {
+async fn resolve_version(
+    job: &DownloadJob,
+    civitai: &CivitaiClient,
+    config: &Config,
+) -> Result<VersionResolution> {
     match (job.version_id, job.model_id) {
         (Some(version_id), Some(model_id)) => {
             // Both IDs known: use get_model for reliable type and base_model,
@@ -71,17 +75,27 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 .find(|f| f.primary == Some(true))
                 .or_else(|| version.files.first())
                 .context("no files in version metadata")?;
-            let model_type_subdir = Some(model_info.r#type.models_subdir_for_file(file, base_model.as_deref()).to_string());
-            let download_url = file
-                .download_url
-                .clone()
-                .with_context(|| format!("no downloadUrl for file '{}' in version {version_id}", file.name))?;
+            let model_type_subdir = Some(
+                model_info
+                    .r#type
+                    .models_subdir_for_file(file, base_model.as_deref())
+                    .to_string(),
+            );
+            let download_url = file.download_url.clone().with_context(|| {
+                format!(
+                    "no downloadUrl for file '{}' in version {version_id}",
+                    file.name
+                )
+            })?;
             let expected_hash = file.hashes.sha256.clone();
             let filename = file.name.clone();
             let preview_image_url = version.images.first().map(|img| img.url.clone());
             let preview_nsfw_level = version.images.first().and_then(|img| img.nsfw_level);
             let model_name = Some(model_info.name);
-            info!("Resolved: type={:?} base_model={:?} file={}", model_type_subdir, base_model, filename);
+            info!(
+                "Resolved: type={:?} base_model={:?} file={}",
+                model_type_subdir, base_model, filename
+            );
             Ok(VersionResolution {
                 download_url,
                 expected_hash,
@@ -108,20 +122,26 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 .find(|f| f.primary == Some(true))
                 .or_else(|| version.files.first())
                 .context("no files in version metadata")?;
-            let model_type_subdir = version
-                .model
-                .as_ref()
-                .map(|m| m.r#type.models_subdir_for_file(file, base_model.as_deref()).to_string());
-            let download_url = file
-                .download_url
-                .clone()
-                .with_context(|| format!("no downloadUrl for file '{}' in version {version_id}", file.name))?;
+            let model_type_subdir = version.model.as_ref().map(|m| {
+                m.r#type
+                    .models_subdir_for_file(file, base_model.as_deref())
+                    .to_string()
+            });
+            let download_url = file.download_url.clone().with_context(|| {
+                format!(
+                    "no downloadUrl for file '{}' in version {version_id}",
+                    file.name
+                )
+            })?;
             let expected_hash = file.hashes.sha256.clone();
             let filename = file.name.clone();
             let preview_image_url = version.images.first().map(|img| img.url.clone());
             let preview_nsfw_level = version.images.first().and_then(|img| img.nsfw_level);
             let model_name = version.model.as_ref().map(|m| m.name.clone());
-            info!("Resolved: type={:?} base_model={:?} file={}", model_type_subdir, base_model, filename);
+            info!(
+                "Resolved: type={:?} base_model={:?} file={}",
+                model_type_subdir, base_model, filename
+            );
             Ok(VersionResolution {
                 download_url,
                 expected_hash,
@@ -144,7 +164,10 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
             let latest = model_info
                 .model_versions
                 .iter()
-                .find(|v| !config.daemon.skip_early_access || v.availability.as_deref() != Some("EarlyAccess"))
+                .find(|v| {
+                    !config.daemon.skip_early_access
+                        || v.availability.as_deref() != Some("EarlyAccess")
+                })
                 .context("no publicly available version (all versions are EarlyAccess)")?;
             let base_model = latest.base_model.clone();
             let version_id = latest.id;
@@ -158,17 +181,27 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
                 .find(|f| f.primary == Some(true))
                 .or_else(|| version.files.first())
                 .context("no files in latest version")?;
-            let model_type_subdir = Some(model_info.r#type.models_subdir_for_file(file, base_model.as_deref()).to_string());
-            let download_url = file
-                .download_url
-                .clone()
-                .with_context(|| format!("no downloadUrl for file '{}' in version {version_id}", file.name))?;
+            let model_type_subdir = Some(
+                model_info
+                    .r#type
+                    .models_subdir_for_file(file, base_model.as_deref())
+                    .to_string(),
+            );
+            let download_url = file.download_url.clone().with_context(|| {
+                format!(
+                    "no downloadUrl for file '{}' in version {version_id}",
+                    file.name
+                )
+            })?;
             let expected_hash = file.hashes.sha256.clone();
             let filename = file.name.clone();
             let preview_image_url = version.images.first().map(|img| img.url.clone());
             let preview_nsfw_level = version.images.first().and_then(|img| img.nsfw_level);
             let model_name = Some(model_info.name);
-            info!("Resolved: type={:?} base_model={:?} file={}", model_type_subdir, base_model, filename);
+            info!(
+                "Resolved: type={:?} base_model={:?} file={}",
+                model_type_subdir, base_model, filename
+            );
             Ok(VersionResolution {
                 download_url,
                 expected_hash,
@@ -183,7 +216,10 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Co
         }
 
         (None, None) => {
-            warn!("Job {} has no model/version ID; using stored URL without checksum verification", job.id);
+            warn!(
+                "Job {} has no model/version ID; using stored URL without checksum verification",
+                job.id
+            );
             Ok(VersionResolution {
                 download_url: job.url.clone(),
                 expected_hash: None,
@@ -208,11 +244,9 @@ pub async fn download(
     token: CancellationToken,
     progress: ProgressMap,
 ) -> Result<(PathBuf, Option<String>)> {
-    let key = config
-        .civitai
-        .api_key
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("CivitAI API key is not configured (set civitai.api_key in config.toml)"))?;
+    let key = config.civitai.api_key.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("CivitAI API key is not configured (set civitai.api_key in config.toml)")
+    })?;
 
     let resolution = resolve_version(job, civitai, config).await?;
 
@@ -230,7 +264,10 @@ pub async fn download(
     if let Some(ref name) = resolution.filename {
         let existing = dest_dir.join(name);
         if existing.exists() {
-            info!("File already exists, skipping download: {}", existing.display());
+            info!(
+                "File already exists, skipping download: {}",
+                existing.display()
+            );
             return Ok((existing, resolution.model_type_subdir));
         }
     }
@@ -265,10 +302,19 @@ pub async fn download(
                 .to_string()
         });
 
-    info!("Downloading '{}' → {}/{}", filename, model_type_str, filename);
+    info!(
+        "Downloading '{}' → {}/{}",
+        filename, model_type_str, filename
+    );
     {
         let mut prog = progress.lock().await;
-        prog.insert(job.id, DownloadProgress { bytes_received: 0, total_bytes });
+        prog.insert(
+            job.id,
+            DownloadProgress {
+                bytes_received: 0,
+                total_bytes,
+            },
+        );
     }
 
     let notif_id = notifier::notify_download_start(&filename);
@@ -343,17 +389,31 @@ pub async fn download(
     fs::rename(&tmp, &dest).await?;
 
     let preview_path = resolution.preview_image_url.as_deref().map(|url| {
-        let ext = url.split('?').next().unwrap_or(url).rsplit('.').next().unwrap_or("jpg");
+        let ext = url
+            .split('?')
+            .next()
+            .unwrap_or(url)
+            .rsplit('.')
+            .next()
+            .unwrap_or("jpg");
         dest.with_extension(format!("preview.{ext}"))
     });
     write_metadata(&dest, &resolution, &digest, preview_path.as_ref()).await;
-    if let (Some(url), Some(path)) = (resolution.preview_image_url.as_deref(), preview_path.as_ref()) {
+    if let (Some(url), Some(path)) = (
+        resolution.preview_image_url.as_deref(),
+        preview_path.as_ref(),
+    ) {
         download_preview(url, path).await;
     }
     Ok((dest, resolution.model_type_subdir))
 }
 
-async fn write_metadata(dest: &PathBuf, resolution: &VersionResolution, sha256: &str, preview_path: Option<&PathBuf>) {
+async fn write_metadata(
+    dest: &PathBuf,
+    resolution: &VersionResolution,
+    sha256: &str,
+    preview_path: Option<&PathBuf>,
+) {
     let meta_path = dest.with_extension("metadata.json");
 
     let fs_meta = tokio::fs::metadata(dest).await.ok();
@@ -406,18 +466,16 @@ async fn download_preview(url: &str, path: &PathBuf) {
     }
     let http = reqwest::Client::new();
     match http.get(url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            match resp.bytes().await {
-                Ok(bytes) => {
-                    if let Err(e) = tokio::fs::write(path, &bytes).await {
-                        warn!("Failed to write preview image {}: {e}", path.display());
-                    } else {
-                        info!("Preview saved: {}", path.display());
-                    }
+        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+            Ok(bytes) => {
+                if let Err(e) = tokio::fs::write(path, &bytes).await {
+                    warn!("Failed to write preview image {}: {e}", path.display());
+                } else {
+                    info!("Preview saved: {}", path.display());
                 }
-                Err(e) => warn!("Failed to read preview image bytes: {e}"),
             }
-        }
+            Err(e) => warn!("Failed to read preview image bytes: {e}"),
+        },
         Ok(resp) => warn!("Preview image request failed with status {}", resp.status()),
         Err(e) => warn!("Failed to fetch preview image: {e}"),
     }
@@ -439,7 +497,13 @@ pub(crate) async fn save_artifacts(
     let preview_image_url = version.images.first().map(|img| img.url.clone());
     let preview_nsfw_level = version.images.first().and_then(|img| img.nsfw_level);
     let preview_path = preview_image_url.as_deref().map(|url| {
-        let ext = url.split('?').next().unwrap_or(url).rsplit('.').next().unwrap_or("jpg");
+        let ext = url
+            .split('?')
+            .next()
+            .unwrap_or(url)
+            .rsplit('.')
+            .next()
+            .unwrap_or("jpg");
         dest.with_extension(format!("preview.{ext}"))
     });
     let resolution = VersionResolution {
@@ -486,7 +550,12 @@ pub(crate) fn free_disk_bytes(path: &std::path::Path) -> Result<u64> {
 /// Strips characters that are unsafe on common filesystems (slashes, null bytes, etc.).
 fn sanitize_dir_name(s: &str) -> String {
     s.chars()
-        .filter(|c| !matches!(c, '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .filter(|c| {
+            !matches!(
+                c,
+                '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+            )
+        })
         .collect()
 }
 
@@ -502,9 +571,8 @@ fn parse_filename_from_cd(header: &str) -> Option<String> {
 mod tests {
     #[test]
     fn test_parse_filename_from_cd_quoted() {
-        let result = super::parse_filename_from_cd(
-            r#"attachment; filename="my_model.safetensors""#,
-        );
+        let result =
+            super::parse_filename_from_cd(r#"attachment; filename="my_model.safetensors""#);
         assert_eq!(result, Some("my_model.safetensors".to_string()));
     }
 
@@ -516,7 +584,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancellation_token_stops_loop() {
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
         use tokio_util::sync::CancellationToken;
 
         let token = CancellationToken::new();
@@ -531,5 +599,35 @@ mod tests {
 
         token.cancel();
         assert_eq!(result.await.unwrap(), "cancelled");
+    }
+
+    fn load_model_info() -> crate::civitai::types::ModelInfo {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/stubs/model_response.stub.json");
+        let json = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn test_early_access_filtering() {
+        let info = load_model_info();
+
+        let first_public = info
+            .model_versions
+            .iter()
+            .find(|v| v.availability.as_deref() != Some("EarlyAccess"));
+
+        let v = first_public.expect("should find a public version");
+        assert_eq!(v.id, 5550002);
+        assert_eq!(v.name, "Flux Dev V2");
+    }
+
+    #[test]
+    fn test_early_access_not_filtered_when_disabled() {
+        let info = load_model_info();
+
+        let latest = info.model_versions.first().expect("should have versions");
+        assert_eq!(latest.id, 5550003);
+        assert_eq!(latest.availability.as_deref(), Some("EarlyAccess"));
     }
 }

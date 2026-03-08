@@ -110,21 +110,26 @@ async fn handle_request(
         Request::GetStatus => {
             let queued = {
                 let cat = catalog.lock().await;
-                cat.count_by_status(crate::catalog::JobStatus::Queued).unwrap_or(0)
+                cat.count_by_status(crate::catalog::JobStatus::Queued)
+                    .unwrap_or(0)
             };
             let active_jobs: Vec<serde_json::Value> = {
                 let prog = progress.lock().await;
                 prog.iter()
-                    .map(|(id, p)| serde_json::json!({
-                        "id": id,
-                        "bytes_received": p.bytes_received,
-                        "total_bytes": p.total_bytes,
-                    }))
+                    .map(|(id, p)| {
+                        serde_json::json!({
+                            "id": id,
+                            "bytes_received": p.bytes_received,
+                            "total_bytes": p.total_bytes,
+                        })
+                    })
                     .collect()
             };
             let free_bytes = crate::config::Config::load()
                 .ok()
-                .map(|c| crate::daemon::downloader::free_disk_bytes(&c.paths.models_dir).unwrap_or(0))
+                .map(|c| {
+                    crate::daemon::downloader::free_disk_bytes(&c.paths.models_dir).unwrap_or(0)
+                })
                 .unwrap_or(0);
             Response::ok(serde_json::json!({
                 "queued": queued,

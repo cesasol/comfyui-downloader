@@ -43,7 +43,12 @@ pub fn notify_download_start(filename: &str) -> Option<u32> {
 
 /// Replace the progress notification (identified by `id`) with updated progress text.
 /// Silently ignores errors — progress notifications are best-effort.
-pub fn update_download_progress(id: u32, filename: &str, bytes_received: u64, total_bytes: Option<u64>) {
+pub fn update_download_progress(
+    id: u32,
+    filename: &str,
+    bytes_received: u64,
+    total_bytes: Option<u64>,
+) {
     let body = match total_bytes {
         Some(total) if total > 0 => {
             let pct = bytes_received * 100 / total;

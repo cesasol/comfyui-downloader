@@ -24,9 +24,7 @@ impl IpcClient {
         writer.write_all(line.as_bytes()).await?;
 
         let mut response_line = String::new();
-        BufReader::new(reader)
-            .read_line(&mut response_line)
-            .await?;
+        BufReader::new(reader).read_line(&mut response_line).await?;
 
         serde_json::from_str(&response_line).context("parsing daemon response")
     }

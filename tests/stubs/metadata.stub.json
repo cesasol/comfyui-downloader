@@ -1,0 +1,110 @@
+{
+  "file_name": "syntheticTestModel_v2",
+  "model_name": "Synthetic Test Model",
+  "file_path": "/tmp/test-models/diffusion_models/Flux.1 D/syntheticTestModel_v2.safetensors",
+  "size": 100,
+  "modified": 1700000000.0,
+  "sha256": "16ee9e0bfae1b44ef42e8805155e3a08264b8b48e3c913d9f75234661ef4e88a",
+  "base_model": "Flux.1 D",
+  "preview_url": "/tmp/test-models/diffusion_models/Flux.1 D/syntheticTestModel_v2.preview.jpeg",
+  "preview_nsfw_level": 1,
+  "notes": "",
+  "from_civitai": true,
+  "civitai": {
+    "id": 5550001,
+    "modelId": 990001,
+    "name": "v2",
+    "createdAt": "2025-06-15T10:00:00.000Z",
+    "updatedAt": "2025-06-15T12:00:00.000Z",
+    "status": "Published",
+    "publishedAt": "2025-06-15T12:00:00.000Z",
+    "trainedWords": [],
+    "baseModel": "Flux.1 D",
+    "baseModelType": "Standard",
+    "earlyAccessEndsAt": null,
+    "description": "<p>Test version with improved quality</p>",
+    "uploadType": "Created",
+    "air": "urn:air:flux1:checkpoint:civitai:990001@5550001",
+    "stats": {
+      "downloadCount": 1234,
+      "ratingCount": 0,
+      "rating": 0,
+      "thumbsUpCount": 567
+    },
+    "model": {
+      "name": "Synthetic Test Model",
+      "type": "Checkpoint",
+      "nsfw": false,
+      "poi": false
+    },
+    "files": [
+      {
+        "id": 7770001,
+        "sizeKB": 0.09765625,
+        "name": "syntheticTestModel_v2.safetensors",
+        "type": "Model",
+        "pickleScanResult": "Success",
+        "pickleScanMessage": "No Pickle imports",
+        "virusScanResult": "Success",
+        "virusScanMessage": null,
+        "scannedAt": "2025-06-15T13:00:00.000Z",
+        "metadata": {
+          "format": "SafeTensor",
+          "size": "pruned",
+          "fp": "fp8"
+        },
+        "hashes": {
+          "AutoV1": "AABB1122",
+          "AutoV2": "CCDD334455",
+          "SHA256": "16EE9E0BFAE1B44EF42E8805155E3A08264B8B48E3C913D9F75234661EF4E88A",
+          "CRC32": "11223344",
+          "BLAKE3": "AABBCCDD11223344556677889900AABBCCDDEEFF00112233445566778899001122",
+          "AutoV3": "EEFF00112233"
+        },
+        "primary": true,
+        "downloadUrl": "https://example.com/api/download/models/5550001"
+      }
+    ],
+    "images": [
+      {
+        "url": "https://example.com/images/test-preview-001.jpeg",
+        "nsfwLevel": 1,
+        "width": 832,
+        "height": 1216,
+        "hash": "UTEST00000000000000000000000000000000",
+        "type": "image",
+        "metadata": {
+          "hash": "UTEST00000000000000000000000000000000",
+          "size": 50000,
+          "width": 832,
+          "height": 1216
+        },
+        "minor": false,
+        "poi": false,
+        "meta": null,
+        "availability": "Public",
+        "hasMeta": false,
+        "hasPositivePrompt": false,
+        "onSite": false,
+        "remixOfId": null
+      }
+    ],
+    "downloadUrl": "https://example.com/api/download/models/5550001",
+    "creator": {
+      "username": "testcreator",
+      "image": "https://example.com/images/testcreator-avatar.jpeg"
+    }
+  },
+  "tags": [
+    "test",
+    "checkpoint",
+    "synthetic"
+  ],
+  "modelDescription": "<p>A synthetic test model for unit testing.</p>",
+  "civitai_deleted": false,
+  "favorite": false,
+  "exclude": false,
+  "db_checked": false,
+  "last_checked_at": 0,
+  "model_type": "checkpoint"
+}

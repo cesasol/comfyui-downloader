@@ -2,7 +2,7 @@ pub mod schema;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use uuid::Uuid;
@@ -428,5 +428,75 @@ mod tests {
             .unwrap();
         let updated = catalog.get_job(job.id).unwrap().unwrap();
         assert_eq!(updated.dest_path.as_deref(), Some("/tmp/model.safetensors"));
+    }
+
+    fn load_metadata_value() -> serde_json::Value {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/stubs/metadata.stub.json");
+        let json = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn test_catalog_register_from_stub_metadata() {
+        let meta = load_metadata_value();
+
+        let version_id = meta["civitai"]["id"].as_u64();
+        let model_id = meta["civitai"]["modelId"].as_u64();
+        let download_url = meta["civitai"]["downloadUrl"].as_str().unwrap();
+
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog
+            .register_existing(
+                download_url,
+                model_id,
+                version_id,
+                Some("diffusion_models"),
+                std::path::Path::new(
+                    "/tmp/test-models/diffusion_models/Flux.1 D/syntheticTestModel_v2.safetensors",
+                ),
+            )
+            .unwrap()
+            .expect("should insert new row");
+
+        assert_eq!(job.version_id, Some(5550001));
+        assert_eq!(job.model_id, Some(990001));
+        assert_eq!(job.model_type.as_deref(), Some("diffusion_models"));
+    }
+
+    #[test]
+    fn test_catalog_dedup_with_stub_metadata() {
+        let meta = load_metadata_value();
+
+        let version_id = meta["civitai"]["id"].as_u64();
+        let model_id = meta["civitai"]["modelId"].as_u64();
+        let download_url = meta["civitai"]["downloadUrl"].as_str().unwrap();
+        let dest = std::path::Path::new(
+            "/tmp/test-models/diffusion_models/Flux.1 D/syntheticTestModel_v2.safetensors",
+        );
+
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+
+        let first = catalog
+            .register_existing(
+                download_url,
+                model_id,
+                version_id,
+                Some("diffusion_models"),
+                dest,
+            )
+            .unwrap();
+        assert!(first.is_some());
+
+        let dup = catalog
+            .register_existing(
+                download_url,
+                model_id,
+                version_id,
+                Some("diffusion_models"),
+                dest,
+            )
+            .unwrap();
+        assert!(dup.is_none(), "duplicate version_id must be rejected");
     }
 }

@@ -5,7 +5,7 @@ use crate::daemon::notifier;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
 pub async fn run(
@@ -76,7 +76,10 @@ async fn check_updates(
             drop(cat);
             let _ = notifier::notify_update_available(&model.name, &latest.name);
         } else {
-            info!("Model {model_id} is up to date (version {})", stored_version_id);
+            info!(
+                "Model {model_id} is up to date (version {})",
+                stored_version_id
+            );
         }
     }
 
@@ -96,7 +99,7 @@ mod tests {
     async fn test_notify_wakes_select() {
         use std::sync::Arc;
         use tokio::sync::Notify;
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
         let notify = Arc::new(Notify::new());
         let n = notify.clone();
@@ -111,5 +114,30 @@ mod tests {
 
         notify.notify_one();
         assert_eq!(result.await.unwrap(), "notified");
+    }
+
+    fn load_model_info() -> crate::civitai::types::ModelInfo {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/stubs/model_response.stub.json");
+        let json = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn test_update_available_from_stub_versions() {
+        let info = load_model_info();
+
+        let stored_version_id = 5550001u64;
+        let latest = info.model_versions.first().unwrap();
+        assert!(latest.id > stored_version_id);
+    }
+
+    #[test]
+    fn test_no_update_when_already_latest() {
+        let info = load_model_info();
+
+        let stored_version_id = 5550003u64;
+        let latest = info.model_versions.first().unwrap();
+        assert!(latest.id <= stored_version_id);
     }
 }
