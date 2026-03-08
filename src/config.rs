@@ -28,6 +28,7 @@ pub struct DaemonConfig {
     pub max_concurrent_downloads: usize,
     pub socket_path: PathBuf,
     /// Skip model versions marked as EarlyAccess when selecting the latest version.
+    #[serde(default = "default_true")]
     pub skip_early_access: bool,
 }
 
@@ -97,6 +98,10 @@ impl Default for Config {
             daemon: Default::default(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn config_path() -> PathBuf {
