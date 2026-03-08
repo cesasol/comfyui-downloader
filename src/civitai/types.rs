@@ -23,6 +23,7 @@ pub struct ModelVersion {
     pub name: String,
     pub model_id: Option<u64>,
     pub created_at: String,
+    pub availability: Option<String>,
     pub download_url: Option<String>,
     pub files: Vec<ModelFile>,
     /// Nested model info (present in /model-versions/{id} responses).

@@ -21,7 +21,7 @@ struct VersionResolution {
 
 /// Resolve the authoritative download URL, expected SHA-256, and model type from the CivitAI API.
 /// Falls back to the stored job URL only when no model/version ID is available.
-async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient) -> Result<VersionResolution> {
+async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Config) -> Result<VersionResolution> {
     if let Some(version_id) = job.version_id {
         let version = civitai
             .get_model_version(version_id)
@@ -56,8 +56,12 @@ async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient) -> Result<V
         let model_type_subdir = Some(model_info.r#type.models_subdir().to_string());
         let latest = model_info
             .model_versions
-            .first()
-            .context("model has no versions")?;
+            .iter()
+            .find(|v| {
+                !config.daemon.skip_early_access
+                    || v.availability.as_deref() != Some("EarlyAccess")
+            })
+            .context("no publicly available version (all versions are EarlyAccess)")?;
         let version = civitai
             .get_model_version(latest.id)
             .await
@@ -105,7 +109,7 @@ pub async fn download(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("CivitAI API key is not configured (set civitai.api_key in config.toml)"))?;
 
-    let resolution = resolve_version(job, civitai).await?;
+    let resolution = resolve_version(job, civitai, config).await?;
 
     // Prefer the API-reported model type over whatever the user provided at enqueue time.
     let model_type_str = resolution

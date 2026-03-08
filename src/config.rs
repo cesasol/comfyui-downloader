@@ -27,6 +27,8 @@ pub struct DaemonConfig {
     pub update_interval_hours: u64,
     pub max_concurrent_downloads: usize,
     pub socket_path: PathBuf,
+    /// Skip model versions marked as EarlyAccess when selecting the latest version.
+    pub skip_early_access: bool,
 }
 
 impl Default for CivitaiConfig {
@@ -51,6 +53,7 @@ impl Default for DaemonConfig {
         Self {
             update_interval_hours: 24,
             max_concurrent_downloads: 2,
+            skip_early_access: true,
             socket_path: PathBuf::from(format!(
                 "/run/user/{}/comfyui-downloader.sock",
                 uid
