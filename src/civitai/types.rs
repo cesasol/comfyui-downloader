@@ -73,7 +73,8 @@ pub enum ModelType {
     Hypernetwork,
     #[serde(rename = "AestheticGradient")]
     AestheticGradient,
-    LORA,
+    #[serde(rename = "LORA")]
+    Lora,
     Controlnet,
     Poses,
     #[serde(rename = "VAE")]
@@ -93,7 +94,7 @@ impl ModelType {
         match self {
             Self::Checkpoint => "checkpoints",
             Self::Embedding => "embeddings",
-            Self::LORA | Self::LoCon => "loras",
+            Self::Lora | Self::LoCon => "loras",
             Self::Controlnet => "controlnet",
             Self::Vae => "vae",
             Self::Upscaler => "upscale_models",
@@ -103,16 +104,17 @@ impl ModelType {
 
     /// Like `models_subdir` but routes Flux checkpoints with `metadata.size == "pruned"`
     /// to `diffusion_models`; all other checkpoints go to `checkpoints`.
-    pub fn models_subdir_for_file(&self, file: &ModelFile, base_model: Option<&str>) -> &'static str {
+    pub fn models_subdir_for_file(
+        &self,
+        file: &ModelFile,
+        base_model: Option<&str>,
+    ) -> &'static str {
         if matches!(self, Self::Checkpoint) {
             let is_flux = base_model
                 .map(|b| b.to_ascii_lowercase().contains("flux"))
                 .unwrap_or(false);
-            let is_pruned = file
-                .metadata
-                .as_ref()
-                .and_then(|m| m.size.as_deref())
-                == Some("pruned");
+            let is_pruned =
+                file.metadata.as_ref().and_then(|m| m.size.as_deref()) == Some("pruned");
             if is_flux && is_pruned {
                 "diffusion_models"
             } else {

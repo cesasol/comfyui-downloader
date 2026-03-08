@@ -1,11 +1,11 @@
 pub mod schema;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadJob {
@@ -107,9 +107,7 @@ impl Catalog {
                     created_at, updated_at, error
              FROM jobs ORDER BY created_at DESC",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(row_to_job(row))
-        })?;
+        let rows = stmt.query_map([], |row| Ok(row_to_job(row)))?;
         rows.map(|r| r?.map_err(anyhow::Error::from)).collect()
     }
 
@@ -147,6 +145,67 @@ impl Catalog {
             |row| row.get(0),
         )?;
         Ok(count as u64)
+    }
+
+    /// Register a model already present on disk as a `Done` job.
+    ///
+    /// Used by the startup scanner so that pre-existing model files become
+    /// visible to the update daemon without going through the normal
+    /// `Queued → Downloading → Done` lifecycle.
+    ///
+    /// Returns `Ok(Some(job))` on successful insertion or `Ok(None)` when a
+    /// row with the same `version_id` (or, when `version_id` is `None`, the
+    /// same `dest_path`) already exists, preventing duplicates on every
+    /// daemon restart.
+    pub fn register_existing(
+        &self,
+        url: &str,
+        model_id: Option<u64>,
+        version_id: Option<u64>,
+        model_type: Option<&str>,
+        dest_path: &Path,
+    ) -> Result<Option<DownloadJob>> {
+        // Deduplicate: prefer version_id; fall back to dest_path.
+        if let Some(vid) = version_id {
+            let count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE version_id = ?1",
+                params![vid],
+                |row| row.get(0),
+            )?;
+            if count > 0 {
+                return Ok(None);
+            }
+        } else {
+            let dest_str = dest_path.to_string_lossy();
+            let count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE dest_path = ?1",
+                params![dest_str.as_ref()],
+                |row| row.get(0),
+            )?;
+            if count > 0 {
+                return Ok(None);
+            }
+        }
+
+        let id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO jobs
+             (id, url, model_id, version_id, model_type, dest_path, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'done', ?7, ?7)",
+            params![
+                id.to_string(),
+                url,
+                model_id,
+                version_id,
+                model_type,
+                dest_path.to_string_lossy().as_ref(),
+                now,
+            ],
+        )?;
+        self.get_job(id)?
+            .context("job not found after register_existing")
+            .map(Some)
     }
 
     pub fn next_queued(&self) -> Result<Option<DownloadJob>> {
@@ -252,8 +311,7 @@ mod tests {
     fn test_parse_ambiguous_download_segment() {
         // A URL where "download" appears before "models" but is NOT the CivitAI API path.
         // Should still be treated as a download URL (same structural check).
-        let (model_id, version_id) =
-            parse_civitai_url("https://civitai.com/download/models/99999");
+        let (model_id, version_id) = parse_civitai_url("https://civitai.com/download/models/99999");
         assert_eq!(model_id, None);
         assert_eq!(version_id, Some(99999));
     }
@@ -273,8 +331,12 @@ mod tests {
     #[test]
     fn test_count_by_status() {
         let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
-        catalog.enqueue("https://civitai.com/models/1", None).unwrap();
-        catalog.enqueue("https://civitai.com/models/2", None).unwrap();
+        catalog
+            .enqueue("https://civitai.com/models/1", None)
+            .unwrap();
+        catalog
+            .enqueue("https://civitai.com/models/2", None)
+            .unwrap();
         let count = catalog.count_by_status(JobStatus::Queued).unwrap();
         assert_eq!(count, 2);
         let done_count = catalog.count_by_status(JobStatus::Done).unwrap();
@@ -282,16 +344,89 @@ mod tests {
     }
 
     #[test]
+    fn test_register_existing_inserts_done_job() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog
+            .register_existing(
+                "https://civitai.com/api/download/models/67890",
+                Some(12345),
+                Some(67890),
+                Some("loras"),
+                std::path::Path::new("/models/loras/Pony/my_lora.safetensors"),
+            )
+            .unwrap()
+            .expect("should insert new row");
+        assert_eq!(job.status, JobStatus::Done);
+        assert_eq!(job.version_id, Some(67890));
+        assert_eq!(job.model_id, Some(12345));
+        assert_eq!(job.model_type.as_deref(), Some("loras"));
+        assert_eq!(
+            job.dest_path.as_deref(),
+            Some("/models/loras/Pony/my_lora.safetensors")
+        );
+    }
+
+    #[test]
+    fn test_register_existing_deduplicates_by_version_id() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let first = catalog
+            .register_existing(
+                "https://civitai.com/api/download/models/67890",
+                Some(12345),
+                Some(67890),
+                Some("loras"),
+                std::path::Path::new("/models/loras/Pony/lora.safetensors"),
+            )
+            .unwrap();
+        assert!(first.is_some());
+        let second = catalog
+            .register_existing(
+                "https://civitai.com/api/download/models/67890",
+                Some(12345),
+                Some(67890),
+                Some("loras"),
+                std::path::Path::new("/models/loras/Pony/lora_copy.safetensors"),
+            )
+            .unwrap();
+        assert!(second.is_none(), "duplicate version_id must return None");
+    }
+
+    #[test]
+    fn test_register_existing_deduplicates_by_dest_path_when_no_version_id() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let path = std::path::Path::new("/models/other/unknown.bin");
+        let first = catalog
+            .register_existing(
+                "https://example.com/unknown.bin",
+                None,
+                None,
+                Some("other"),
+                path,
+            )
+            .unwrap();
+        assert!(first.is_some());
+        let second = catalog
+            .register_existing(
+                "https://example.com/unknown.bin",
+                None,
+                None,
+                Some("other"),
+                path,
+            )
+            .unwrap();
+        assert!(second.is_none(), "duplicate dest_path must return None");
+    }
+
+    #[test]
     fn test_set_dest_path() {
         let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
-        let job = catalog.enqueue("https://civitai.com/models/1", None).unwrap();
+        let job = catalog
+            .enqueue("https://civitai.com/models/1", None)
+            .unwrap();
         catalog
             .set_dest_path(job.id, std::path::Path::new("/tmp/model.safetensors"))
             .unwrap();
         let updated = catalog.get_job(job.id).unwrap().unwrap();
-        assert_eq!(
-            updated.dest_path.as_deref(),
-            Some("/tmp/model.safetensors")
-        );
+        assert_eq!(updated.dest_path.as_deref(), Some("/tmp/model.safetensors"));
     }
 }

@@ -29,7 +29,7 @@ pub async fn run(
     active: ActiveTasks,
     progress: ProgressMap,
 ) {
-    let max = config.daemon.max_concurrent_downloads.max(1) as usize;
+    let max = config.daemon.max_concurrent_downloads.max(1);
     let sem = Arc::new(Semaphore::new(max));
 
     loop {

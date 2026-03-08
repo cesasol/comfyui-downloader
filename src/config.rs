@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub civitai: CivitaiConfig,
@@ -12,7 +12,7 @@ pub struct Config {
     pub daemon: DaemonConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CivitaiConfig {
     pub api_key: Option<String>,
 }
@@ -32,12 +32,6 @@ pub struct DaemonConfig {
     pub skip_early_access: bool,
 }
 
-impl Default for CivitaiConfig {
-    fn default() -> Self {
-        Self { api_key: None }
-    }
-}
-
 impl Default for PathsConfig {
     fn default() -> Self {
         Self {
@@ -53,10 +47,7 @@ impl Default for DaemonConfig {
             update_interval_hours: 24,
             max_concurrent_downloads: 1,
             skip_early_access: true,
-            socket_path: PathBuf::from(format!(
-                "/run/user/{}/comfyui-downloader.sock",
-                uid
-            )),
+            socket_path: PathBuf::from(format!("/run/user/{}/comfyui-downloader.sock", uid)),
         }
     }
 }
@@ -79,22 +70,11 @@ impl Config {
                 .with_context(|| format!("creating config dir {}", parent.display()))?;
         }
         let text = toml::to_string_pretty(self).context("serialising config")?;
-        std::fs::write(&path, text)
-            .with_context(|| format!("writing config {}", path.display()))
+        std::fs::write(&path, text).with_context(|| format!("writing config {}", path.display()))
     }
 
     pub fn config_path() -> PathBuf {
         config_path()
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            civitai: Default::default(),
-            paths: Default::default(),
-            daemon: Default::default(),
-        }
     }
 }
 

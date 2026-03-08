@@ -35,8 +35,9 @@ pub async fn run() -> Result<()> {
     let scanner_handle = {
         let cfg = config.clone();
         let civ = civitai.clone();
+        let cat = catalog.clone();
         tokio::spawn(async move {
-            scanner::run(cfg, civ).await;
+            scanner::run(cfg, civ, cat).await;
         })
     };
 

@@ -7,7 +7,7 @@ use crate::daemon::queue::{DownloadProgress, ProgressMap};
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
@@ -260,7 +260,7 @@ pub async fn download(
             resolution
                 .download_url
                 .split('/')
-                .last()
+                .next_back()
                 .unwrap_or("model.bin")
                 .to_string()
         });
@@ -296,14 +296,13 @@ pub async fn download(
                                 entry.bytes_received = bytes_received;
                             }
                         }
-                        // Update progress notification every 10%.
-                        if let (Some(nid), Some(total)) = (notif_id, total_bytes) {
-                            if total > 0 {
-                                let pct = bytes_received * 100 / total;
-                                if pct >= last_notif_pct + 10 {
-                                    last_notif_pct = pct;
-                                    notifier::update_download_progress(nid, &filename, bytes_received, total_bytes);
-                                }
+                        if let (Some(nid), Some(total)) = (notif_id, total_bytes)
+                            && total > 0
+                        {
+                            let pct = bytes_received * 100 / total;
+                            if pct >= last_notif_pct + 10 {
+                                last_notif_pct = pct;
+                                notifier::update_download_progress(nid, &filename, bytes_received, total_bytes);
                             }
                         }
                     }
@@ -457,14 +456,14 @@ pub(crate) async fn save_artifacts(
     if write_meta {
         write_metadata(dest, &resolution, sha256, preview_path.as_ref()).await;
     }
-    if write_preview {
-        if let (Some(url), Some(path)) = (preview_image_url.as_deref(), preview_path.as_ref()) {
-            download_preview(url, path).await;
-        }
+    if write_preview
+        && let (Some(url), Some(path)) = (preview_image_url.as_deref(), preview_path.as_ref())
+    {
+        download_preview(url, path).await;
     }
 }
 
-fn check_disk_space(dir: &PathBuf) -> Result<()> {
+fn check_disk_space(dir: &Path) -> Result<()> {
     let stat = free_disk_bytes(dir)?;
     if stat < 1024 * 1024 * 1024 {
         bail!("insufficient disk space (< 1 GiB free)");
@@ -472,7 +471,7 @@ fn check_disk_space(dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn free_disk_bytes(path: &std::path::PathBuf) -> Result<u64> {
+pub(crate) fn free_disk_bytes(path: &std::path::Path) -> Result<u64> {
     use std::ffi::CString;
     let cs = CString::new(path.to_string_lossy().as_ref())?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
