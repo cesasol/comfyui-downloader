@@ -26,10 +26,25 @@ enum Command {
     CheckUpdates,
     /// Cancel a queued or active download by ID
     Cancel { id: Uuid },
+    /// Set the CivitAI API key in the config file
+    SetKey {
+        /// Your CivitAI API key
+        key: String,
+    },
 }
 
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    // SetKey runs without a daemon connection — it writes directly to the config file.
+    if let Command::SetKey { key } = cli.command {
+        let mut config = Config::load()?;
+        config.civitai.api_key = Some(key);
+        config.save()?;
+        println!("API key saved to {}", Config::config_path().display());
+        return Ok(());
+    }
+
     let config = Config::load()?;
     let mut client = IpcClient::connect(&config.daemon.socket_path).await?;
 
@@ -38,6 +53,7 @@ pub async fn run() -> Result<()> {
         Command::Status => Request::GetStatus,
         Command::CheckUpdates => Request::CheckUpdates,
         Command::Cancel { id } => Request::Cancel { id },
+        Command::SetKey { .. } => unreachable!(),
     };
 
     let response = client.send(&req).await?;

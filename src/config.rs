@@ -70,6 +70,17 @@ impl Config {
         toml::from_str(&text).context("parsing config.toml")
     }
 
+    pub fn save(&self) -> Result<()> {
+        let path = config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating config dir {}", parent.display()))?;
+        }
+        let text = toml::to_string_pretty(self).context("serialising config")?;
+        std::fs::write(&path, text)
+            .with_context(|| format!("writing config {}", path.display()))
+    }
+
     pub fn config_path() -> PathBuf {
         config_path()
     }
