@@ -6,8 +6,10 @@ pub mod updater;
 use crate::catalog::Catalog;
 use crate::civitai::CivitaiClient;
 use crate::config::Config;
+use crate::daemon::queue::ActiveTasks;
 use crate::ipc::{IpcServer, Request, Response};
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
@@ -24,21 +26,18 @@ pub async fn run() -> Result<()> {
     )?));
 
     let civitai = Arc::new(CivitaiClient::new(config.civitai.api_key.clone())?);
-    let cfg = config.clone();
-    let cat = catalog.clone();
-    let civ = civitai.clone();
+    let active: ActiveTasks = Arc::new(Mutex::new(HashMap::new()));
 
-    // Spawn the download queue worker.
     let queue_handle = {
         let cfg = config.clone();
         let cat = catalog.clone();
         let civ = civitai.clone();
+        let act = active.clone();
         tokio::spawn(async move {
-            queue::run(cfg, cat, civ).await;
+            queue::run(cfg, cat, civ, act).await;
         })
     };
 
-    // Spawn the periodic update checker.
     let updater_handle = {
         let cfg = config.clone();
         let cat = catalog.clone();
@@ -48,14 +47,16 @@ pub async fn run() -> Result<()> {
         })
     };
 
-    // Bind IPC socket and serve.
     let server = IpcServer::bind(&config.daemon.socket_path)?;
     info!("Daemon ready");
 
+    let cat = catalog.clone();
+    let act = active.clone();
     server
         .serve(move |req| {
             let cat = cat.clone();
-            async move { handle_request(req, cat).await }
+            let act = act.clone();
+            async move { handle_request(req, cat, act).await }
         })
         .await?;
 
@@ -67,6 +68,7 @@ pub async fn run() -> Result<()> {
 async fn handle_request(
     req: Request,
     catalog: Arc<Mutex<Catalog>>,
+    active: ActiveTasks,
 ) -> Response {
     match req {
         Request::AddDownload { url, model_type } => {
@@ -85,14 +87,27 @@ async fn handle_request(
         }
         Request::GetStatus => Response::ok(serde_json::json!({ "status": "running" })),
         Request::CheckUpdates => {
-            // Signal handled by the updater task; for now acknowledge.
             Response::ok(serde_json::json!({ "message": "update check triggered" }))
         }
         Request::Cancel { id } => {
-            let cat = catalog.lock().await;
-            match cat.set_status(id, crate::catalog::JobStatus::Cancelled, None) {
-                Ok(()) => Response::ok(serde_json::json!({ "cancelled": id })),
-                Err(e) => Response::err(e.to_string()),
+            // Signal the in-flight task if active; otherwise set DB flag directly.
+            let cancelled = {
+                let tasks = active.lock().await;
+                if let Some(token) = tasks.get(&id) {
+                    token.cancel();
+                    true
+                } else {
+                    false
+                }
+            };
+            if cancelled {
+                Response::ok(serde_json::json!({ "cancelled": id }))
+            } else {
+                let cat = catalog.lock().await;
+                match cat.set_status(id, crate::catalog::JobStatus::Cancelled, None) {
+                    Ok(()) => Response::ok(serde_json::json!({ "cancelled": id })),
+                    Err(e) => Response::err(e.to_string()),
+                }
             }
         }
     }

@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 /// Download the file for `job`, verify its checksum, and return the destination path.
@@ -15,6 +16,7 @@ pub async fn download(
     job: &DownloadJob,
     config: &Config,
     civitai: &CivitaiClient,
+    _token: CancellationToken,
 ) -> Result<PathBuf> {
     // Parse model/version IDs from the URL if not already resolved.
     let dest_dir = config.paths.models_dir.join(
