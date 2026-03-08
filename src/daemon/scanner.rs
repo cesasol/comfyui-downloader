@@ -10,6 +10,19 @@ use tracing::{info, warn};
 
 const MODEL_EXTENSIONS: &[&str] = &["safetensors", "gguf", "pt", "pth", "bin", "ckpt"];
 
+/// All subdirectories of the models root that may contain model files.
+/// Must stay in sync with `ModelType::models_subdir` and `models_subdir_for_file`.
+const KNOWN_SUBDIRS: &[&str] = &[
+    "checkpoints",
+    "diffusion_models",
+    "embeddings",
+    "loras",
+    "controlnet",
+    "vae",
+    "upscale_models",
+    "other",
+];
+
 pub async fn run(config: Arc<Config>, civitai: Arc<CivitaiClient>) {
     if config.civitai.api_key.is_none() {
         warn!("Skipping startup scan: no CivitAI API key configured");
@@ -18,7 +31,11 @@ pub async fn run(config: Arc<Config>, civitai: Arc<CivitaiClient>) {
     info!("Scanning models directory for files with missing metadata or preview images");
     let models_dir = config.paths.models_dir.clone();
     let mut count = 0usize;
-    let mut stack = vec![models_dir];
+    let mut stack: Vec<PathBuf> = KNOWN_SUBDIRS
+        .iter()
+        .map(|s| models_dir.join(s))
+        .filter(|p| p.is_dir())
+        .collect();
     while let Some(dir) = stack.pop() {
         let mut entries = match tokio::fs::read_dir(&dir).await {
             Ok(e) => e,
