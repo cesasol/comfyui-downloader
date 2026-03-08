@@ -21,85 +21,100 @@ struct VersionResolution {
     base_model: Option<String>,
 }
 
-/// Resolve the authoritative download URL, expected SHA-256, and model type from the CivitAI API.
-/// Falls back to the stored job URL only when no model/version ID is available.
+/// Resolve the authoritative download URL, expected SHA-256, model type, and base model
+/// from the CivitAI API. Falls back to the stored job URL only when no IDs are available.
 async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient, config: &Config) -> Result<VersionResolution> {
-    if let Some(version_id) = job.version_id {
-        let version = civitai
-            .get_model_version(version_id)
-            .await
-            .context("fetching version metadata")?;
-        let base_model = version.base_model.clone();
-        let file = version
-            .files
-            .iter()
-            .find(|f| f.primary == Some(true))
-            .or_else(|| version.files.first())
-            .context("no files in version metadata")?;
-        let model_type_subdir = version
-            .model
-            .as_ref()
-            .map(|m| m.r#type.models_subdir_for_file(file).to_string());
-        let download_url = file
-            .download_url
-            .clone()
-            .with_context(|| format!("no downloadUrl for file '{}' in version {version_id}", file.name))?;
-        return Ok(VersionResolution {
-            download_url,
-            expected_hash: file.hashes.sha256.clone(),
-            model_type_subdir,
-            base_model,
-        });
-    }
+    match (job.version_id, job.model_id) {
+        (Some(version_id), Some(model_id)) => {
+            // Both IDs known: use get_model for reliable type and base_model,
+            // get_model_version for the authoritative file list and download URL.
+            let (model_info, version) = tokio::try_join!(
+                civitai.get_model(model_id),
+                civitai.get_model_version(version_id),
+            )?;
+            let file = version
+                .files
+                .iter()
+                .find(|f| f.primary == Some(true))
+                .or_else(|| version.files.first())
+                .context("no files in version metadata")?;
+            let model_type_subdir = Some(model_info.r#type.models_subdir_for_file(file).to_string());
+            let base_model = model_info
+                .model_versions
+                .iter()
+                .find(|v| v.id == version_id)
+                .and_then(|v| v.base_model.clone())
+                .or_else(|| version.base_model.clone());
+            let download_url = file
+                .download_url
+                .clone()
+                .with_context(|| format!("no downloadUrl for file '{}' in version {version_id}", file.name))?;
+            info!("Resolved: type={:?} base_model={:?}", model_type_subdir, base_model);
+            Ok(VersionResolution { download_url, expected_hash: file.hashes.sha256.clone(), model_type_subdir, base_model })
+        }
 
-    if let Some(model_id) = job.model_id {
-        let model_info = civitai
-            .get_model(model_id)
-            .await
-            .context("fetching model metadata")?;
-        let model_type = &model_info.r#type;
-        let latest = model_info
-            .model_versions
-            .iter()
-            .find(|v| {
-                !config.daemon.skip_early_access
-                    || v.availability.as_deref() != Some("EarlyAccess")
-            })
-            .context("no publicly available version (all versions are EarlyAccess)")?;
-        let base_model = latest.base_model.clone();
-        let version = civitai
-            .get_model_version(latest.id)
-            .await
-            .context("fetching latest version metadata")?;
-        let file = version
-            .files
-            .iter()
-            .find(|f| f.primary == Some(true))
-            .or_else(|| version.files.first())
-            .context("no files in latest version")?;
-        let model_type_subdir = Some(model_type.models_subdir_for_file(file).to_string());
-        let download_url = file
-            .download_url
-            .clone()
-            .with_context(|| format!("no downloadUrl for file '{}' in version {}", file.name, latest.id))?;
-        return Ok(VersionResolution {
-            download_url,
-            expected_hash: file.hashes.sha256.clone(),
-            model_type_subdir,
-            base_model,
-        });
-    }
+        (Some(version_id), None) => {
+            // Version ID only: single call, use whatever the endpoint returns.
+            let version = civitai
+                .get_model_version(version_id)
+                .await
+                .context("fetching version metadata")?;
+            let file = version
+                .files
+                .iter()
+                .find(|f| f.primary == Some(true))
+                .or_else(|| version.files.first())
+                .context("no files in version metadata")?;
+            let model_type_subdir = version
+                .model
+                .as_ref()
+                .map(|m| m.r#type.models_subdir_for_file(file).to_string());
+            let base_model = version.base_model.clone();
+            let download_url = file
+                .download_url
+                .clone()
+                .with_context(|| format!("no downloadUrl for file '{}' in version {version_id}", file.name))?;
+            info!("Resolved: type={:?} base_model={:?}", model_type_subdir, base_model);
+            Ok(VersionResolution { download_url, expected_hash: file.hashes.sha256.clone(), model_type_subdir, base_model })
+        }
 
-    warn!(
-        "Job {} has no model/version ID; using stored URL without checksum verification",
-        job.id
-    );
-    Ok(VersionResolution {
-        download_url: job.url.clone(),
-        expected_hash: None,
-        model_type_subdir: None,
-        base_model: None,
-    })
+        (None, Some(model_id)) => {
+            // Model ID only: pick the latest non-early-access version.
+            let model_info = civitai
+                .get_model(model_id)
+                .await
+                .context("fetching model metadata")?;
+            let latest = model_info
+                .model_versions
+                .iter()
+                .find(|v| !config.daemon.skip_early_access || v.availability.as_deref() != Some("EarlyAccess"))
+                .context("no publicly available version (all versions are EarlyAccess)")?;
+            let base_model = latest.base_model.clone();
+            let version_id = latest.id;
+            let version = civitai
+                .get_model_version(version_id)
+                .await
+                .context("fetching latest version metadata")?;
+            let file = version
+                .files
+                .iter()
+                .find(|f| f.primary == Some(true))
+                .or_else(|| version.files.first())
+                .context("no files in latest version")?;
+            let model_type_subdir = Some(model_info.r#type.models_subdir_for_file(file).to_string());
+            let download_url = file
+                .download_url
+                .clone()
+                .with_context(|| format!("no downloadUrl for file '{}' in version {version_id}", file.name))?;
+            info!("Resolved: type={:?} base_model={:?}", model_type_subdir, base_model);
+            Ok(VersionResolution { download_url, expected_hash: file.hashes.sha256.clone(), model_type_subdir, base_model })
+        }
+
+        (None, None) => {
+            warn!("Job {} has no model/version ID; using stored URL without checksum verification", job.id);
+            Ok(VersionResolution { download_url: job.url.clone(), expected_hash: None, model_type_subdir: None, base_model: None })
+        }
+    }
 }
 
 /// Download the file for `job`, verify its checksum, and return `(dest_path, resolved_model_type)`.
