@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/comfyui-downloader
+ExecStart=/usr/bin/comfyui-downloader
 Restart=on-failure
 RestartSec=5s
 Environment=RUST_LOG=info
