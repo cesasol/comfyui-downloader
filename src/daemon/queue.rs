@@ -74,10 +74,13 @@ pub async fn run(
             let _permit = permit; // released when task finishes
 
             match downloader::download(&job, &cfg, &civ, token, prog.clone()).await {
-                Ok(dest) => {
+                Ok((dest, resolved_type)) => {
                     info!("Job {job_id} complete: {}", dest.display());
                     let cat = cat.lock().await;
                     let _ = cat.set_dest_path(job_id, &dest);
+                    if let Some(model_type) = resolved_type {
+                        let _ = cat.set_model_type(job_id, &model_type);
+                    }
                     let _ = cat.set_status(job_id, JobStatus::Done, None);
                     let _ = notifier::notify_success(&dest.display().to_string());
                 }

@@ -11,6 +11,13 @@ pub struct ModelInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ModelVersionModel {
+    pub name: String,
+    pub r#type: ModelType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelVersion {
     pub id: u64,
     pub name: String,
@@ -18,6 +25,8 @@ pub struct ModelVersion {
     pub created_at: String,
     pub download_url: Option<String>,
     pub files: Vec<ModelFile>,
+    /// Nested model info (present in /model-versions/{id} responses).
+    pub model: Option<ModelVersionModel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

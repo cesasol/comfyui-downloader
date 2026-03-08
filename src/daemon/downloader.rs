@@ -1,6 +1,7 @@
 use crate::catalog::DownloadJob;
 use crate::civitai::CivitaiClient;
 use crate::config::Config;
+use crate::daemon::notifier;
 use crate::daemon::queue::{DownloadProgress, ProgressMap};
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
@@ -9,56 +10,117 @@ use std::path::PathBuf;
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
-/// Download the file for `job`, verify its checksum, and return the destination path.
-pub async fn download(
-    job: &DownloadJob,
-    config: &Config,
-    civitai: &CivitaiClient,
-    token: CancellationToken,
-    progress: ProgressMap,
-) -> Result<PathBuf> {
-    // Parse model/version IDs from the URL if not already resolved.
-    let dest_dir = config.paths.models_dir.join(
-        job.model_type.as_deref().unwrap_or("other"),
-    );
-    fs::create_dir_all(&dest_dir).await?;
+struct VersionResolution {
+    download_url: String,
+    expected_hash: Option<String>,
+    /// ComfyUI models subdirectory derived from the CivitAI model type (e.g. "checkpoints").
+    model_type_subdir: Option<String>,
+}
 
-    check_disk_space(&dest_dir)?;
-
-    let key = config.civitai.api_key.as_deref()
-        .ok_or_else(|| anyhow::anyhow!("CivitAI API key is not configured (set civitai.api_key in config.toml)"))?;
-
-    let http = reqwest::Client::new();
-
-    // When we know the version_id, resolve the real download URL and expected hash from
-    // the CivitAI API rather than using whatever URL the user provided (which may be a
-    // model page URL that returns HTML instead of the model file).
-    let (download_url, expected_hash) = if let Some(version_id) = job.version_id {
+/// Resolve the authoritative download URL, expected SHA-256, and model type from the CivitAI API.
+/// Falls back to the stored job URL only when no model/version ID is available.
+async fn resolve_version(job: &DownloadJob, civitai: &CivitaiClient) -> Result<VersionResolution> {
+    if let Some(version_id) = job.version_id {
         let version = civitai
             .get_model_version(version_id)
             .await
             .context("fetching version metadata")?;
+        let model_type_subdir = version
+            .model
+            .as_ref()
+            .map(|m| m.r#type.models_subdir().to_string());
         let file = version
             .files
             .iter()
             .find(|f| f.primary == Some(true))
             .or_else(|| version.files.first())
             .context("no files in version metadata")?;
-        let url = file
+        let download_url = file
             .download_url
             .clone()
-            .with_context(|| format!("no downloadUrl for file {} in version {version_id}", file.name))?;
-        info!("Resolved download URL for version {version_id}: {url}");
-        (url, file.hashes.sha256.clone())
-    } else {
-        tracing::warn!("No version_id for job {}; using stored URL without checksum verification", job.id);
-        (job.url.clone(), None)
-    };
+            .with_context(|| format!("no downloadUrl for file '{}' in version {version_id}", file.name))?;
+        return Ok(VersionResolution {
+            download_url,
+            expected_hash: file.hashes.sha256.clone(),
+            model_type_subdir,
+        });
+    }
 
+    if let Some(model_id) = job.model_id {
+        let model_info = civitai
+            .get_model(model_id)
+            .await
+            .context("fetching model metadata")?;
+        let model_type_subdir = Some(model_info.r#type.models_subdir().to_string());
+        let latest = model_info
+            .model_versions
+            .first()
+            .context("model has no versions")?;
+        let version = civitai
+            .get_model_version(latest.id)
+            .await
+            .context("fetching latest version metadata")?;
+        let file = version
+            .files
+            .iter()
+            .find(|f| f.primary == Some(true))
+            .or_else(|| version.files.first())
+            .context("no files in latest version")?;
+        let download_url = file
+            .download_url
+            .clone()
+            .with_context(|| format!("no downloadUrl for file '{}' in version {}", file.name, latest.id))?;
+        return Ok(VersionResolution {
+            download_url,
+            expected_hash: file.hashes.sha256.clone(),
+            model_type_subdir,
+        });
+    }
+
+    warn!(
+        "Job {} has no model/version ID; using stored URL without checksum verification",
+        job.id
+    );
+    Ok(VersionResolution {
+        download_url: job.url.clone(),
+        expected_hash: None,
+        model_type_subdir: None,
+    })
+}
+
+/// Download the file for `job`, verify its checksum, and return `(dest_path, resolved_model_type)`.
+/// `resolved_model_type` is the CivitAI-reported subdir (e.g. "checkpoints") if available.
+pub async fn download(
+    job: &DownloadJob,
+    config: &Config,
+    civitai: &CivitaiClient,
+    token: CancellationToken,
+    progress: ProgressMap,
+) -> Result<(PathBuf, Option<String>)> {
+    let key = config
+        .civitai
+        .api_key
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("CivitAI API key is not configured (set civitai.api_key in config.toml)"))?;
+
+    let resolution = resolve_version(job, civitai).await?;
+
+    // Prefer the API-reported model type over whatever the user provided at enqueue time.
+    let model_type_str = resolution
+        .model_type_subdir
+        .as_deref()
+        .or(job.model_type.as_deref())
+        .unwrap_or("other");
+    let dest_dir = config.paths.models_dir.join(model_type_str);
+    fs::create_dir_all(&dest_dir).await?;
+
+    check_disk_space(&dest_dir)?;
+
+    let http = reqwest::Client::new();
     let resp = http
-        .get(&download_url)
+        .get(&resolution.download_url)
         .bearer_auth(key)
         .send()
         .await
@@ -68,24 +130,28 @@ pub async fn download(
     }
 
     let total_bytes = resp.content_length();
-    {
-        let mut prog = progress.lock().await;
-        prog.insert(job.id, DownloadProgress { bytes_received: 0, total_bytes });
-    }
-
-    // Derive filename from Content-Disposition or the download URL.
     let filename = resp
         .headers()
         .get("content-disposition")
         .and_then(|v| v.to_str().ok())
         .and_then(parse_filename_from_cd)
         .unwrap_or_else(|| {
-            download_url
+            resolution
+                .download_url
                 .split('/')
                 .last()
                 .unwrap_or("model.bin")
                 .to_string()
         });
+
+    info!("Downloading '{}' → {}/{}", filename, model_type_str, filename);
+    {
+        let mut prog = progress.lock().await;
+        prog.insert(job.id, DownloadProgress { bytes_received: 0, total_bytes });
+    }
+
+    let notif_id = notifier::notify_download_start(&filename);
+    let mut last_notif_pct: u64 = 0;
 
     let dest = dest_dir.join(&filename);
     let tmp = dest.with_extension("tmp");
@@ -109,6 +175,16 @@ pub async fn download(
                                 entry.bytes_received = bytes_received;
                             }
                         }
+                        // Update progress notification every 10%.
+                        if let (Some(nid), Some(total)) = (notif_id, total_bytes) {
+                            if total > 0 {
+                                let pct = bytes_received * 100 / total;
+                                if pct >= last_notif_pct + 10 {
+                                    last_notif_pct = pct;
+                                    notifier::update_download_progress(nid, &filename, bytes_received, total_bytes);
+                                }
+                            }
+                        }
                     }
                     Some(Err(e)) => return Err(anyhow::Error::from(e)).context("reading chunk"),
                     None => break,
@@ -117,6 +193,9 @@ pub async fn download(
             _ = token.cancelled() => {
                 drop(file);
                 let _ = tokio::fs::remove_file(&tmp).await;
+                if let Some(nid) = notif_id {
+                    notifier::close_download_notification(nid);
+                }
                 bail!("download cancelled");
             }
         }
@@ -124,25 +203,28 @@ pub async fn download(
     file.flush().await?;
     drop(file);
 
+    if let Some(nid) = notif_id {
+        notifier::close_download_notification(nid);
+    }
+
     let digest = hex::encode(hasher.finalize());
     info!("SHA-256: {digest}");
 
-    if let Some(expected) = expected_hash.as_deref() {
-        if !checksums_match(&digest, Some(expected)) {
+    if let Some(expected) = resolution.expected_hash.as_deref() {
+        if !expected.eq_ignore_ascii_case(&digest) {
             fs::remove_file(&tmp).await?;
             bail!("checksum mismatch: computed {digest}, expected {expected}");
         }
         info!("Checksum verified");
     } else {
-        tracing::warn!("No SHA-256 hash available, skipping verification");
+        warn!("No SHA-256 hash available for this file, skipping verification");
     }
 
     fs::rename(&tmp, &dest).await?;
-    Ok(dest)
+    Ok((dest, resolution.model_type_subdir))
 }
 
 fn check_disk_space(dir: &PathBuf) -> Result<()> {
-    // Require at least 1 GiB free.
     let stat = free_disk_bytes(dir)?;
     if stat < 1024 * 1024 * 1024 {
         bail!("insufficient disk space (< 1 GiB free)");
@@ -162,20 +244,11 @@ pub(crate) fn free_disk_bytes(path: &std::path::PathBuf) -> Result<u64> {
 }
 
 fn parse_filename_from_cd(header: &str) -> Option<String> {
-    header
-        .split(';')
-        .find_map(|part| {
-            let part = part.trim();
-            part.strip_prefix("filename=")
-                .map(|s| s.trim_matches('"').to_string())
-        })
-}
-
-fn checksums_match(computed: &str, expected: Option<&str>) -> bool {
-    match expected {
-        None => true,
-        Some(h) => h.eq_ignore_ascii_case(computed),
-    }
+    header.split(';').find_map(|part| {
+        let part = part.trim();
+        part.strip_prefix("filename=")
+            .map(|s| s.trim_matches('"').to_string())
+    })
 }
 
 #[cfg(test)]
@@ -192,14 +265,6 @@ mod tests {
     fn test_parse_filename_from_cd_unquoted() {
         let result = super::parse_filename_from_cd("attachment; filename=model.bin");
         assert_eq!(result, Some("model.bin".to_string()));
-    }
-
-    #[test]
-    fn test_checksums_match() {
-        assert!(super::checksums_match("abc123", Some("abc123")));
-        assert!(super::checksums_match("ABC123", Some("abc123"))); // case-insensitive
-        assert!(!super::checksums_match("abc123", Some("deadbeef")));
-        assert!(super::checksums_match("abc123", None)); // no expected hash → pass
     }
 
     #[tokio::test]

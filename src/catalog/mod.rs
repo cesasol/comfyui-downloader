@@ -122,6 +122,15 @@ impl Catalog {
         Ok(())
     }
 
+    pub fn set_model_type(&self, id: Uuid, model_type: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE jobs SET model_type = ?1, updated_at = ?2 WHERE id = ?3",
+            params![model_type, now, id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn set_dest_path(&self, id: Uuid, path: &std::path::Path) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
