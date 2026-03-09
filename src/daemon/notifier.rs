@@ -1,18 +1,29 @@
 use anyhow::Result;
-use notify_rust::{Notification, Timeout};
+use notify_rust::{Hint, Notification, Timeout};
+
+const TITLE: &str = "ComfyUI Downloader";
 
 pub fn notify_success(path: &str) -> Result<()> {
     Notification::new()
-        .summary("comfyui-downloader")
-        .body(&format!("Download complete: {path}"))
+        .appname(TITLE)
+        .summary("Download complete")
+        .body(path)
+        .hint(notify_rust::Hint::SoundName(String::from(
+            "complete-download",
+        )))
+        .hint(Hint::Category("transfer.complete".to_owned()))
         .icon("dialog-information")
+        .timeout(500)
         .show()?;
     Ok(())
 }
 
 pub fn notify_error(msg: &str) -> Result<()> {
     Notification::new()
-        .summary("comfyui-downloader — error")
+        .appname(TITLE)
+        .summary("error")
+        .hint(notify_rust::Hint::SoundName(String::from("dialog-error")))
+        .hint(Hint::Category("transfer.error".to_owned()))
         .body(msg)
         .icon("dialog-error")
         .show()?;
@@ -21,7 +32,8 @@ pub fn notify_error(msg: &str) -> Result<()> {
 
 pub fn notify_update_available(model_name: &str, version: &str) -> Result<()> {
     Notification::new()
-        .summary("comfyui-downloader — update available")
+        .appname(TITLE)
+        .summary("model update available")
         .body(&format!("{model_name} has a new version: {version}"))
         .icon("software-update-available")
         .show()?;
@@ -32,9 +44,11 @@ pub fn notify_update_available(model_name: &str, version: &str) -> Result<()> {
 /// Returns None if the notification system is unavailable.
 pub fn notify_download_start(filename: &str) -> Option<u32> {
     Notification::new()
-        .summary("comfyui-downloader — downloading")
+        .appname(TITLE)
+        .summary("downloading")
         .body(filename)
         .icon("document-save")
+        .hint(Hint::Category("transfer".to_owned()))
         .timeout(Timeout::Never)
         .show()
         .ok()
@@ -44,7 +58,7 @@ pub fn notify_download_start(filename: &str) -> Option<u32> {
 /// Replace the progress notification (identified by `id`) with updated progress text.
 /// Silently ignores errors — progress notifications are best-effort.
 pub fn update_download_progress(
-    id: u32,
+    _id: u32,
     filename: &str,
     bytes_received: u64,
     total_bytes: Option<u64>,
@@ -62,9 +76,10 @@ pub fn update_download_progress(
         }
     };
     let _ = Notification::new()
-        .id(id)
-        .summary("comfyui-downloader — downloading")
+        .appname(TITLE)
+        .summary("downloading")
         .body(&body)
+        .hint(Hint::Category("transfer".to_owned()))
         .icon("document-save")
         .timeout(Timeout::Never)
         .show();
