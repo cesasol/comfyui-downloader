@@ -1,8 +1,10 @@
-use crate::catalog::{Catalog, JobStatus};
+use crate::catalog::{Catalog, DownloadJob, JobStatus};
 use crate::civitai::CivitaiClient;
+use crate::civitai::types::ModelInfo;
 use crate::config::Config;
-use crate::daemon::notifier;
+use crate::daemon::{downloader, notifier};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, sleep};
@@ -17,7 +19,7 @@ pub async fn run(
     let interval = Duration::from_secs(config.daemon.update_interval_hours * 3600);
     loop {
         info!("Running update check");
-        if let Err(e) = check_updates(&catalog, &civitai).await {
+        if let Err(e) = check_updates(&config, &catalog, &civitai).await {
             error!("Update check failed: {e}");
         }
         tokio::select! {
@@ -35,6 +37,7 @@ pub(crate) fn is_newer(latest_id: u64, stored_id: u64) -> bool {
 }
 
 async fn check_updates(
+    config: &Arc<Config>,
     catalog: &Arc<Mutex<Catalog>>,
     civitai: &Arc<CivitaiClient>,
 ) -> anyhow::Result<()> {
@@ -44,7 +47,7 @@ async fn check_updates(
     };
 
     // One representative Done job per model_id.
-    let mut by_model: HashMap<u64, &crate::catalog::DownloadJob> = HashMap::new();
+    let mut by_model: HashMap<u64, &DownloadJob> = HashMap::new();
     for job in jobs
         .iter()
         .filter(|j| j.status == JobStatus::Done && j.model_id.is_some() && j.version_id.is_some())
@@ -62,28 +65,217 @@ async fn check_updates(
             }
         };
 
-        let Some(latest) = model.model_versions.first() else {
-            continue;
-        };
+        if let Some(latest) = model.model_versions.first() {
+            if is_newer(latest.id, stored_version_id) {
+                info!(
+                    "Update available for model {model_id}: {} → {}",
+                    stored_version_id, latest.id
+                );
+                let cat = catalog.lock().await;
+                cat.enqueue_version_update(*model_id, latest.id, job.model_type.as_deref())?;
+                drop(cat);
+                let _ = notifier::notify_update_available(&model.name, &latest.name);
+            } else {
+                info!(
+                    "Model {model_id} is up to date (version {})",
+                    stored_version_id
+                );
+            }
+        }
 
-        if is_newer(latest.id, stored_version_id) {
-            info!(
-                "Update available for model {model_id}: {} → {}",
-                stored_version_id, latest.id
-            );
-            let cat = catalog.lock().await;
-            cat.enqueue_version_update(*model_id, latest.id, job.model_type.as_deref())?;
-            drop(cat);
-            let _ = notifier::notify_update_available(&model.name, &latest.name);
-        } else {
-            info!(
-                "Model {model_id} is up to date (version {})",
-                stored_version_id
-            );
+        for done_job in jobs.iter().filter(|j| {
+            j.status == JobStatus::Done
+                && j.model_id == Some(*model_id)
+                && j.version_id.is_some()
+                && j.dest_path.is_some()
+        }) {
+            relocate_if_needed(done_job, &model, config, catalog).await;
         }
     }
 
     Ok(())
+}
+
+async fn relocate_if_needed(
+    job: &DownloadJob,
+    model: &ModelInfo,
+    config: &Config,
+    catalog: &Arc<Mutex<Catalog>>,
+) {
+    let current_path = PathBuf::from(job.dest_path.as_ref().unwrap());
+    if !current_path.exists() {
+        return;
+    }
+
+    let version_id = job.version_id.unwrap();
+    let Some(version) = model.model_versions.iter().find(|v| v.id == version_id) else {
+        return;
+    };
+    let Some(file) = version
+        .files
+        .iter()
+        .find(|f| f.primary == Some(true))
+        .or_else(|| version.files.first())
+    else {
+        return;
+    };
+
+    let expected_subdir = model
+        .r#type
+        .models_subdir_for_file(file, version.base_model.as_deref());
+    let mut expected_dir = config.paths.models_dir.join(expected_subdir);
+    if let Some(ref base_model) = version.base_model {
+        expected_dir = expected_dir.join(downloader::sanitize_dir_name(base_model));
+    }
+
+    // Prefer the on-disk filename over file.name — the downloader derives
+    // it from the Content-Disposition header which may differ from the API.
+    let Some(current_filename) = current_path.file_name() else {
+        return;
+    };
+    let expected_path = expected_dir.join(current_filename);
+
+    if current_path == expected_path {
+        return;
+    }
+
+    if expected_path.exists() {
+        warn!(
+            "Cannot relocate {}: target already exists at {}",
+            current_path.display(),
+            expected_path.display()
+        );
+        return;
+    }
+
+    info!(
+        "Relocating {} → {}",
+        current_path.display(),
+        expected_path.display()
+    );
+
+    if let Err(e) = tokio::fs::create_dir_all(&expected_dir).await {
+        warn!(
+            "Failed to create directory {}: {e}",
+            expected_dir.display()
+        );
+        return;
+    }
+
+    if let Err(e) = tokio::fs::rename(&current_path, &expected_path).await {
+        warn!(
+            "Failed to move {} → {}: {e}",
+            current_path.display(),
+            expected_path.display()
+        );
+        return;
+    }
+
+    move_sidecar(&current_path, &expected_path, "metadata.json").await;
+    move_preview_sidecars(&current_path, &expected_path).await;
+
+    update_metadata_file_path(&expected_path).await;
+
+    {
+        let cat = catalog.lock().await;
+        if let Err(e) = cat.set_dest_path(job.id, &expected_path) {
+            warn!("Failed to update catalog dest_path: {e}");
+        }
+    }
+
+    if let Some(old_dir) = current_path.parent() {
+        let _ = tokio::fs::remove_dir(old_dir).await;
+    }
+
+    let filename = current_filename.to_string_lossy();
+    let _ = notifier::notify_file_moved(
+        &filename,
+        &current_path.display().to_string(),
+        &expected_path.display().to_string(),
+    );
+}
+
+async fn move_sidecar(old_model: &Path, new_model: &Path, extension: &str) {
+    let old_sidecar = old_model.with_extension(extension);
+    if old_sidecar.exists() {
+        let new_sidecar = new_model.with_extension(extension);
+        if let Err(e) = tokio::fs::rename(&old_sidecar, &new_sidecar).await {
+            warn!(
+                "Failed to move sidecar {} → {}: {e}",
+                old_sidecar.display(),
+                new_sidecar.display()
+            );
+        }
+    }
+}
+
+async fn move_preview_sidecars(old_model: &Path, new_model: &Path) {
+    let Some(parent) = old_model.parent() else {
+        return;
+    };
+    let Some(stem) = old_model.file_stem() else {
+        return;
+    };
+    let prefix = format!("{}.preview.", stem.to_string_lossy());
+    let Ok(mut entries) = tokio::fs::read_dir(parent).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if let Some(ext) = name_str.strip_prefix(&prefix) {
+            let new_preview = new_model.with_extension(format!("preview.{ext}"));
+            if let Err(e) = tokio::fs::rename(entry.path(), &new_preview).await {
+                warn!("Failed to move preview sidecar: {e}");
+            }
+        }
+    }
+}
+
+async fn update_metadata_file_path(new_model_path: &Path) {
+    let meta_path = new_model_path.with_extension("metadata.json");
+    let Ok(content) = tokio::fs::read_to_string(&meta_path).await else {
+        return;
+    };
+    let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return;
+    };
+    let Some(obj) = meta.as_object_mut() else {
+        return;
+    };
+
+    obj.insert(
+        "file_path".to_string(),
+        serde_json::Value::String(new_model_path.to_string_lossy().into_owned()),
+    );
+
+    if let Some(stem) = new_model_path.file_stem()
+        && let Some(parent) = new_model_path.parent()
+    {
+        let prefix = format!("{}.preview.", stem.to_string_lossy());
+        if let Ok(mut entries) = tokio::fs::read_dir(parent).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    obj.insert(
+                        "preview_url".to_string(),
+                        serde_json::Value::String(
+                            entry.path().to_string_lossy().into_owned(),
+                        ),
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Ok(json) = serde_json::to_string_pretty(&meta)
+        && let Err(e) = tokio::fs::write(&meta_path, json).await
+    {
+        warn!(
+            "Failed to update metadata file {}: {e}",
+            meta_path.display()
+        );
+    }
 }
 
 #[cfg(test)]

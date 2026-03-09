@@ -58,7 +58,7 @@ pub fn notify_download_start(filename: &str) -> Option<u32> {
 /// Replace the progress notification (identified by `id`) with updated progress text.
 /// Silently ignores errors — progress notifications are best-effort.
 pub fn update_download_progress(
-    _id: u32,
+    id: u32,
     filename: &str,
     bytes_received: u64,
     total_bytes: Option<u64>,
@@ -76,6 +76,7 @@ pub fn update_download_progress(
         }
     };
     let _ = Notification::new()
+        .id(id)
         .appname(TITLE)
         .summary("downloading")
         .body(&body)
@@ -83,6 +84,16 @@ pub fn update_download_progress(
         .icon("document-save")
         .timeout(Timeout::Never)
         .show();
+}
+
+pub fn notify_file_moved(filename: &str, from: &str, to: &str) -> Result<()> {
+    Notification::new()
+        .appname(TITLE)
+        .summary("model relocated")
+        .body(&format!("{filename}\n{from} → {to}"))
+        .icon("dialog-information")
+        .show()?;
+    Ok(())
 }
 
 /// Close the progress notification when the download finishes or is cancelled.

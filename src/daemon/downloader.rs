@@ -548,7 +548,7 @@ pub(crate) fn free_disk_bytes(path: &std::path::Path) -> Result<u64> {
 
 /// Sanitize a string for use as a directory name component.
 /// Strips characters that are unsafe on common filesystems (slashes, null bytes, etc.).
-fn sanitize_dir_name(s: &str) -> String {
+pub(crate) fn sanitize_dir_name(s: &str) -> String {
     s.chars()
         .filter(|c| {
             !matches!(

@@ -163,6 +163,28 @@ let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
 
 ---
 
+## Git Commits
+
+- **Style**: Conventional Commits — `type: lowercase message`.
+- **Types**: `feat`, `fix`, `refactor`, `chore`, `docs`, `test`, `ci`, `perf`.
+- **Language**: English.
+- **Scope**: One logical change per commit. Split unrelated changes into separate commits.
+- **Footer**: Every commit includes attribution trailers:
+
+```
+feat: add update checker for tracked models
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-opencode)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+```
+
+- Run `cargo fmt` before committing.
+- All clippy warnings must be clean (`cargo clippy -- -D warnings`) before committing.
+- Never commit files containing secrets (`.env`, API keys, credentials).
+
+---
+
 ## Key Design Constraints
 
 1. **CLI ↔ Daemon isolation**: CLI sends a single JSON request over the Unix socket and prints the response. It never reads the SQLite DB.
