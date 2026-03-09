@@ -102,3 +102,49 @@ pub fn close_download_notification(id: u32) {
         handle.close();
     }
 }
+
+pub fn notify_update_skipped_deleted(version_id: u64, model_type: Option<&str>) -> Result<()> {
+    let kind = model_type.unwrap_or("unknown type");
+    Notification::new()
+        .appname(TITLE)
+        .summary("update skipped — model deleted")
+        .body(&format!(
+            "Version {version_id} ({kind}): original files removed, skipping update and clearing catalog entries."
+        ))
+        .icon("dialog-information")
+        .show()?;
+    Ok(())
+}
+
+pub fn notify_version_access_denied(
+    model_name: &str,
+    denied_version: u64,
+    fallback_version: u64,
+    status: u16,
+) -> Result<()> {
+    Notification::new()
+        .appname(TITLE)
+        .summary("version access denied")
+        .body(&format!(
+            "{model_name}: version {denied_version} returned HTTP {status}. Queued version {fallback_version} as fallback."
+        ))
+        .icon("dialog-warning")
+        .show()?;
+    Ok(())
+}
+
+pub fn notify_access_denied_no_fallback(
+    model_name: &str,
+    denied_version: u64,
+    status: u16,
+) -> Result<()> {
+    Notification::new()
+        .appname(TITLE)
+        .summary("version access denied — no fallback")
+        .body(&format!(
+            "{model_name}: version {denied_version} returned HTTP {status}. No accessible fallback version found."
+        ))
+        .icon("dialog-error")
+        .show()?;
+    Ok(())
+}

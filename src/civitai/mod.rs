@@ -9,6 +9,12 @@ use tracing::warn;
 
 const BASE_URL: &str = "https://civitai.com/api/v1";
 
+#[derive(Debug, thiserror::Error)]
+#[error("CivitAI returned HTTP {status} (access denied)")]
+pub struct CivitaiAccessError {
+    pub status: u16,
+}
+
 pub struct CivitaiClient {
     http: Client,
     api_key: Option<String>,
@@ -60,6 +66,9 @@ impl CivitaiClient {
                 }
                 s if s.is_success() => {
                     return resp.json::<T>().await.context("deserialising response");
+                }
+                s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
+                    return Err(CivitaiAccessError { status: s.as_u16() }.into());
                 }
                 s => {
                     anyhow::bail!("CivitAI API error: {s}");

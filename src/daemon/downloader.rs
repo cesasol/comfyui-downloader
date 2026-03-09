@@ -283,8 +283,12 @@ pub async fn download(
         .send()
         .await
         .context("starting download")?;
-    if !resp.status().is_success() {
-        bail!("download failed with status {}", resp.status());
+    match resp.status() {
+        s if s.is_success() => {}
+        s @ (reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN) => {
+            return Err(crate::civitai::CivitaiAccessError { status: s.as_u16() }.into());
+        }
+        s => bail!("download failed with status {s}"),
     }
 
     let total_bytes = resp.content_length();

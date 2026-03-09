@@ -155,10 +155,7 @@ async fn relocate_if_needed(
     );
 
     if let Err(e) = tokio::fs::create_dir_all(&expected_dir).await {
-        warn!(
-            "Failed to create directory {}: {e}",
-            expected_dir.display()
-        );
+        warn!("Failed to create directory {}: {e}", expected_dir.display());
         return;
     }
 
@@ -258,9 +255,7 @@ async fn update_metadata_file_path(new_model_path: &Path) {
                 if entry.file_name().to_string_lossy().starts_with(&prefix) {
                     obj.insert(
                         "preview_url".to_string(),
-                        serde_json::Value::String(
-                            entry.path().to_string_lossy().into_owned(),
-                        ),
+                        serde_json::Value::String(entry.path().to_string_lossy().into_owned()),
                     );
                     break;
                 }

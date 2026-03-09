@@ -51,6 +51,7 @@ pub enum DownloadReason {
     UpdateAvailable,
     /// Registered as a `Done` job (not `Queued`) so the update daemon can track it.
     StartupScan,
+    AccessDeniedFallback,
 }
 
 impl std::fmt::Display for DownloadReason {
@@ -104,11 +105,11 @@ impl Catalog {
 
     pub fn enqueue_version_update(
         &self,
-        _model_id: u64,
+        model_id: u64,
         new_version_id: u64,
         model_type: Option<&str>,
     ) -> Result<DownloadJob> {
-        let url = format!("https://civitai.com/api/download/models/{new_version_id}");
+        let url = format!("https://civitai.com/models/{model_id}?modelVersionId={new_version_id}");
         self.enqueue(&url, model_type, DownloadReason::UpdateAvailable)
     }
 
@@ -170,6 +171,36 @@ impl Catalog {
             |row| row.get(0),
         )?;
         Ok(count as u64)
+    }
+
+    pub fn delete_job(&self, id: Uuid) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM jobs WHERE id = ?1", params![id.to_string()])?;
+        Ok(())
+    }
+
+    pub fn done_jobs_for_model(&self, model_id: u64) -> Result<Vec<DownloadJob>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, url, model_id, version_id, model_type, dest_path, status,
+                    created_at, updated_at, error, download_reason
+             FROM jobs WHERE model_id = ?1 AND status = 'done'",
+        )?;
+        let rows = stmt.query_map(params![model_id], |row| Ok(row_to_job(row)))?;
+        rows.map(|r| r?.map_err(anyhow::Error::from)).collect()
+    }
+
+    pub fn get_job_by_version_id(&self, version_id: u64) -> Result<Option<DownloadJob>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, url, model_id, version_id, model_type, dest_path, status,
+                    created_at, updated_at, error, download_reason
+             FROM jobs WHERE version_id = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![version_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_job(row)?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Register a model already present on disk as a `Done` job.
@@ -287,6 +318,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadJob> {
         "cli_add" => DownloadReason::CliAdd,
         "update_available" => DownloadReason::UpdateAvailable,
         "startup_scan" => DownloadReason::StartupScan,
+        "access_denied_fallback" => DownloadReason::AccessDeniedFallback,
         _ => DownloadReason::CliAdd,
     };
     Ok(DownloadJob {
@@ -357,7 +389,7 @@ mod tests {
         let job = catalog
             .enqueue_version_update(12345, 67890, Some("checkpoints"))
             .unwrap();
-        assert_eq!(job.model_id, None); // URL-parsed: download URL only has version_id
+        assert_eq!(job.model_id, Some(12345));
         assert_eq!(job.version_id, Some(67890));
         assert_eq!(job.model_type.as_deref(), Some("checkpoints"));
         assert_eq!(job.status, JobStatus::Queued);
