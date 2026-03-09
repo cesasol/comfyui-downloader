@@ -203,7 +203,14 @@ async fn register_in_catalog(
 ) -> bool {
     let model_type = model_type_from_path(models_dir, path);
     let cat = catalog.lock().await;
-    match cat.register_existing(url, model_id, version_id, model_type.as_deref(), path) {
+    match cat.register_existing(
+        url,
+        model_id,
+        version_id,
+        model_type.as_deref(),
+        path,
+        crate::catalog::DownloadReason::StartupScan,
+    ) {
         Ok(Some(job)) => {
             info!(
                 "Registered {} in catalog (version_id={:?})",

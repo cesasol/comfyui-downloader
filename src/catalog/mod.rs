@@ -19,6 +19,7 @@ pub struct DownloadJob {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub error: Option<String>,
+    pub download_reason: DownloadReason,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -33,6 +34,26 @@ pub enum JobStatus {
 }
 
 impl std::fmt::Display for JobStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = serde_json::to_value(self)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_else(|| "unknown".into());
+        write!(f, "{s}")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadReason {
+    CliAdd,
+    /// Covers both the periodic scheduler and a manual `check-updates` trigger.
+    UpdateAvailable,
+    /// Registered as a `Done` job (not `Queued`) so the update daemon can track it.
+    StartupScan,
+}
+
+impl std::fmt::Display for DownloadReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = serde_json::to_value(self)
             .ok()
@@ -64,19 +85,23 @@ impl Catalog {
             .context("running migrations")
     }
 
-    pub fn enqueue(&self, url: &str, model_type: Option<&str>) -> Result<DownloadJob> {
+    pub fn enqueue(
+        &self,
+        url: &str,
+        model_type: Option<&str>,
+        reason: DownloadReason,
+    ) -> Result<DownloadJob> {
         let id = Uuid::new_v4();
         let now = Utc::now().to_rfc3339();
         let (model_id, version_id) = parse_civitai_url(url);
         self.conn.execute(
-            "INSERT INTO jobs (id, url, model_id, version_id, model_type, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6)",
-            params![id.to_string(), url, model_id, version_id, model_type, now],
+            "INSERT INTO jobs (id, url, model_id, version_id, model_type, status, created_at, updated_at, download_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6, ?7)",
+            params![id.to_string(), url, model_id, version_id, model_type, now, reason.to_string()],
         )?;
         self.get_job(id)?.context("job not found after insert")
     }
 
-    /// Enqueue a new version of an already-downloaded model.
     pub fn enqueue_version_update(
         &self,
         _model_id: u64,
@@ -84,13 +109,13 @@ impl Catalog {
         model_type: Option<&str>,
     ) -> Result<DownloadJob> {
         let url = format!("https://civitai.com/api/download/models/{new_version_id}");
-        self.enqueue(&url, model_type)
+        self.enqueue(&url, model_type, DownloadReason::UpdateAvailable)
     }
 
     pub fn get_job(&self, id: Uuid) -> Result<Option<DownloadJob>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, url, model_id, version_id, model_type, dest_path, status,
-                    created_at, updated_at, error
+                    created_at, updated_at, error, download_reason
              FROM jobs WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.to_string()])?;
@@ -104,7 +129,7 @@ impl Catalog {
     pub fn list_jobs(&self) -> Result<Vec<DownloadJob>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, url, model_id, version_id, model_type, dest_path, status,
-                    created_at, updated_at, error
+                    created_at, updated_at, error, download_reason
              FROM jobs ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], |row| Ok(row_to_job(row)))?;
@@ -164,6 +189,7 @@ impl Catalog {
         version_id: Option<u64>,
         model_type: Option<&str>,
         dest_path: &Path,
+        reason: DownloadReason,
     ) -> Result<Option<DownloadJob>> {
         // Deduplicate: prefer version_id; fall back to dest_path.
         if let Some(vid) = version_id {
@@ -191,8 +217,8 @@ impl Catalog {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO jobs
-             (id, url, model_id, version_id, model_type, dest_path, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'done', ?7, ?7)",
+             (id, url, model_id, version_id, model_type, dest_path, status, created_at, updated_at, download_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'done', ?7, ?7, ?8)",
             params![
                 id.to_string(),
                 url,
@@ -201,6 +227,7 @@ impl Catalog {
                 model_type,
                 dest_path.to_string_lossy().as_ref(),
                 now,
+                reason.to_string(),
             ],
         )?;
         self.get_job(id)?
@@ -211,7 +238,7 @@ impl Catalog {
     pub fn next_queued(&self) -> Result<Option<DownloadJob>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, url, model_id, version_id, model_type, dest_path, status,
-                    created_at, updated_at, error
+                    created_at, updated_at, error, download_reason
              FROM jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1",
         )?;
         let mut rows = stmt.query([])?;
@@ -255,6 +282,13 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadJob> {
         "cancelled" => JobStatus::Cancelled,
         _ => JobStatus::Failed,
     };
+    let reason_str: String = row.get(10)?;
+    let download_reason = match reason_str.as_str() {
+        "cli_add" => DownloadReason::CliAdd,
+        "update_available" => DownloadReason::UpdateAvailable,
+        "startup_scan" => DownloadReason::StartupScan,
+        _ => DownloadReason::CliAdd,
+    };
     Ok(DownloadJob {
         id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
         url: row.get(1)?,
@@ -270,6 +304,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadJob> {
             .unwrap_or_default()
             .with_timezone(&Utc),
         error: row.get(9)?,
+        download_reason,
     })
 }
 
@@ -332,10 +367,10 @@ mod tests {
     fn test_count_by_status() {
         let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
         catalog
-            .enqueue("https://civitai.com/models/1", None)
+            .enqueue("https://civitai.com/models/1", None, DownloadReason::CliAdd)
             .unwrap();
         catalog
-            .enqueue("https://civitai.com/models/2", None)
+            .enqueue("https://civitai.com/models/2", None, DownloadReason::CliAdd)
             .unwrap();
         let count = catalog.count_by_status(JobStatus::Queued).unwrap();
         assert_eq!(count, 2);
@@ -353,6 +388,7 @@ mod tests {
                 Some(67890),
                 Some("loras"),
                 std::path::Path::new("/models/loras/Pony/my_lora.safetensors"),
+                DownloadReason::StartupScan,
             )
             .unwrap()
             .expect("should insert new row");
@@ -376,6 +412,7 @@ mod tests {
                 Some(67890),
                 Some("loras"),
                 std::path::Path::new("/models/loras/Pony/lora.safetensors"),
+                DownloadReason::StartupScan,
             )
             .unwrap();
         assert!(first.is_some());
@@ -386,6 +423,7 @@ mod tests {
                 Some(67890),
                 Some("loras"),
                 std::path::Path::new("/models/loras/Pony/lora_copy.safetensors"),
+                DownloadReason::StartupScan,
             )
             .unwrap();
         assert!(second.is_none(), "duplicate version_id must return None");
@@ -402,6 +440,7 @@ mod tests {
                 None,
                 Some("other"),
                 path,
+                DownloadReason::StartupScan,
             )
             .unwrap();
         assert!(first.is_some());
@@ -412,6 +451,7 @@ mod tests {
                 None,
                 Some("other"),
                 path,
+                DownloadReason::StartupScan,
             )
             .unwrap();
         assert!(second.is_none(), "duplicate dest_path must return None");
@@ -421,7 +461,7 @@ mod tests {
     fn test_set_dest_path() {
         let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
         let job = catalog
-            .enqueue("https://civitai.com/models/1", None)
+            .enqueue("https://civitai.com/models/1", None, DownloadReason::CliAdd)
             .unwrap();
         catalog
             .set_dest_path(job.id, std::path::Path::new("/tmp/model.safetensors"))
@@ -455,6 +495,7 @@ mod tests {
                 std::path::Path::new(
                     "/tmp/test-models/diffusion_models/Flux.1 D/syntheticTestModel_v2.safetensors",
                 ),
+                DownloadReason::StartupScan,
             )
             .unwrap()
             .expect("should insert new row");
@@ -484,6 +525,7 @@ mod tests {
                 version_id,
                 Some("diffusion_models"),
                 dest,
+                DownloadReason::StartupScan,
             )
             .unwrap();
         assert!(first.is_some());
@@ -495,6 +537,7 @@ mod tests {
                 version_id,
                 Some("diffusion_models"),
                 dest,
+                DownloadReason::StartupScan,
             )
             .unwrap();
         assert!(dup.is_none(), "duplicate version_id must be rejected");

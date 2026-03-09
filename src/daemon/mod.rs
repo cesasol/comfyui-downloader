@@ -95,7 +95,11 @@ async fn handle_request(
     match req {
         Request::AddDownload { url, model_type } => {
             let cat = catalog.lock().await;
-            match cat.enqueue(&url, model_type.as_deref()) {
+            match cat.enqueue(
+                &url,
+                model_type.as_deref(),
+                crate::catalog::DownloadReason::CliAdd,
+            ) {
                 Ok(job) => Response::ok(job),
                 Err(e) => Response::err(e.to_string()),
             }
