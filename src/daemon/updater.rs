@@ -67,14 +67,55 @@ async fn check_updates(
 
         if let Some(latest) = model.model_versions.first() {
             if is_newer(latest.id, stored_version_id) {
-                info!(
-                    "Update available for model {model_id}: {} → {}",
-                    stored_version_id, latest.id
-                );
-                let cat = catalog.lock().await;
-                cat.enqueue_version_update(*model_id, latest.id, job.model_type.as_deref())?;
-                drop(cat);
-                let _ = notifier::notify_update_available(&model.name, &latest.name);
+                let stored_version = model.model_versions
+                    .iter()
+                    .find(|v| v.id == stored_version_id);
+                
+                let should_update = match (stored_version, &latest.base_model) {
+                    (Some(stored), Some(latest_base)) => {
+                        match &stored.base_model {
+                            Some(stored_base) => stored_base == latest_base,
+                            None => {
+                                warn!(
+                                    "Stored version {} has no base_model, skipping update to avoid type mismatch",
+                                    stored_version_id
+                                );
+                                false
+                            }
+                        }
+                    }
+                    (Some(_), None) => {
+                        warn!(
+                            "Latest version {} has no base_model, skipping update to avoid type mismatch",
+                            latest.id
+                        );
+                        false
+                    }
+                    (None, _) => {
+                        warn!(
+                            "Could not find stored version {} in model {}, proceeding with update",
+                            stored_version_id, model_id
+                        );
+                        true
+                    }
+                };
+                
+                if should_update {
+                    info!(
+                        "Update available for model {model_id}: {} → {}",
+                        stored_version_id, latest.id
+                    );
+                    let cat = catalog.lock().await;
+                    cat.enqueue_version_update(*model_id, latest.id, job.model_type.as_deref())?;
+                    drop(cat);
+                    let _ = notifier::notify_update_available(&model.name, &latest.name);
+                } else if let (Some(stored), Some(latest_base)) = (stored_version, &latest.base_model)
+                    && let Some(stored_base) = &stored.base_model {
+                    info!(
+                        "Skipping update for model {model_id}: base model mismatch ('{}' → '{}')",
+                        stored_base, latest_base
+                    );
+                }
             } else {
                 info!(
                     "Model {model_id} is up to date (version {})",

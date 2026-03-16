@@ -9,7 +9,7 @@ use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::fs::{self, File};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -276,15 +276,60 @@ pub async fn download(
 
     check_disk_space(&dest_dir)?;
 
+    let provisional_filename = resolution
+        .download_url
+        .split('/')
+        .next_back()
+        .unwrap_or("model.bin");
+    let provisional_dest = dest_dir.join(provisional_filename);
+    let provisional_tmp = provisional_dest.with_extension("tmp");
+    
+    let resume_from: u64 = if provisional_tmp.exists() {
+        match tokio::fs::metadata(&provisional_tmp).await {
+            Ok(metadata) => {
+                let size = metadata.len();
+                info!("Resuming download from byte {}", size);
+                size
+            }
+            Err(_) => 0,
+        }
+    } else {
+        0
+    };
+
     let http = reqwest::Client::new();
-    let resp = http
+    let mut req = http
         .get(&resolution.download_url)
-        .bearer_auth(key)
+        .bearer_auth(key);
+    
+    if resume_from > 0 {
+        req = req.header("Range", format!("bytes={}-", resume_from));
+    }
+    
+    let mut resp = req
         .send()
         .await
         .context("starting download")?;
+    
+    let mut resume_from = resume_from;
+    
+    if resume_from > 0 && resp.status() == reqwest::StatusCode::OK {
+        warn!("Server doesn't support range requests, restarting download");
+        drop(resp);
+        let _ = tokio::fs::remove_file(&provisional_tmp).await;
+        resume_from = 0;
+        
+        resp = http
+            .get(&resolution.download_url)
+            .bearer_auth(key)
+            .send()
+            .await
+            .context("restarting download")?;
+    }
+    
     match resp.status() {
         s if s.is_success() => {}
+        reqwest::StatusCode::PARTIAL_CONTENT => {}
         s @ (reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN) => {
             return Err(crate::civitai::CivitaiAccessError { status: s.as_u16() }.into());
         }
@@ -306,17 +351,33 @@ pub async fn download(
                 .to_string()
         });
 
+    let dest = dest_dir.join(&filename);
+    let tmp = dest.with_extension("tmp");
+    
+    if tmp != provisional_tmp && provisional_tmp.exists() && resume_from > 0
+        && let Err(e) = tokio::fs::rename(&provisional_tmp, &tmp).await {
+        warn!("Failed to rename temp file: {}, continuing without resume", e);
+        resume_from = 0;
+    }
+
     info!(
         "Downloading '{}' → {}/{}",
         filename, model_type_str, filename
     );
+    
+    let calculated_total_bytes = if resume_from > 0 {
+        Some(resume_from + resp.content_length().unwrap_or(0))
+    } else {
+        total_bytes
+    };
+    
     {
         let mut prog = progress.lock().await;
         prog.insert(
             job.id,
             DownloadProgress {
-                bytes_received: 0,
-                total_bytes,
+                bytes_received: resume_from,
+                total_bytes: calculated_total_bytes,
             },
         );
     }
@@ -324,13 +385,18 @@ pub async fn download(
     let notif_id = notifier::notify_download_start(&filename);
     let mut last_notif_pct: u64 = 0;
 
-    let dest = dest_dir.join(&filename);
-    let tmp = dest.with_extension("tmp");
-
-    let mut file = File::create(&tmp).await?;
+    let mut file = if resume_from > 0 {
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&tmp)
+            .await?
+    } else {
+        File::create(&tmp).await?
+    };
     let mut hasher = Sha256::new();
     let mut stream = resp.bytes_stream();
-    let mut bytes_received: u64 = 0;
+    let mut bytes_received: u64 = resume_from;
 
     loop {
         tokio::select! {
@@ -377,7 +443,25 @@ pub async fn download(
         notifier::close_download_notification(nid);
     }
 
-    let digest = hex::encode(hasher.finalize());
+    let digest = if resume_from > 0 {
+        info!("Re-hashing entire file for resumed download");
+        let mut file = tokio::fs::File::open(&tmp).await?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0; 8192];
+        
+        loop {
+            let bytes_read = file.read(&mut buffer).await?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..bytes_read]);
+        }
+        
+        hex::encode(hasher.finalize())
+    } else {
+        hex::encode(hasher.finalize())
+    };
+    
     info!("SHA-256: {digest}");
 
     if let Some(expected) = resolution.expected_hash.as_deref() {
