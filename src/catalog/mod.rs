@@ -2,7 +2,7 @@ pub mod schema;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use uuid::Uuid;
@@ -137,6 +137,16 @@ impl Catalog {
         rows.map(|r| r?.map_err(anyhow::Error::from)).collect()
     }
 
+    pub fn list_done_models(&self) -> Result<Vec<DownloadJob>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, url, model_id, version_id, model_type, dest_path, status,
+                    created_at, updated_at, error, download_reason
+             FROM jobs WHERE status = 'done' ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| Ok(row_to_job(row)))?;
+        rows.map(|r| r?.map_err(anyhow::Error::from)).collect()
+    }
+
     pub fn set_status(&self, id: Uuid, status: JobStatus, error: Option<&str>) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
@@ -177,6 +187,27 @@ impl Catalog {
         self.conn
             .execute("DELETE FROM jobs WHERE id = ?1", params![id.to_string()])?;
         Ok(())
+    }
+
+    pub fn delete_model(&self, id: Uuid) -> Result<Vec<std::path::PathBuf>> {
+        let job = self.get_job(id)?.context("job not found")?;
+
+        let mut paths_to_delete = Vec::new();
+
+        if let Some(dest_path) = job.dest_path {
+            let model_path = std::path::PathBuf::from(&dest_path);
+            let metadata_path = model_path.with_extension("metadata.json");
+            let preview_path_jpg = model_path.with_extension("preview.jpg");
+            let preview_path_webp = model_path.with_extension("preview.webp");
+
+            paths_to_delete.push(model_path);
+            paths_to_delete.push(metadata_path);
+            paths_to_delete.push(preview_path_jpg);
+            paths_to_delete.push(preview_path_webp);
+        }
+
+        self.delete_job(id)?;
+        Ok(paths_to_delete)
     }
 
     pub fn done_jobs_for_model(&self, model_id: u64) -> Result<Vec<DownloadJob>> {
@@ -573,5 +604,46 @@ mod tests {
             )
             .unwrap();
         assert!(dup.is_none(), "duplicate version_id must be rejected");
+    }
+
+    #[test]
+    fn test_list_done_models() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+
+        let job1 = catalog
+            .enqueue("https://civitai.com/models/1", None, DownloadReason::CliAdd)
+            .unwrap();
+        let _job2 = catalog
+            .enqueue("https://civitai.com/models/2", None, DownloadReason::CliAdd)
+            .unwrap();
+
+        catalog.set_status(job1.id, JobStatus::Done, None).unwrap();
+
+        let done_models = catalog.list_done_models().unwrap();
+        assert_eq!(done_models.len(), 1);
+        assert_eq!(done_models[0].id, job1.id);
+        assert_eq!(done_models[0].status, JobStatus::Done);
+    }
+
+    #[test]
+    fn test_delete_model() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog
+            .enqueue("https://civitai.com/models/1", None, DownloadReason::CliAdd)
+            .unwrap();
+
+        catalog
+            .set_dest_path(job.id, std::path::Path::new("/tmp/model.safetensors"))
+            .unwrap();
+
+        let paths = catalog.delete_model(job.id).unwrap();
+
+        assert_eq!(paths.len(), 4);
+        assert!(paths.contains(&std::path::PathBuf::from("/tmp/model.safetensors")));
+        assert!(paths.contains(&std::path::PathBuf::from("/tmp/model.metadata.json")));
+        assert!(paths.contains(&std::path::PathBuf::from("/tmp/model.preview.jpg")));
+        assert!(paths.contains(&std::path::PathBuf::from("/tmp/model.preview.webp")));
+
+        assert!(catalog.get_job(job.id).unwrap().is_none());
     }
 }

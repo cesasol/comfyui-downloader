@@ -13,7 +13,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
-use tracing::info;
+use tracing::{info, warn};
 
 pub async fn run() -> Result<()> {
     let config = Config::load()?;
@@ -108,6 +108,28 @@ async fn handle_request(
             let cat = catalog.lock().await;
             match cat.list_jobs() {
                 Ok(jobs) => Response::ok(jobs),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::ListModels => {
+            let cat = catalog.lock().await;
+            match cat.list_done_models() {
+                Ok(models) => Response::ok(models),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::DeleteModel { id } => {
+            let cat = catalog.lock().await;
+            match cat.delete_model(id) {
+                Ok(deleted_paths) => {
+                    drop(cat);
+                    for path in deleted_paths {
+                        if let Err(e) = tokio::fs::remove_file(&path).await {
+                            warn!("Failed to delete file {}: {}", path.display(), e);
+                        }
+                    }
+                    Response::ok(serde_json::json!({ "deleted": id }))
+                }
                 Err(e) => Response::err(e.to_string()),
             }
         }

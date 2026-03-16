@@ -12,6 +12,10 @@ pub enum Request {
     },
     /// Return the current queue state.
     ListQueue,
+    /// Return downloaded models from the catalog.
+    ListModels,
+    /// Delete a model by job ID.
+    DeleteModel { id: Uuid },
     /// Trigger an immediate update scan.
     CheckUpdates,
     /// Return daemon health and active download progress.

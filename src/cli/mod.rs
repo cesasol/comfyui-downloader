@@ -25,6 +25,13 @@ enum Command {
     },
     /// Show daemon status and download queue
     Status,
+    /// List downloaded models in the catalog
+    List,
+    /// Delete a model by job ID
+    Delete { 
+        /// Job ID to delete
+        id: Uuid 
+    },
     /// Trigger an immediate update check
     CheckUpdates,
     /// Cancel a queued or active download by ID
@@ -54,6 +61,8 @@ pub async fn run() -> Result<()> {
     let req = match cli.command {
         Command::Add { url, model_type } => Request::AddDownload { url, model_type },
         Command::Status => Request::GetStatus,
+        Command::List => Request::ListModels,
+        Command::Delete { id } => Request::DeleteModel { id },
         Command::CheckUpdates => Request::CheckUpdates,
         Command::Cancel { id } => Request::Cancel { id },
         Command::SetKey { .. } => unreachable!(),
