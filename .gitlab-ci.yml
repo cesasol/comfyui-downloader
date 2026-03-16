@@ -1,0 +1,66 @@
+# Reference: https://docs.gitlab.com/ee/ci/yaml/
+
+stages:
+  - prepare
+  - test
+  - build
+  - release
+
+variables:
+  # Environment variable for the Cargo home directory
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+
+cache:
+  # Cache Cargo dependencies between jobs for all pipelines
+  key: "$CI_JOB_NAME"
+  paths:
+    - .cargo/
+    - target/
+
+cargo-version:
+  stage: prepare
+  image: rust:latest
+  script:
+    - rustc --version && cargo --version
+
+cargo-test:
+  stage: test
+  image: rust:latest
+  script:
+    - cargo test --verbose
+
+cargo-build:
+  stage: build
+  image: rust:latest
+  script:
+    # Install musl target
+    - rustup target add x86_64-unknown-linux-musl
+    # Build a statically linked binary
+    - cargo build --release --target x86_64-unknown-linux-musl
+    # Create a releases directory
+    - mkdir releases
+    # Copy the binary to the releases directory and append the platform to the filename
+    - cp target/x86_64-unknown-linux-musl/release/rust-binary-release-gitlab-ci releases/rust-binary-release-gitlab-ci-x86_64-unknown-linux-musl
+  artifacts:
+    paths:
+      - releases/
+  only:
+    - tags
+
+gitlab-release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  script:
+    - echo "Creating GitLab release for $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: "Release $CI_COMMIT_TAG"
+    description: "Release $CI_COMMIT_TAG"
+    assets:
+      links:
+        - name: "rust-binary-release-gitlab-ci-x86_64-unknown-linux-musl"
+          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/releases/rust-binary-release-gitlab-ci-x86_64-unknown-linux-musl?job=cargo-build"
+          link_type: package
+
+  only:
+    - tags
