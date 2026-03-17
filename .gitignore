@@ -1,2 +1,5 @@
 /target
 /.worktrees
+gui/node_modules
+gui/dist
+src-tauri/gen

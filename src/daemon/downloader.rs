@@ -283,7 +283,7 @@ pub async fn download(
         .unwrap_or("model.bin");
     let provisional_dest = dest_dir.join(provisional_filename);
     let provisional_tmp = provisional_dest.with_extension("tmp");
-    
+
     let resume_from: u64 = if provisional_tmp.exists() {
         match tokio::fs::metadata(&provisional_tmp).await {
             Ok(metadata) => {
@@ -298,27 +298,22 @@ pub async fn download(
     };
 
     let http = reqwest::Client::new();
-    let mut req = http
-        .get(&resolution.download_url)
-        .bearer_auth(key);
-    
+    let mut req = http.get(&resolution.download_url).bearer_auth(key);
+
     if resume_from > 0 {
         req = req.header("Range", format!("bytes={}-", resume_from));
     }
-    
-    let mut resp = req
-        .send()
-        .await
-        .context("starting download")?;
-    
+
+    let mut resp = req.send().await.context("starting download")?;
+
     let mut resume_from = resume_from;
-    
+
     if resume_from > 0 && resp.status() == reqwest::StatusCode::OK {
         warn!("Server doesn't support range requests, restarting download");
         drop(resp);
         let _ = tokio::fs::remove_file(&provisional_tmp).await;
         resume_from = 0;
-        
+
         resp = http
             .get(&resolution.download_url)
             .bearer_auth(key)
@@ -326,7 +321,7 @@ pub async fn download(
             .await
             .context("restarting download")?;
     }
-    
+
     match resp.status() {
         s if s.is_success() => {}
         reqwest::StatusCode::PARTIAL_CONTENT => {}
@@ -353,10 +348,16 @@ pub async fn download(
 
     let dest = dest_dir.join(&filename);
     let tmp = dest.with_extension("tmp");
-    
-    if tmp != provisional_tmp && provisional_tmp.exists() && resume_from > 0
-        && let Err(e) = tokio::fs::rename(&provisional_tmp, &tmp).await {
-        warn!("Failed to rename temp file: {}, continuing without resume", e);
+
+    if tmp != provisional_tmp
+        && provisional_tmp.exists()
+        && resume_from > 0
+        && let Err(e) = tokio::fs::rename(&provisional_tmp, &tmp).await
+    {
+        warn!(
+            "Failed to rename temp file: {}, continuing without resume",
+            e
+        );
         resume_from = 0;
     }
 
@@ -364,13 +365,13 @@ pub async fn download(
         "Downloading '{}' → {}/{}",
         filename, model_type_str, filename
     );
-    
+
     let calculated_total_bytes = if resume_from > 0 {
         Some(resume_from + resp.content_length().unwrap_or(0))
     } else {
         total_bytes
     };
-    
+
     {
         let mut prog = progress.lock().await;
         prog.insert(
@@ -378,6 +379,14 @@ pub async fn download(
             DownloadProgress {
                 bytes_received: resume_from,
                 total_bytes: calculated_total_bytes,
+                model_name: resolution.model_name.clone(),
+                dest_path: Some(dest.to_string_lossy().into_owned()),
+                model_type: resolution
+                    .model_type_subdir
+                    .clone()
+                    .or_else(|| job.model_type.clone()),
+                download_reason: Some(job.download_reason.to_string()),
+                started_at: Some(chrono::Utc::now()),
             },
         );
     }
@@ -448,7 +457,7 @@ pub async fn download(
         let mut file = tokio::fs::File::open(&tmp).await?;
         let mut hasher = Sha256::new();
         let mut buffer = vec![0; 8192];
-        
+
         loop {
             let bytes_read = file.read(&mut buffer).await?;
             if bytes_read == 0 {
@@ -456,12 +465,12 @@ pub async fn download(
             }
             hasher.update(&buffer[..bytes_read]);
         }
-        
+
         hex::encode(hasher.finalize())
     } else {
         hex::encode(hasher.finalize())
     };
-    
+
     info!("SHA-256: {digest}");
 
     if let Some(expected) = resolution.expected_hash.as_deref() {

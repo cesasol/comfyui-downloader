@@ -15,10 +15,15 @@ use uuid::Uuid;
 /// Map of active download job IDs to their cancellation tokens.
 pub type ActiveTasks = Arc<Mutex<HashMap<Uuid, CancellationToken>>>;
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DownloadProgress {
     pub bytes_received: u64,
     pub total_bytes: Option<u64>,
+    pub model_name: Option<String>,
+    pub dest_path: Option<String>,
+    pub model_type: Option<String>,
+    pub download_reason: Option<String>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub type ProgressMap = Arc<Mutex<HashMap<Uuid, DownloadProgress>>>;

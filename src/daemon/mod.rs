@@ -4,13 +4,15 @@ pub mod queue;
 pub mod scanner;
 pub mod updater;
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, DownloadJob};
 use crate::civitai::CivitaiClient;
 use crate::config::Config;
 use crate::daemon::queue::{ActiveTasks, ProgressMap};
+use crate::ipc::protocol::EnrichedModel;
 use crate::ipc::{IpcServer, Request, Response};
 use anyhow::Result;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tracing::{info, warn};
@@ -118,6 +120,17 @@ async fn handle_request(
                 Err(e) => Response::err(e.to_string()),
             }
         }
+        Request::ListModelsEnriched => {
+            let cat = catalog.lock().await;
+            match cat.list_done_models() {
+                Ok(models) => {
+                    drop(cat);
+                    let enriched = enrich_models(models).await;
+                    Response::ok(enriched)
+                }
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
         Request::DeleteModel { id } => {
             let cat = catalog.lock().await;
             match cat.delete_model(id) {
@@ -134,10 +147,9 @@ async fn handle_request(
             }
         }
         Request::GetStatus => {
-            let queued = {
+            let queued_jobs = {
                 let cat = catalog.lock().await;
-                cat.count_by_status(crate::catalog::JobStatus::Queued)
-                    .unwrap_or(0)
+                cat.list_queued().unwrap_or_default()
             };
             let active_jobs: Vec<serde_json::Value> = {
                 let prog = progress.lock().await;
@@ -147,10 +159,26 @@ async fn handle_request(
                             "id": id,
                             "bytes_received": p.bytes_received,
                             "total_bytes": p.total_bytes,
+                            "model_name": p.model_name,
+                            "dest_path": p.dest_path,
+                            "model_type": p.model_type,
+                            "download_reason": p.download_reason,
+                            "started_at": p.started_at,
                         })
                     })
                     .collect()
             };
+            let queued_info: Vec<serde_json::Value> = queued_jobs
+                .iter()
+                .map(|j| {
+                    serde_json::json!({
+                        "id": j.id,
+                        "url": j.url,
+                        "model_type": j.model_type,
+                        "download_reason": j.download_reason.to_string(),
+                    })
+                })
+                .collect();
             let free_bytes = crate::config::Config::load()
                 .ok()
                 .map(|c| {
@@ -158,7 +186,8 @@ async fn handle_request(
                 })
                 .unwrap_or(0);
             Response::ok(serde_json::json!({
-                "queued": queued,
+                "queued": queued_info.len(),
+                "queued_jobs": queued_info,
                 "active": active_jobs,
                 "free_bytes": free_bytes,
             }))
@@ -188,4 +217,59 @@ async fn handle_request(
             }
         }
     }
+}
+
+async fn enrich_models(models: Vec<DownloadJob>) -> Vec<EnrichedModel> {
+    let mut enriched = Vec::with_capacity(models.len());
+    for job in models {
+        let metadata = match job.dest_path.as_deref() {
+            Some(dest) => read_sidecar_metadata(Path::new(dest)).await,
+            None => None,
+        };
+        let (model_name, base_model, preview_path, preview_nsfw_level, file_size, sha256) =
+            match metadata {
+                Some(meta) => (
+                    meta.get("model_name")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    meta.get("base_model")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    meta.get("preview_url")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    meta.get("preview_nsfw_level")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as u32),
+                    meta.get("size").and_then(|v| v.as_u64()),
+                    meta.get("sha256")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                ),
+                None => (None, None, None, None, None, None),
+            };
+        enriched.push(EnrichedModel {
+            id: job.id,
+            url: job.url,
+            model_id: job.model_id,
+            version_id: job.version_id,
+            model_type: job.model_type,
+            dest_path: job.dest_path,
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+            model_name,
+            base_model,
+            preview_path,
+            preview_nsfw_level,
+            file_size,
+            sha256,
+        });
+    }
+    enriched
+}
+
+async fn read_sidecar_metadata(model_path: &Path) -> Option<serde_json::Value> {
+    let meta_path = model_path.with_extension("metadata.json");
+    let bytes = tokio::fs::read(&meta_path).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
 }

@@ -2,7 +2,7 @@ pub mod schema;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use uuid::Uuid;
@@ -295,6 +295,16 @@ impl Catalog {
         self.get_job(id)?
             .context("job not found after register_existing")
             .map(Some)
+    }
+
+    pub fn list_queued(&self) -> Result<Vec<DownloadJob>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, url, model_id, version_id, model_type, dest_path, status,
+                    created_at, updated_at, error, download_reason
+             FROM jobs WHERE status = 'queued' ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| Ok(row_to_job(row)))?;
+        rows.map(|r| r?.map_err(anyhow::Error::from)).collect()
     }
 
     pub fn next_queued(&self) -> Result<Option<DownloadJob>> {

@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -14,6 +15,8 @@ pub enum Request {
     ListQueue,
     /// Return downloaded models from the catalog.
     ListModels,
+    /// Return downloaded models enriched with metadata (preview, base_model, etc.).
+    ListModelsEnriched,
     /// Delete a model by job ID.
     DeleteModel { id: Uuid },
     /// Trigger an immediate update scan.
@@ -22,6 +25,24 @@ pub enum Request {
     GetStatus,
     /// Cancel a queued or active download by ID.
     Cancel { id: Uuid },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichedModel {
+    pub id: Uuid,
+    pub url: String,
+    pub model_id: Option<u64>,
+    pub version_id: Option<u64>,
+    pub model_type: Option<String>,
+    pub dest_path: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub model_name: Option<String>,
+    pub base_model: Option<String>,
+    pub preview_path: Option<String>,
+    pub preview_nsfw_level: Option<u32>,
+    pub file_size: Option<u64>,
+    pub sha256: Option<String>,
 }
 
 /// Responses sent from the daemon back to the CLI client.
