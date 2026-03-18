@@ -75,12 +75,7 @@ async fn resolve_version(
                 .find(|f| f.primary == Some(true))
                 .or_else(|| version.files.first())
                 .context("no files in version metadata")?;
-            let model_type_subdir = Some(
-                model_info
-                    .r#type
-                    .models_subdir_for_file(file, base_model.as_deref())
-                    .to_string(),
-            );
+            let model_type_subdir = Some(model_info.r#type.models_subdir().to_string());
             let download_url = file.download_url.clone().with_context(|| {
                 format!(
                     "no downloadUrl for file '{}' in version {version_id}",
@@ -110,7 +105,6 @@ async fn resolve_version(
         }
 
         (Some(version_id), None) => {
-            // Version ID only: single call, use whatever the endpoint returns.
             let version = civitai
                 .get_model_version(version_id)
                 .await
@@ -122,11 +116,10 @@ async fn resolve_version(
                 .find(|f| f.primary == Some(true))
                 .or_else(|| version.files.first())
                 .context("no files in version metadata")?;
-            let model_type_subdir = version.model.as_ref().map(|m| {
-                m.r#type
-                    .models_subdir_for_file(file, base_model.as_deref())
-                    .to_string()
-            });
+            let model_type_subdir = version
+                .model
+                .as_ref()
+                .map(|m| m.r#type.models_subdir().to_string());
             let download_url = file.download_url.clone().with_context(|| {
                 format!(
                     "no downloadUrl for file '{}' in version {version_id}",
@@ -181,12 +174,7 @@ async fn resolve_version(
                 .find(|f| f.primary == Some(true))
                 .or_else(|| version.files.first())
                 .context("no files in latest version")?;
-            let model_type_subdir = Some(
-                model_info
-                    .r#type
-                    .models_subdir_for_file(file, base_model.as_deref())
-                    .to_string(),
-            );
+            let model_type_subdir = Some(model_info.r#type.models_subdir().to_string());
             let download_url = file.download_url.clone().with_context(|| {
                 format!(
                     "no downloadUrl for file '{}' in version {version_id}",
@@ -250,13 +238,12 @@ pub async fn download(
 
     let resolution = resolve_version(job, civitai, config).await?;
 
-    // Prefer the API-reported model type over whatever the user provided at enqueue time.
-    let model_type_str = resolution
+    let mut model_type_str = resolution
         .model_type_subdir
-        .as_deref()
-        .or(job.model_type.as_deref())
-        .unwrap_or("other");
-    let mut dest_dir = config.paths.models_dir.join(model_type_str);
+        .clone()
+        .or_else(|| job.model_type.clone())
+        .unwrap_or_else(|| "other".to_string());
+    let mut dest_dir = config.paths.models_dir.join(&model_type_str);
     if let Some(ref base_model) = resolution.base_model {
         dest_dir = dest_dir.join(sanitize_dir_name(base_model));
     }
@@ -346,7 +333,7 @@ pub async fn download(
                 .to_string()
         });
 
-    let dest = dest_dir.join(&filename);
+    let mut dest = dest_dir.join(&filename);
     let tmp = dest.with_extension("tmp");
 
     if tmp != provisional_tmp
@@ -483,6 +470,37 @@ pub async fn download(
         warn!("No SHA-256 hash available for this file, skipping verification");
     }
 
+    if model_type_str == "checkpoints" {
+        let ext = dest.extension().and_then(|e| e.to_str());
+        let reroute = match ext {
+            Some("gguf") => true,
+            Some("safetensors") => {
+                match crate::safetensor::inspect_components(&tmp).await {
+                    Ok(c) if !c.has_vae && !c.has_clip => true,
+                    Ok(_) => {
+                        info!("VAE/CLIP found in safetensors header, keeping in checkpoints");
+                        false
+                    }
+                    Err(e) => {
+                        warn!("Failed to inspect safetensors header: {e:#}; defaulting to checkpoints");
+                        false
+                    }
+                }
+            }
+            _ => false,
+        };
+        if reroute {
+            info!("Routing checkpoint to diffusion_models");
+            model_type_str = "diffusion_models".to_string();
+            dest_dir = config.paths.models_dir.join(&model_type_str);
+            if let Some(ref base_model) = resolution.base_model {
+                dest_dir = dest_dir.join(sanitize_dir_name(base_model));
+            }
+            fs::create_dir_all(&dest_dir).await?;
+            dest = dest_dir.join(&filename);
+        }
+    }
+
     fs::rename(&tmp, &dest).await?;
 
     let preview_path = resolution.preview_image_url.as_deref().map(|url| {
@@ -502,7 +520,7 @@ pub async fn download(
     ) {
         download_preview(url, path).await;
     }
-    Ok((dest, resolution.model_type_subdir))
+    Ok((dest, Some(model_type_str)))
 }
 
 async fn write_metadata(

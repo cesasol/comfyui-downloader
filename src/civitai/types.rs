@@ -88,8 +88,6 @@ pub enum ModelType {
 }
 
 impl ModelType {
-    /// Map to the ComfyUI models subdirectory name.
-    /// For checkpoints, use `models_subdir_for_file` instead to account for pruned vs full.
     pub fn models_subdir(&self) -> &'static str {
         match self {
             Self::Checkpoint => "checkpoints",
@@ -99,29 +97,6 @@ impl ModelType {
             Self::Vae => "vae",
             Self::Upscaler => "upscale_models",
             _ => "other",
-        }
-    }
-
-    /// Like `models_subdir` but routes Flux checkpoints with `metadata.size == "pruned"`
-    /// to `diffusion_models`; all other checkpoints go to `checkpoints`.
-    pub fn models_subdir_for_file(
-        &self,
-        file: &ModelFile,
-        base_model: Option<&str>,
-    ) -> &'static str {
-        if matches!(self, Self::Checkpoint) {
-            let is_flux = base_model
-                .map(|b| b.to_ascii_lowercase().contains("flux"))
-                .unwrap_or(false);
-            let is_pruned =
-                file.metadata.as_ref().and_then(|m| m.size.as_deref()) == Some("pruned");
-            if is_flux && is_pruned {
-                "diffusion_models"
-            } else {
-                "checkpoints"
-            }
-        } else {
-            self.models_subdir()
         }
     }
 }
@@ -219,38 +194,18 @@ mod tests {
     }
 
     #[test]
-    fn test_flux_pruned_checkpoint_routes_to_diffusion_models() {
-        let info = load_model_info();
-
-        let flux = &info.model_versions[1];
-        let file = &flux.files[0];
-        let subdir = info
-            .r#type
-            .models_subdir_for_file(file, flux.base_model.as_deref());
-        assert_eq!(subdir, "diffusion_models");
+    fn test_checkpoint_always_routes_to_checkpoints() {
+        assert_eq!(ModelType::Checkpoint.models_subdir(), "checkpoints");
     }
 
     #[test]
-    fn test_sdxl_full_checkpoint_routes_to_checkpoints() {
-        let info = load_model_info();
-
-        let sdxl = &info.model_versions[2];
-        let file = &sdxl.files[0];
-        let subdir = info
-            .r#type
-            .models_subdir_for_file(file, sdxl.base_model.as_deref());
-        assert_eq!(subdir, "checkpoints");
+    fn test_lora_routes_to_loras() {
+        assert_eq!(ModelType::Lora.models_subdir(), "loras");
+        assert_eq!(ModelType::LoCon.models_subdir(), "loras");
     }
 
     #[test]
-    fn test_non_flux_pruned_checkpoint_routes_to_checkpoints() {
-        let info = load_model_info();
-
-        let ea = &info.model_versions[0];
-        let file = &ea.files[0];
-        let subdir = info
-            .r#type
-            .models_subdir_for_file(file, ea.base_model.as_deref());
-        assert_eq!(subdir, "checkpoints");
+    fn test_vae_routes_to_vae() {
+        assert_eq!(ModelType::Vae.models_subdir(), "vae");
     }
 }

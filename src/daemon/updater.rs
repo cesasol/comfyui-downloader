@@ -153,19 +153,31 @@ async fn relocate_if_needed(
     let Some(version) = model.model_versions.iter().find(|v| v.id == version_id) else {
         return;
     };
-    let Some(file) = version
-        .files
-        .iter()
-        .find(|f| f.primary == Some(true))
-        .or_else(|| version.files.first())
-    else {
-        return;
-    };
-
-    let expected_subdir = model
-        .r#type
-        .models_subdir_for_file(file, version.base_model.as_deref());
-    let mut expected_dir = config.paths.models_dir.join(expected_subdir);
+    let mut expected_subdir = model.r#type.models_subdir().to_string();
+    if expected_subdir == "checkpoints" {
+        let ext = current_path.extension().and_then(|e| e.to_str());
+        match ext {
+            Some("gguf") => {
+                expected_subdir = "diffusion_models".to_string();
+            }
+            Some("safetensors") => {
+                match crate::safetensor::inspect_components(&current_path).await {
+                    Ok(c) if !c.has_vae && !c.has_clip => {
+                        expected_subdir = "diffusion_models".to_string();
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(
+                            "Failed to inspect safetensors header for {}: {e:#}",
+                            current_path.display()
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut expected_dir = config.paths.models_dir.join(&expected_subdir);
     if let Some(ref base_model) = version.base_model {
         expected_dir = expected_dir.join(downloader::sanitize_dir_name(base_model));
     }
