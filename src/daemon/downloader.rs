@@ -474,19 +474,17 @@ pub async fn download(
         let ext = dest.extension().and_then(|e| e.to_str());
         let reroute = match ext {
             Some("gguf") => true,
-            Some("safetensors") => {
-                match crate::safetensor::inspect_components(&tmp).await {
-                    Ok(c) if !c.has_vae && !c.has_clip => true,
-                    Ok(_) => {
-                        info!("VAE/CLIP found in safetensors header, keeping in checkpoints");
-                        false
-                    }
-                    Err(e) => {
-                        warn!("Failed to inspect safetensors header: {e:#}; defaulting to checkpoints");
-                        false
-                    }
+            Some("safetensors") => match crate::safetensor::inspect_components(&tmp).await {
+                Ok(c) if !c.has_vae && !c.has_clip => true,
+                Ok(_) => {
+                    info!("VAE/CLIP found in safetensors header, keeping in checkpoints");
+                    false
                 }
-            }
+                Err(e) => {
+                    warn!("Failed to inspect safetensors header: {e:#}; defaulting to checkpoints");
+                    false
+                }
+            },
             _ => false,
         };
         if reroute {

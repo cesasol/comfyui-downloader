@@ -20,7 +20,14 @@ pub struct DownloadJob {
     pub updated_at: DateTime<Utc>,
     pub error: Option<String>,
     pub download_reason: DownloadReason,
+    pub available_version_id: Option<u64>,
+    pub available_version_name: Option<String>,
+    pub last_update_check: Option<DateTime<Utc>>,
 }
+
+const JOB_COLUMNS: &str = "id, url, model_id, version_id, model_type, dest_path, status, \
+     created_at, updated_at, error, download_reason, \
+     available_version_id, available_version_name, last_update_check";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -83,7 +90,11 @@ impl Catalog {
     fn migrate(&self) -> Result<()> {
         self.conn
             .execute_batch(schema::MIGRATIONS)
-            .context("running migrations")
+            .context("running migrations")?;
+        for alter in schema::ALTER_MIGRATIONS {
+            let _ = self.conn.execute(alter, []);
+        }
+        Ok(())
     }
 
     pub fn enqueue(
@@ -114,11 +125,9 @@ impl Catalog {
     }
 
     pub fn get_job(&self, id: Uuid) -> Result<Option<DownloadJob>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, url, model_id, version_id, model_type, dest_path, status,
-                    created_at, updated_at, error, download_reason
-             FROM jobs WHERE id = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1"))?;
         let mut rows = stmt.query(params![id.to_string()])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row_to_job(row)?))
@@ -128,21 +137,17 @@ impl Catalog {
     }
 
     pub fn list_jobs(&self) -> Result<Vec<DownloadJob>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, url, model_id, version_id, model_type, dest_path, status,
-                    created_at, updated_at, error, download_reason
-             FROM jobs ORDER BY created_at DESC",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {JOB_COLUMNS} FROM jobs ORDER BY created_at DESC"
+        ))?;
         let rows = stmt.query_map([], |row| Ok(row_to_job(row)))?;
         rows.map(|r| r?.map_err(anyhow::Error::from)).collect()
     }
 
     pub fn list_done_models(&self) -> Result<Vec<DownloadJob>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, url, model_id, version_id, model_type, dest_path, status,
-                    created_at, updated_at, error, download_reason
-             FROM jobs WHERE status = 'done' ORDER BY created_at DESC",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE status = 'done' ORDER BY created_at DESC"
+        ))?;
         let rows = stmt.query_map([], |row| Ok(row_to_job(row)))?;
         rows.map(|r| r?.map_err(anyhow::Error::from)).collect()
     }
@@ -211,21 +216,17 @@ impl Catalog {
     }
 
     pub fn done_jobs_for_model(&self, model_id: u64) -> Result<Vec<DownloadJob>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, url, model_id, version_id, model_type, dest_path, status,
-                    created_at, updated_at, error, download_reason
-             FROM jobs WHERE model_id = ?1 AND status = 'done'",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE model_id = ?1 AND status = 'done'"
+        ))?;
         let rows = stmt.query_map(params![model_id], |row| Ok(row_to_job(row)))?;
         rows.map(|r| r?.map_err(anyhow::Error::from)).collect()
     }
 
     pub fn get_job_by_version_id(&self, version_id: u64) -> Result<Option<DownloadJob>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, url, model_id, version_id, model_type, dest_path, status,
-                    created_at, updated_at, error, download_reason
-             FROM jobs WHERE version_id = ?1 LIMIT 1",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE version_id = ?1 LIMIT 1"
+        ))?;
         let mut rows = stmt.query(params![version_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row_to_job(row)?))
@@ -297,22 +298,83 @@ impl Catalog {
             .map(Some)
     }
 
-    pub fn list_queued(&self) -> Result<Vec<DownloadJob>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, url, model_id, version_id, model_type, dest_path, status,
-                    created_at, updated_at, error, download_reason
-             FROM jobs WHERE status = 'queued' ORDER BY created_at ASC",
+    pub fn flag_update_available(
+        &self,
+        model_id: u64,
+        new_version_id: u64,
+        version_name: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE jobs SET available_version_id = ?1, available_version_name = ?2, updated_at = ?3
+             WHERE model_id = ?4 AND status = 'done'",
+            params![new_version_id, version_name, now, model_id],
         )?;
+        Ok(())
+    }
+
+    pub fn clear_update_flag(&self, model_id: u64) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE jobs SET available_version_id = NULL, available_version_name = NULL, updated_at = ?1
+             WHERE model_id = ?2 AND status = 'done'",
+            params![now, model_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_updates_available(&self) -> Result<Vec<DownloadJob>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {JOB_COLUMNS} FROM jobs \
+             WHERE status = 'done' AND available_version_id IS NOT NULL \
+             ORDER BY updated_at DESC"
+        ))?;
+        let rows = stmt.query_map([], |row| Ok(row_to_job(row)))?;
+        rows.map(|r| r?.map_err(anyhow::Error::from)).collect()
+    }
+
+    pub fn set_last_update_check(&self, model_id: u64) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE jobs SET last_update_check = ?1
+             WHERE model_id = ?2 AND status = 'done'",
+            params![now, model_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn should_check_update(&self, model_id: u64) -> Result<bool> {
+        let last_check: Option<String> = self.conn.query_row(
+            "SELECT last_update_check FROM jobs
+             WHERE model_id = ?1 AND status = 'done'
+             ORDER BY last_update_check DESC LIMIT 1",
+            params![model_id],
+            |row| row.get(0),
+        )?;
+        match last_check {
+            None => Ok(true),
+            Some(ts) => {
+                let parsed = DateTime::parse_from_rfc3339(&ts)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_default();
+                let elapsed = Utc::now().signed_duration_since(parsed);
+                Ok(elapsed.num_hours() >= 24)
+            }
+        }
+    }
+
+    pub fn list_queued(&self) -> Result<Vec<DownloadJob>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE status = 'queued' ORDER BY created_at ASC"
+        ))?;
         let rows = stmt.query_map([], |row| Ok(row_to_job(row)))?;
         rows.map(|r| r?.map_err(anyhow::Error::from)).collect()
     }
 
     pub fn next_queued(&self) -> Result<Option<DownloadJob>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, url, model_id, version_id, model_type, dest_path, status,
-                    created_at, updated_at, error, download_reason
-             FROM jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1"
+        ))?;
         let mut rows = stmt.query([])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row_to_job(row)?))
@@ -362,6 +424,10 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadJob> {
         "access_denied_fallback" => DownloadReason::AccessDeniedFallback,
         _ => DownloadReason::CliAdd,
     };
+    let last_update_check: Option<DateTime<Utc>> = row
+        .get::<_, Option<String>>(13)?
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
     Ok(DownloadJob {
         id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
         url: row.get(1)?,
@@ -378,6 +444,9 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadJob> {
             .with_timezone(&Utc),
         error: row.get(9)?,
         download_reason,
+        available_version_id: row.get(11)?,
+        available_version_name: row.get(12)?,
+        last_update_check,
     })
 }
 
@@ -655,5 +724,70 @@ mod tests {
         assert!(paths.contains(&std::path::PathBuf::from("/tmp/model.preview.webp")));
 
         assert!(catalog.get_job(job.id).unwrap().is_none());
+    }
+
+    fn create_done_model(catalog: &Catalog, model_id: u64, version_id: u64) -> DownloadJob {
+        let url = format!("https://civitai.com/models/{model_id}?modelVersionId={version_id}");
+        let job = catalog
+            .enqueue(&url, Some("checkpoints"), DownloadReason::CliAdd)
+            .unwrap();
+        catalog.set_status(job.id, JobStatus::Done, None).unwrap();
+        catalog.get_job(job.id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn test_flag_update_available() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = create_done_model(&catalog, 100, 200);
+
+        catalog.flag_update_available(100, 300, "v3").unwrap();
+
+        let updated = catalog.get_job(job.id).unwrap().unwrap();
+        assert_eq!(updated.available_version_id, Some(300));
+        assert_eq!(updated.available_version_name.as_deref(), Some("v3"));
+    }
+
+    #[test]
+    fn test_clear_update_flag() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        create_done_model(&catalog, 100, 200);
+
+        catalog.flag_update_available(100, 300, "v3").unwrap();
+        catalog.clear_update_flag(100).unwrap();
+
+        let updates = catalog.list_updates_available().unwrap();
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn test_list_updates_available() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        create_done_model(&catalog, 100, 200);
+        create_done_model(&catalog, 101, 201);
+
+        catalog.flag_update_available(100, 300, "v3").unwrap();
+
+        let updates = catalog.list_updates_available().unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].model_id, Some(100));
+        assert_eq!(updates[0].available_version_id, Some(300));
+    }
+
+    #[test]
+    fn test_should_check_update_first_time() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        create_done_model(&catalog, 100, 200);
+
+        assert!(catalog.should_check_update(100).unwrap());
+    }
+
+    #[test]
+    fn test_should_check_update_within_24h() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        create_done_model(&catalog, 100, 200);
+
+        catalog.set_last_update_check(100).unwrap();
+
+        assert!(!catalog.should_check_update(100).unwrap());
     }
 }

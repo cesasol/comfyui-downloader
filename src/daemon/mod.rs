@@ -216,6 +216,27 @@ async fn handle_request(
                 }
             }
         }
+        Request::ListUpdates => {
+            let cat = catalog.lock().await;
+            match cat.list_updates_available() {
+                Ok(updates) => Response::ok(updates),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::DownloadVersion {
+            model_id,
+            version_id,
+        } => {
+            let cat = catalog.lock().await;
+            let url = format!("https://civitai.com/models/{model_id}?modelVersionId={version_id}");
+            match cat.enqueue(&url, None, crate::catalog::DownloadReason::CliAdd) {
+                Ok(job) => {
+                    let _ = cat.clear_update_flag(model_id);
+                    Response::ok(job)
+                }
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
     }
 }
 

@@ -1,34 +1,30 @@
 # comfyui-downloader
 
-A Rust daemon that downloads, catalogs, and updates AI models from CivitAI into a directory structure compatible with ComfyUI.
+A Rust daemon that downloads, catalogs, and manages AI models from CivitAI into a directory structure compatible with ComfyUI.
 
 ## Overview
 
-`comfyui-downloader` runs as a SystemD user service on GNU/Linux. It exposes a Unix socket IPC interface so a companion CLI tool can enqueue downloads, query status, and trigger update checks — all without requiring root privileges.
+`comfyui-downloader` runs as a SystemD user service on GNU/Linux. It exposes a Unix socket IPC interface so a companion CLI tool can enqueue downloads, manage models, review available updates, and configure the daemon — all without requiring root privileges.
 
 ## Features
 
 - **Download queue** — enqueue model downloads; the daemon processes them with configurable concurrency (default: 1)
+- **Download resume** — resumes interrupted downloads using HTTP range requests when the server supports it
 - **Metadata sidecars** — writes a `.metadata.json` file alongside each downloaded model containing the SHA-256 hash, CivitAI API response, base model, preview path, and more
 - **Preview images** — downloads and saves the CivitAI preview image (`model.preview.jpg/webp`) next to each model file
-- **Startup scanner** — on daemon start, scans the models directory for existing files missing metadata or preview images and fetches them from CivitAI using SHA-256 hash lookup
+- **Startup scanner** — on daemon start, scans the models directory for existing files missing metadata or preview images and fetches them from CivitAI using SHA-256 hash lookup; registers discovered models in the catalog for update tracking
 - **Duplicate detection** — skips the download if the target file already exists on disk
-- **Update checks** — periodically polls CivitAI for newer versions of every tracked model
+- **Update notifications** — periodically polls CivitAI for newer versions of tracked models (once per model every 24 hours) and flags them in the database; updates are never auto-downloaded, giving you full control over which versions to install
+- **Smart model routing** — automatically places checkpoint models in the correct ComfyUI subdirectory by inspecting the safetensors file header for bundled VAE/CLIP components; GGUF checkpoints are always routed to `diffusion_models/`
 - **Early access filtering** — skips EarlyAccess model versions by default (configurable)
 - **Checksum verification** — validates SHA-256 hashes reported by CivitAI after each download
 - **Retry logic** — handles CivitAI rate-limit responses (HTTP 429) with exponential backoff
 - **Disk space guard** — checks available disk space before starting a download
 - **Desktop notifications** — emits libnotify notifications on download completion, errors, and available updates; progress notifications every 10%
+- **Model management** — list downloaded models, delete models (removes files and catalog entry), and relocate misplaced files during update checks
 - **IPC interface** — Unix domain socket with a simple JSON protocol for daemon ↔ CLI communication
-- **CLI client** — `comfyui-dl` command to add downloads, check status, trigger update checks, cancel jobs, and configure the API key
+- **CLI client** — `comfyui-dl` command for all daemon interactions
 - **SystemD integration** — ships a `.service` unit file for `systemctl --user`
-
-## Planned Features
-
-- ZFS snapshot integration before and after bulk downloads
-- ComfyUI execution status shown as desktop notifications
-- Manage ComfyUI itself as a SystemD sub-daemon
-- Execute saved workflow templates with parameter patching
 
 ## Architecture
 
@@ -37,13 +33,15 @@ comfyui-downloader/
 ├── src/
 │   ├── main.rs           # Daemon binary entry point
 │   ├── cli_main.rs       # CLI binary entry point
+│   ├── lib.rs            # Library root, re-exports modules
 │   ├── config.rs         # Config loading/saving (XDG paths, TOML)
+│   ├── safetensor.rs     # Safetensors header parser (VAE/CLIP detection)
 │   ├── daemon/
-│   │   ├── mod.rs        # Daemon lifecycle (init, signal handling, shutdown)
+│   │   ├── mod.rs        # Daemon lifecycle, IPC request handler
 │   │   ├── queue.rs      # Async download queue (tokio, semaphore-bounded)
 │   │   ├── downloader.rs # HTTP streaming, checksum, metadata & preview writing
 │   │   ├── scanner.rs    # Startup scanner: hash-lookup for existing model files
-│   │   ├── updater.rs    # Periodic update checker
+│   │   ├── updater.rs    # Periodic update checker (notify-only, no auto-download)
 │   │   └── notifier.rs   # libnotify desktop notifications
 │   ├── ipc/
 │   │   ├── mod.rs        # Re-exports
@@ -57,7 +55,7 @@ comfyui-downloader/
 │   │   ├── mod.rs        # Model catalog (SQLite via rusqlite)
 │   │   └── schema.rs     # DB schema and migrations
 │   └── cli/
-│       └── mod.rs        # CLI argument parsing (clap)
+│       └── mod.rs        # CLI argument parsing and output formatting (clap)
 ├── systemd/
 │   └── comfyui-downloader.service
 ├── PKGBUILD              # Arch Linux / AUR package
@@ -71,11 +69,12 @@ Models are saved under a configurable root (default: `$XDG_DATA_HOME/comfyui/mod
 
 ```
 models/
-├── checkpoints/          # Full-precision checkpoints
+├── checkpoints/          # Full checkpoints (bundling VAE + CLIP + UNet)
 │   └── SDXL 1.0/
 │       └── model.safetensors
-├── diffusion_models/     # Pruned Flux checkpoints (GGUF / fp8 / etc.)
+├── diffusion_models/     # Diffusion-only models (no VAE/CLIP)
 │   └── Flux.1 D/
+│       ├── model.safetensors
 │       ├── model.gguf
 │       ├── model.metadata.json
 │       └── model.preview.webp
@@ -87,7 +86,11 @@ models/
 └── other/                # Fallback for unrecognised model types
 ```
 
-Model type and base model are inferred from the CivitAI API response. Flux checkpoints with `metadata.size == "pruned"` are routed to `diffusion_models/` instead of `checkpoints/`.
+Model type is inferred from the CivitAI API response. For checkpoint safetensors files, the daemon reads the file header to detect bundled components:
+
+- **VAE present** (`first_stage_model.*` tensors) and/or **CLIP present** (`cond_stage_model.*`, `conditioner.embedders.*` tensors) → `checkpoints/`
+- **Neither VAE nor CLIP** → `diffusion_models/`
+- **GGUF checkpoints** → always `diffusion_models/` (GGUF never bundles VAE/CLIP)
 
 ## Configuration
 
@@ -113,6 +116,57 @@ The API key can also be set without editing the file manually:
 comfyui-dl set-key <your-api-key>
 ```
 
+## CLI Usage
+
+```sh
+# Set your CivitAI API key (writes to config file, no daemon needed)
+comfyui-dl set-key <your-api-key>
+
+# Add a model by CivitAI URL
+comfyui-dl add https://civitai.com/models/12345
+comfyui-dl add https://civitai.com/models/12345?modelVersionId=67890
+
+# Show daemon status, active downloads, and free disk space
+comfyui-dl status
+
+# List downloaded models in the catalog
+comfyui-dl list
+
+# Check for available updates (flags models, does not auto-download)
+comfyui-dl check-updates
+
+# View models with available updates
+comfyui-dl updates
+
+# Download a specific version of a model
+comfyui-dl download-version <model_id> <version_id>
+
+# Cancel a queued or active download by job ID
+comfyui-dl cancel <uuid>
+
+# Delete a model by job ID (removes files and catalog entry)
+comfyui-dl delete <uuid>
+```
+
+### Update Workflow
+
+The daemon periodically checks CivitAI for newer versions of tracked models (rate-limited to once per model every 24 hours). When an update is found, it is flagged in the database and a desktop notification is sent — but **no automatic download occurs**. This is intentional: CivitAI model "versions" often represent quantizations, different base models, or unrelated variants rather than true updates.
+
+To review and install updates:
+
+```sh
+# See what's available
+comfyui-dl updates
+
+# Output:
+#   dreamWeaver_fluxDevV2.safetensors  [diffusion_models]
+#     version 5550002 → 5550003 (Flux Dev V3)
+#     comfyui-dl download-version 990001 5550003
+
+# Explicitly install an update
+comfyui-dl download-version 990001 5550003
+```
+
 ## IPC Protocol
 
 Communication over the Unix socket uses newline-delimited JSON:
@@ -121,6 +175,11 @@ Communication over the Unix socket uses newline-delimited JSON:
 |---|---|---|
 | `AddDownload` | `{ url, model_type? }` | Enqueue a CivitAI model URL |
 | `ListQueue` | — | Return current queue state |
+| `ListModels` | — | Return downloaded models from the catalog |
+| `ListModelsEnriched` | — | Return models enriched with sidecar metadata |
+| `ListUpdates` | — | Return models with available updates flagged |
+| `DownloadVersion` | `{ model_id, version_id }` | Enqueue a specific model version for download |
+| `DeleteModel` | `{ id }` | Delete a model by job ID (files + catalog entry) |
 | `CheckUpdates` | — | Trigger an immediate update scan |
 | `GetStatus` | — | Daemon health, active download progress, free disk space |
 | `Cancel` | `{ id }` | Cancel a queued or active download |
@@ -140,6 +199,7 @@ Communication over the Unix socket uses newline-delimited JSON:
 | Checksum | `sha2` / `hex` |
 | Disk space | `libc` (`statvfs`) |
 | Job IDs | `uuid` |
+| Timestamps | `chrono` |
 
 ## Requirements
 
@@ -168,26 +228,6 @@ cp target/release/comfyui-dl ~/.local/bin/
 cp systemd/comfyui-downloader.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now comfyui-downloader
-```
-
-## CLI Usage
-
-```sh
-# Set your CivitAI API key (writes to config file, no daemon needed)
-comfyui-dl set-key <your-api-key>
-
-# Add a model by CivitAI URL
-comfyui-dl add https://civitai.com/models/12345
-comfyui-dl add https://civitai.com/models/12345?modelVersionId=67890
-
-# Show daemon status, active downloads, and free disk space
-comfyui-dl status
-
-# Trigger an immediate update check
-comfyui-dl check-updates
-
-# Cancel a queued or active download by job ID
-comfyui-dl cancel <uuid>
 ```
 
 ## License

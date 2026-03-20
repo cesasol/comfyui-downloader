@@ -17,30 +17,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Enqueue a CivitAI model URL for download
     Add {
         url: String,
-        /// Override model type (checkpoints, loras, vae, …)
         #[arg(long)]
         model_type: Option<String>,
     },
-    /// Show daemon status and download queue
     Status,
-    /// List downloaded models in the catalog
     List,
-    /// Delete a model by job ID
     Delete {
-        /// Job ID to delete
         id: Uuid,
     },
-    /// Trigger an immediate update check
     CheckUpdates,
-    /// Cancel a queued or active download by ID
-    Cancel { id: Uuid },
-    /// Set the CivitAI API key in the config file
+    Cancel {
+        id: Uuid,
+    },
     SetKey {
-        /// Your CivitAI API key
         key: String,
+    },
+    Updates,
+    DownloadVersion {
+        model_id: u64,
+        version_id: u64,
     },
 }
 
@@ -68,13 +65,25 @@ pub async fn run() -> Result<()> {
         Some(Command::Delete { id }) => Request::DeleteModel { id },
         Some(Command::CheckUpdates) => Request::CheckUpdates,
         Some(Command::Cancel { id }) => Request::Cancel { id },
+        Some(Command::Updates) => Request::ListUpdates,
+        Some(Command::DownloadVersion {
+            model_id,
+            version_id,
+        }) => Request::DownloadVersion {
+            model_id,
+            version_id,
+        },
         Some(Command::SetKey { .. }) => unreachable!(),
     };
+
+    let is_updates = matches!(req, Request::ListUpdates);
 
     let response = client.send(&req).await?;
 
     if is_status {
         print_status(&response)?;
+    } else if is_updates {
+        print_updates(&response)?;
     } else {
         println!("{}", serde_json::to_string_pretty(&response)?);
     }
@@ -124,6 +133,43 @@ fn print_status(response: &Response) -> Result<()> {
     }
 
     println!("Free disk space: {}", format_bytes(free_bytes));
+
+    Ok(())
+}
+
+fn print_updates(response: &Response) -> Result<()> {
+    let data = match response {
+        Response::Ok(data) => data,
+        Response::Err { message } => bail!("daemon error: {message}"),
+    };
+
+    let updates = data.as_array();
+    match updates {
+        Some(items) if items.is_empty() => {
+            println!("All models are up to date.");
+        }
+        Some(items) => {
+            println!("{} update(s) available:\n", items.len());
+            for item in items {
+                let model_id = item["model_id"].as_u64().unwrap_or(0);
+                let current_version = item["version_id"].as_u64().unwrap_or(0);
+                let new_version = item["available_version_id"].as_u64().unwrap_or(0);
+                let version_name = item["available_version_name"].as_str().unwrap_or("unknown");
+                let model_type = item["model_type"].as_str().unwrap_or("?");
+                let dest_path = item["dest_path"].as_str();
+
+                let filename = dest_path.and_then(|p| p.rsplit('/').next()).unwrap_or("?");
+
+                println!("  {filename}  [{model_type}]");
+                println!("    version {current_version} \u{2192} {new_version} ({version_name})");
+                println!("    comfyui-dl download-version {model_id} {new_version}");
+                println!();
+            }
+        }
+        None => {
+            println!("All models are up to date.");
+        }
+    }
 
     Ok(())
 }

@@ -56,6 +56,20 @@ async fn check_updates(
     }
 
     for (model_id, job) in &by_model {
+        {
+            let cat = catalog.lock().await;
+            match cat.should_check_update(*model_id) {
+                Ok(false) => {
+                    info!("Skipping model {model_id}: checked within last 24h");
+                    continue;
+                }
+                Ok(true) => {}
+                Err(e) => {
+                    warn!("Failed to check rate limit for model {model_id}: {e}");
+                }
+            }
+        }
+
         let stored_version_id = job.version_id.unwrap();
         let model = match civitai.get_model(*model_id).await {
             Ok(m) => m,
@@ -65,6 +79,13 @@ async fn check_updates(
             }
         };
 
+        {
+            let cat = catalog.lock().await;
+            if let Err(e) = cat.set_last_update_check(*model_id) {
+                warn!("Failed to set last_update_check for model {model_id}: {e}");
+            }
+        }
+
         if let Some(latest) = model.model_versions.first() {
             if is_newer(latest.id, stored_version_id) {
                 let stored_version = model
@@ -72,7 +93,7 @@ async fn check_updates(
                     .iter()
                     .find(|v| v.id == stored_version_id);
 
-                let should_update = match (stored_version, &latest.base_model) {
+                let should_flag = match (stored_version, &latest.base_model) {
                     (Some(stored), Some(latest_base)) => match &stored.base_model {
                         Some(stored_base) => stored_base == latest_base,
                         None => {
@@ -92,20 +113,22 @@ async fn check_updates(
                     }
                     (None, _) => {
                         warn!(
-                            "Could not find stored version {} in model {}, proceeding with update",
+                            "Could not find stored version {} in model {}, proceeding with flag",
                             stored_version_id, model_id
                         );
                         true
                     }
                 };
 
-                if should_update {
+                if should_flag {
                     info!(
-                        "Update available for model {model_id}: {} → {}",
-                        stored_version_id, latest.id
+                        "Update available for model {model_id}: {} → {} ({})",
+                        stored_version_id, latest.id, latest.name
                     );
                     let cat = catalog.lock().await;
-                    cat.enqueue_version_update(*model_id, latest.id, job.model_type.as_deref())?;
+                    if let Err(e) = cat.flag_update_available(*model_id, latest.id, &latest.name) {
+                        warn!("Failed to flag update for model {model_id}: {e}");
+                    }
                     drop(cat);
                     let _ = notifier::notify_update_available(&model.name, &latest.name);
                 } else if let (Some(stored), Some(latest_base)) =

@@ -6,25 +6,26 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", content = "payload", rename_all = "snake_case")]
 pub enum Request {
-    /// Enqueue a CivitAI model URL for download.
     AddDownload {
         url: String,
         model_type: Option<String>,
     },
-    /// Return the current queue state.
     ListQueue,
-    /// Return downloaded models from the catalog.
     ListModels,
-    /// Return downloaded models enriched with metadata (preview, base_model, etc.).
     ListModelsEnriched,
-    /// Delete a model by job ID.
-    DeleteModel { id: Uuid },
-    /// Trigger an immediate update scan.
+    DeleteModel {
+        id: Uuid,
+    },
     CheckUpdates,
-    /// Return daemon health and active download progress.
     GetStatus,
-    /// Cancel a queued or active download by ID.
-    Cancel { id: Uuid },
+    Cancel {
+        id: Uuid,
+    },
+    ListUpdates,
+    DownloadVersion {
+        model_id: u64,
+        version_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
