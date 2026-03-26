@@ -29,6 +29,18 @@ cargo-test:
   script:
     - cargo test -p comfyui-downloader --verbose
 
+cargo-clippy:
+  stage: test
+  image: rust:latest
+  script:
+    - cargo clippy -p comfyui-downloader -- -D warnings
+
+cargo-fmt:
+  stage: test
+  image: rust:latest
+  script:
+    - cargo fmt --check
+
 cargo-build:
   stage: build
   image: rust:latest
