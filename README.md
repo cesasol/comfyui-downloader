@@ -237,7 +237,7 @@ The AppImage bundles all GUI dependencies. The daemon and CLI are distributed se
 ### Manual
 
 ```sh
-cargo build --release
+cargo build --release -p comfyui-downloader
 cp target/release/comfyui-downloader ~/.local/bin/
 cp target/release/comfyui-dl ~/.local/bin/
 cp systemd/comfyui-downloader.service ~/.config/systemd/user/
