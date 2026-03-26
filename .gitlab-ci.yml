@@ -27,7 +27,7 @@ cargo-test:
   stage: test
   image: rust:latest
   script:
-    - cargo test --verbose
+    - cargo test -p comfyui-downloader --verbose
 
 cargo-build:
   stage: build
@@ -36,7 +36,7 @@ cargo-build:
     # Install musl target
     - rustup target add x86_64-unknown-linux-musl
     # Build a statically linked binary
-    - cargo build --release --target x86_64-unknown-linux-musl
+    - cargo build --release --target x86_64-unknown-linux-musl -p comfyui-downloader
     # Create a releases directory
     - mkdir releases
     # Copy the binary to the releases directory and append the platform to the filename
