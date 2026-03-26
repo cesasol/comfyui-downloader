@@ -1,0 +1,6 @@
+5:PREFIX ?= /usr/local
+6:BINDIR  = $(DESTDIR)$(PREFIX)/bin
+7:SYSTEMD = $(DESTDIR)/usr/lib/systemd/user
+8:APPDIR  = $(DESTDIR)$(PREFIX)/share/applications
+9:ICONDIR = $(DESTDIR)$(PREFIX)/share/icons/hicolor/128x128/apps
+11:.PHONY: build build-gui test lint fmt fmt-check check clean install uninstall update
