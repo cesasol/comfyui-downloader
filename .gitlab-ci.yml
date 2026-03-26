@@ -51,8 +51,9 @@ cargo-build:
     - cargo build --release --target x86_64-unknown-linux-musl -p comfyui-downloader
     # Create a releases directory
     - mkdir releases
-    # Copy the binary to the releases directory and append the platform to the filename
-    - cp target/x86_64-unknown-linux-musl/release/rust-binary-release-gitlab-ci releases/rust-binary-release-gitlab-ci-x86_64-unknown-linux-musl
+    # Copy both binaries to the releases directory with platform suffix
+    - cp target/x86_64-unknown-linux-musl/release/comfyui-downloader releases/comfyui-downloader-x86_64-unknown-linux-musl
+    - cp target/x86_64-unknown-linux-musl/release/comfyui-dl releases/comfyui-dl-x86_64-unknown-linux-musl
   artifacts:
     paths:
       - releases/
@@ -70,8 +71,11 @@ gitlab-release:
     description: "Release $CI_COMMIT_TAG"
     assets:
       links:
-        - name: "rust-binary-release-gitlab-ci-x86_64-unknown-linux-musl"
-          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/releases/rust-binary-release-gitlab-ci-x86_64-unknown-linux-musl?job=cargo-build"
+        - name: "comfyui-downloader-x86_64-unknown-linux-musl"
+          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/releases/comfyui-downloader-x86_64-unknown-linux-musl?job=cargo-build"
+          link_type: package
+        - name: "comfyui-dl-x86_64-unknown-linux-musl"
+          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/releases/comfyui-dl-x86_64-unknown-linux-musl?job=cargo-build"
           link_type: package
 
   only:
