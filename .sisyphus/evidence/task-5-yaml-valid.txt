@@ -1,0 +1,3 @@
+PASS: .gitlab-ci.yml is valid YAML
+Jobs found: ['cargo-version', 'cargo-test', 'cargo-clippy', 'cargo-fmt', 'cargo-build', 'tauri-build', 'gitlab-release']
+Stages: ['prepare', 'test', 'build', 'release']
