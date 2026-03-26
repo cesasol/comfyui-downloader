@@ -26,6 +26,10 @@ A Rust daemon that downloads, catalogs, and manages AI models from CivitAI into 
 - **CLI client** — `comfyui-dl` command for all daemon interactions
 - **SystemD integration** — ships a `.service` unit file for `systemctl --user`
 
+## Desktop Application
+
+A companion desktop app is included, built with Tauri (Rust) and Svelte. It provides a model gallery with sidebar filters for model type and base model, and communicates with the daemon over the Unix socket.
+
 ## Architecture
 
 ```
@@ -218,6 +222,17 @@ makepkg -si
 ```
 
 Or use an AUR helper once the package is published.
+
+### AppImage (GUI)
+
+Prebuilt AppImages are published on GitLab Releases. Download the latest `ComfyUI-Downloader-*.AppImage` and make it executable:
+
+```sh
+chmod +x ComfyUI-Downloader-*.AppImage
+./ComfyUI-Downloader-*.AppImage
+```
+
+The AppImage bundles all GUI dependencies. The daemon and CLI are distributed separately via the PKGBUILD or manual install steps above.
 
 ### Manual
 
