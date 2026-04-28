@@ -1,8 +1,0 @@
-$ make build
-cargo build --release -p comfyui-downloader
-   Compiling comfyui-downloader v0.1.0
-    Finished release profile [optimized] target(s) in 5.07s
-
-$ ls -la target/release/comfyui-downloader target/release/comfyui-dl
--rwxr-xr-x 2 cesasol cesasol  3231880 Mar 25 18:49 target/release/comfyui-dl
--rwxr-xr-x 2 cesasol cesasol 12161624 Mar 25 18:49 target/release/comfyui-downloader

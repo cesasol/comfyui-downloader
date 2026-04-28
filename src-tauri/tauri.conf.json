@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-utils/schema.json",
-  "productName": "ComfyUI Downloader",
+  "productName": "ComfyUI-Downloader",
   "version": "0.1.0",
   "identifier": "com.cesasol.comfyui-downloader",
   "build": {
