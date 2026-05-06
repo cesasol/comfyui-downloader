@@ -248,6 +248,20 @@ async fn handle_request(
                 Err(e) => Response::err(e.to_string()),
             }
         }
+        Request::RedownloadModel { id } => {
+            let cat = catalog.lock().await;
+            match cat.requeue_one(id) {
+                Ok(job) => {
+                    let _ = bus.send(crate::daemon::events::Event::CatalogChanged);
+                    let _ = bus.send(crate::daemon::events::Event::QueueChanged);
+                    Response::ok(job)
+                }
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::Subscribe => {
+            Response::err("subscribe is a streaming variant; use IpcSubscriber after Task 5")
+        }
     }
 }
 

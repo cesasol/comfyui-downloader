@@ -29,6 +29,25 @@ pub enum Request {
     RedownloadMissing {
         all: bool,
     },
+    /// Open a streaming subscription connection.  The daemon will push
+    /// `Frame` messages on the socket until the connection is closed.
+    Subscribe,
+    /// Re-download a single model (must be in `Done` state).
+    RedownloadModel {
+        id: Uuid,
+    },
+}
+
+/// Server-pushed messages sent on a `Subscribe` connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Frame {
+    /// Acknowledgement: subscription is active.
+    Subscribed,
+    /// A full state snapshot pushed by the daemon.
+    Snapshot(Snapshot),
+    /// Server-side error on the subscription stream.
+    Error { message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +118,51 @@ impl Response {
     pub fn err(msg: impl Into<String>) -> Self {
         Self::Err {
             message: msg.into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_subscribed_round_trips() {
+        let f = Frame::Subscribed;
+        let s = serde_json::to_string(&f).unwrap();
+        assert_eq!(s, r#"{"type":"subscribed"}"#);
+        let back: Frame = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, Frame::Subscribed));
+    }
+
+    #[test]
+    fn request_subscribe_round_trips() {
+        let r = Request::Subscribe;
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(s, r#"{"cmd":"subscribe"}"#);
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, Request::Subscribe));
+    }
+
+    #[test]
+    fn frame_snapshot_round_trips() {
+        let f = Frame::Snapshot(Snapshot {
+            active: vec![],
+            queued: vec![],
+            free_bytes: 1024,
+            catalog_dirty: true,
+            updates_dirty: false,
+            seq: 7,
+        });
+        let s = serde_json::to_string(&f).unwrap();
+        let back: Frame = serde_json::from_str(&s).unwrap();
+        match back {
+            Frame::Snapshot(snap) => {
+                assert_eq!(snap.free_bytes, 1024);
+                assert_eq!(snap.seq, 7);
+                assert!(snap.catalog_dirty);
+            }
+            _ => panic!("wrong variant"),
         }
     }
 }

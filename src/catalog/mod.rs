@@ -393,6 +393,17 @@ impl Catalog {
         Ok(requeued)
     }
 
+    /// Re-queue a single model by ID, regardless of whether the file is missing.
+    ///
+    /// Returns the new queued `DownloadJob`. Errors if the row isn't `Done`.
+    pub fn requeue_one(&self, id: Uuid) -> Result<DownloadJob> {
+        let job = self.get_job(id)?.context("model not found")?;
+        if job.status != JobStatus::Done {
+            anyhow::bail!("model is not in Done state (status = {})", job.status);
+        }
+        self.enqueue(&job.url, job.model_type.as_deref(), DownloadReason::CliAdd)
+    }
+
     pub fn list_queued(&self) -> Result<Vec<DownloadJob>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {JOB_COLUMNS} FROM jobs WHERE status = 'queued' ORDER BY created_at ASC"
