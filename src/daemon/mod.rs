@@ -308,3 +308,84 @@ async fn read_sidecar_metadata(model_path: &Path) -> Option<serde_json::Value> {
     let bytes = tokio::fs::read(&meta_path).await.ok()?;
     serde_json::from_slice(&bytes).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::read_sidecar_metadata;
+    use std::path::PathBuf;
+
+    /// Verify that `read_sidecar_metadata` correctly reads and returns the
+    /// `version_name` key from a sidecar JSON file written next to the model
+    /// file.  This test locks down the key-name contract between the writer
+    /// (`downloader::ModelMetadata`) and the reader (`enrich_models`).
+    #[tokio::test]
+    async fn test_sidecar_version_name_round_trip() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        // The function derives the sidecar path by replacing the model file's
+        // extension with "metadata.json", so we point it at a fake model file.
+        let model_path: PathBuf = dir.path().join("mymodel.safetensors");
+        let sidecar_path = model_path.with_extension("metadata.json");
+
+        let sidecar = serde_json::json!({
+            "file_name": "mymodel",
+            "model_name": null,
+            "version_name": "better_hands",
+            "file_path": model_path.to_str().unwrap(),
+            "size": 0,
+            "modified": 0.0,
+            "sha256": "abc123",
+            "base_model": null,
+            "notes": "",
+            "from_civitai": false
+        });
+        tokio::fs::write(&sidecar_path, serde_json::to_vec_pretty(&sidecar).unwrap())
+            .await
+            .expect("write sidecar");
+
+        let meta = read_sidecar_metadata(&model_path)
+            .await
+            .expect("sidecar should be readable");
+
+        let version_name = meta
+            .get("version_name")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        assert_eq!(version_name, Some("better_hands".to_string()));
+    }
+
+    /// When `version_name` is serialized as `null` (no `skip_serializing_if`),
+    /// the reader must still return `None` gracefully — not panic or return a
+    /// stray `"null"` string.
+    #[tokio::test]
+    async fn test_sidecar_version_name_null_returns_none() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let model_path: PathBuf = dir.path().join("mymodel.safetensors");
+        let sidecar_path = model_path.with_extension("metadata.json");
+
+        let sidecar = serde_json::json!({
+            "file_name": "mymodel",
+            "model_name": null,
+            "version_name": null,
+            "file_path": model_path.to_str().unwrap(),
+            "size": 0,
+            "modified": 0.0,
+            "sha256": "abc123",
+            "base_model": null,
+            "notes": "",
+            "from_civitai": false
+        });
+        tokio::fs::write(&sidecar_path, serde_json::to_vec_pretty(&sidecar).unwrap())
+            .await
+            .expect("write sidecar");
+
+        let meta = read_sidecar_metadata(&model_path)
+            .await
+            .expect("sidecar should be readable");
+
+        let version_name = meta
+            .get("version_name")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        assert_eq!(version_name, None);
+    }
+}

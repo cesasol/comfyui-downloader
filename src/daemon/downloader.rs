@@ -33,7 +33,6 @@ struct VersionResolution {
 struct ModelMetadata {
     file_name: String,
     model_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     version_name: Option<String>,
     file_path: String,
     size: u64,
