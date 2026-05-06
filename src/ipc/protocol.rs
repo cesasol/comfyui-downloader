@@ -50,6 +50,39 @@ pub struct EnrichedModel {
     pub sha256: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveJob {
+    pub id: Uuid,
+    pub model_name: Option<String>,
+    pub version_name: Option<String>,
+    pub model_type: Option<String>,
+    pub bytes_received: u64,
+    pub total_bytes: Option<u64>,
+    pub dest_path: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub download_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedJob {
+    pub id: Uuid,
+    pub url: String,
+    pub model_name: Option<String>,
+    pub version_name: Option<String>,
+    pub model_type: Option<String>,
+    pub download_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub active: Vec<ActiveJob>,
+    pub queued: Vec<QueuedJob>,
+    pub free_bytes: u64,
+    pub catalog_dirty: bool,
+    pub updates_dirty: bool,
+    pub seq: u64,
+}
+
 /// Responses sent from the daemon back to the CLI client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", content = "data", rename_all = "snake_case")]

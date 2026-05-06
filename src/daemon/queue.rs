@@ -21,6 +21,7 @@ pub struct DownloadProgress {
     pub bytes_received: u64,
     pub total_bytes: Option<u64>,
     pub model_name: Option<String>,
+    pub version_name: Option<String>,
     pub dest_path: Option<String>,
     pub model_type: Option<String>,
     pub download_reason: Option<String>,

@@ -10,6 +10,7 @@ use crate::civitai::CivitaiClient;
 use crate::config::Config;
 use crate::daemon::queue::{ActiveTasks, ProgressMap};
 use crate::ipc::protocol::EnrichedModel;
+use crate::ipc::protocol::{ActiveJob, QueuedJob, Snapshot};
 use crate::ipc::{IpcServer, Request, Response};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -176,50 +177,8 @@ async fn handle_request(
             }
         }
         Request::GetStatus => {
-            let queued_jobs = {
-                let cat = catalog.lock().await;
-                cat.list_queued().unwrap_or_default()
-            };
-            let active_jobs: Vec<serde_json::Value> = {
-                let prog = progress.lock().await;
-                prog.iter()
-                    .map(|(id, p)| {
-                        serde_json::json!({
-                            "id": id,
-                            "bytes_received": p.bytes_received,
-                            "total_bytes": p.total_bytes,
-                            "model_name": p.model_name,
-                            "dest_path": p.dest_path,
-                            "model_type": p.model_type,
-                            "download_reason": p.download_reason,
-                            "started_at": p.started_at,
-                        })
-                    })
-                    .collect()
-            };
-            let queued_info: Vec<serde_json::Value> = queued_jobs
-                .iter()
-                .map(|j| {
-                    serde_json::json!({
-                        "id": j.id,
-                        "url": j.url,
-                        "model_type": j.model_type,
-                        "download_reason": j.download_reason.to_string(),
-                    })
-                })
-                .collect();
-            let free_bytes = crate::config::Config::load()
-                .ok()
-                .map(|c| {
-                    crate::daemon::downloader::free_disk_bytes(&c.paths.models_dir).unwrap_or(0)
-                })
-                .unwrap_or(0);
-            Response::ok(serde_json::json!({
-                "queued": queued_info.len(),
-                "queued_jobs": queued_info,
-                "active": active_jobs,
-                "free_bytes": free_bytes,
-            }))
+            let snap = build_snapshot(&catalog, &progress, false, false, 0).await;
+            Response::ok(snap)
         }
         Request::CheckUpdates => {
             update_wake.notify_one();
@@ -286,6 +245,59 @@ async fn handle_request(
                 Err(e) => Response::err(e.to_string()),
             }
         }
+    }
+}
+
+async fn build_snapshot(
+    catalog: &Arc<Mutex<Catalog>>,
+    progress: &ProgressMap,
+    catalog_dirty: bool,
+    updates_dirty: bool,
+    seq: u64,
+) -> Snapshot {
+    let queued_jobs = {
+        let cat = catalog.lock().await;
+        cat.list_queued().unwrap_or_default()
+    };
+    let active = {
+        let prog = progress.lock().await;
+        prog.iter()
+            .map(|(id, p)| ActiveJob {
+                id: *id,
+                model_name: p.model_name.clone(),
+                version_name: p.version_name.clone(),
+                model_type: p.model_type.clone(),
+                bytes_received: p.bytes_received,
+                total_bytes: p.total_bytes,
+                dest_path: p.dest_path.clone(),
+                started_at: p.started_at,
+                download_reason: p.download_reason.clone(),
+            })
+            .collect()
+    };
+    let queued = queued_jobs
+        .into_iter()
+        .map(|j| QueuedJob {
+            id: j.id,
+            url: j.url,
+            model_name: None,
+            version_name: None,
+            model_type: j.model_type,
+            download_reason: Some(j.download_reason.to_string()),
+        })
+        .collect();
+    let free_bytes = crate::config::Config::load()
+        .ok()
+        .map(|c| crate::daemon::downloader::free_disk_bytes(&c.paths.models_dir).unwrap_or(0))
+        .unwrap_or(0);
+
+    Snapshot {
+        active,
+        queued,
+        free_bytes,
+        catalog_dirty,
+        updates_dirty,
+        seq,
     }
 }
 

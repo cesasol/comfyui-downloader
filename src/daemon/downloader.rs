@@ -368,6 +368,7 @@ pub async fn download(
                 bytes_received: resume_from,
                 total_bytes: calculated_total_bytes,
                 model_name: resolution.model_name.clone(),
+                version_name: resolution.model_version.as_ref().map(|v| v.name.clone()),
                 dest_path: Some(dest.to_string_lossy().into_owned()),
                 model_type: resolution
                     .model_type_subdir

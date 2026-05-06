@@ -110,8 +110,8 @@ fn print_status(response: &Response) -> Result<()> {
     };
 
     let active = data["active"].as_array();
-    let queued = data["queued"].as_u64().unwrap_or(0);
-    let queued_jobs = data["queued_jobs"].as_array();
+    let queued_jobs = data["queued"].as_array();
+    let queued = queued_jobs.map(|a| a.len() as u64).unwrap_or(0);
     let free_bytes = data["free_bytes"].as_u64().unwrap_or(0);
 
     if let Some(jobs) = active {
@@ -275,7 +275,7 @@ async fn resolve_active_id(client: &mut IpcClient, input: &str) -> Result<Uuid> 
     }
 
     let data = ok_data(client.send(&Request::GetStatus).await?)?;
-    let candidates = ["active", "queued_jobs"]
+    let candidates = ["active", "queued"]
         .iter()
         .filter_map(|k| data[k].as_array())
         .flatten()
