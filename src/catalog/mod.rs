@@ -363,6 +363,36 @@ impl Catalog {
         }
     }
 
+    /// Flip `Done` jobs back to `Queued` so the worker re-downloads them.
+    ///
+    /// When `only_missing` is true, jobs whose `dest_path` still exists on
+    /// disk are skipped. Returns the jobs that were re-queued.
+    pub fn requeue_done(&self, only_missing: bool) -> Result<Vec<DownloadJob>> {
+        let candidates = self.list_done_models()?;
+        let now = Utc::now().to_rfc3339();
+        let mut requeued = Vec::new();
+        for job in candidates {
+            if only_missing
+                && job
+                    .dest_path
+                    .as_deref()
+                    .map(|p| Path::new(p).exists())
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            self.conn.execute(
+                "UPDATE jobs SET status = 'queued', dest_path = NULL, error = NULL, updated_at = ?1 \
+                 WHERE id = ?2",
+                params![now, job.id.to_string()],
+            )?;
+            if let Some(updated) = self.get_job(job.id)? {
+                requeued.push(updated);
+            }
+        }
+        Ok(requeued)
+    }
+
     pub fn list_queued(&self) -> Result<Vec<DownloadJob>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {JOB_COLUMNS} FROM jobs WHERE status = 'queued' ORDER BY created_at ASC"
@@ -771,6 +801,62 @@ mod tests {
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].model_id, Some(100));
         assert_eq!(updates[0].available_version_id, Some(300));
+    }
+
+    #[test]
+    fn test_requeue_done_only_missing_skips_present_files() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog
+            .enqueue("https://civitai.com/models/1", None, DownloadReason::CliAdd)
+            .unwrap();
+        let tmp = std::env::temp_dir().join(format!("requeue-test-{}.bin", job.id));
+        std::fs::write(&tmp, b"x").unwrap();
+        catalog.set_dest_path(job.id, &tmp).unwrap();
+        catalog.set_status(job.id, JobStatus::Done, None).unwrap();
+
+        let requeued = catalog.requeue_done(true).unwrap();
+        assert!(requeued.is_empty(), "present file must not be re-queued");
+        let after = catalog.get_job(job.id).unwrap().unwrap();
+        assert_eq!(after.status, JobStatus::Done);
+
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_requeue_done_only_missing_requeues_missing_files() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog
+            .enqueue("https://civitai.com/models/1", None, DownloadReason::CliAdd)
+            .unwrap();
+        catalog
+            .set_dest_path(job.id, std::path::Path::new("/nonexistent/missing.safetensors"))
+            .unwrap();
+        catalog.set_status(job.id, JobStatus::Done, None).unwrap();
+
+        let requeued = catalog.requeue_done(true).unwrap();
+        assert_eq!(requeued.len(), 1);
+        let after = catalog.get_job(job.id).unwrap().unwrap();
+        assert_eq!(after.status, JobStatus::Queued);
+        assert!(after.dest_path.is_none());
+    }
+
+    #[test]
+    fn test_requeue_done_all_requeues_everything() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog
+            .enqueue("https://civitai.com/models/1", None, DownloadReason::CliAdd)
+            .unwrap();
+        let tmp = std::env::temp_dir().join(format!("requeue-all-{}.bin", job.id));
+        std::fs::write(&tmp, b"x").unwrap();
+        catalog.set_dest_path(job.id, &tmp).unwrap();
+        catalog.set_status(job.id, JobStatus::Done, None).unwrap();
+
+        let requeued = catalog.requeue_done(false).unwrap();
+        assert_eq!(requeued.len(), 1, "--all must re-queue even present files");
+        let after = catalog.get_job(job.id).unwrap().unwrap();
+        assert_eq!(after.status, JobStatus::Queued);
+
+        std::fs::remove_file(&tmp).unwrap();
     }
 
     #[test]

@@ -223,6 +223,16 @@ async fn handle_request(
                 Err(e) => Response::err(e.to_string()),
             }
         }
+        Request::RedownloadMissing { all } => {
+            let cat = catalog.lock().await;
+            match cat.requeue_done(!all) {
+                Ok(jobs) => Response::ok(serde_json::json!({
+                    "requeued": jobs.len(),
+                    "jobs": jobs,
+                })),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
         Request::DownloadVersion {
             model_id,
             version_id,

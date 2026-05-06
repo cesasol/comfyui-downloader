@@ -24,12 +24,14 @@ enum Command {
     },
     Status,
     List,
+    /// Delete a catalogued model by ID (full UUID or unique prefix).
     Delete {
-        id: Uuid,
+        id: String,
     },
     CheckUpdates,
+    /// Cancel a queued or active download by ID (full UUID or unique prefix).
     Cancel {
-        id: Uuid,
+        id: String,
     },
     SetKey {
         key: String,
@@ -38,6 +40,12 @@ enum Command {
     DownloadVersion {
         model_id: u64,
         version_id: u64,
+    },
+    /// Re-queue catalogued models whose files are missing on disk.
+    RedownloadMissing {
+        /// Re-queue all catalogued models, even ones still present on disk.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -62,9 +70,13 @@ pub async fn run() -> Result<()> {
         None | Some(Command::Status) => Request::GetStatus,
         Some(Command::Add { url, model_type }) => Request::AddDownload { url, model_type },
         Some(Command::List) => Request::ListModels,
-        Some(Command::Delete { id }) => Request::DeleteModel { id },
+        Some(Command::Delete { id }) => Request::DeleteModel {
+            id: resolve_model_id(&mut client, &id).await?,
+        },
         Some(Command::CheckUpdates) => Request::CheckUpdates,
-        Some(Command::Cancel { id }) => Request::Cancel { id },
+        Some(Command::Cancel { id }) => Request::Cancel {
+            id: resolve_active_id(&mut client, &id).await?,
+        },
         Some(Command::Updates) => Request::ListUpdates,
         Some(Command::DownloadVersion {
             model_id,
@@ -73,6 +85,7 @@ pub async fn run() -> Result<()> {
             model_id,
             version_id,
         },
+        Some(Command::RedownloadMissing { all }) => Request::RedownloadMissing { all },
         Some(Command::SetKey { .. }) => unreachable!(),
     };
 
@@ -175,6 +188,7 @@ fn print_updates(response: &Response) -> Result<()> {
 }
 
 fn print_active_job(job: &serde_json::Value) {
+    let id = job["id"].as_str().unwrap_or("");
     let name = job["model_name"].as_str().unwrap_or("Unknown model");
     let bytes_received = job["bytes_received"].as_u64().unwrap_or(0);
     let total_bytes = job["total_bytes"].as_u64();
@@ -185,7 +199,7 @@ fn print_active_job(job: &serde_json::Value) {
         .as_str()
         .and_then(|s| s.parse::<DateTime<Utc>>().ok());
 
-    print!("  {name}");
+    print!("  {}  {name}", short_id(id));
     if let Some(mt) = model_type {
         print!("  [{mt}]");
     }
@@ -234,11 +248,12 @@ fn print_active_job(job: &serde_json::Value) {
 }
 
 fn print_queued_job(job: &serde_json::Value) {
+    let id = job["id"].as_str().unwrap_or("");
     let url = job["url"].as_str().unwrap_or("?");
     let model_type = job["model_type"].as_str();
     let download_reason = job["download_reason"].as_str();
 
-    print!("  \u{23f3} {url}");
+    print!("  \u{23f3} {}  {url}", short_id(id));
     if let Some(mt) = model_type {
         print!("  [{mt}]");
     }
@@ -246,6 +261,66 @@ fn print_queued_job(job: &serde_json::Value) {
         print!("  (upgrade)");
     }
     println!();
+}
+
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+/// Resolve a user-provided ID (full UUID or unique prefix) against the active and
+/// queued jobs reported by `GetStatus`.
+async fn resolve_active_id(client: &mut IpcClient, input: &str) -> Result<Uuid> {
+    if let Ok(uuid) = Uuid::parse_str(input) {
+        return Ok(uuid);
+    }
+
+    let data = ok_data(client.send(&Request::GetStatus).await?)?;
+    let candidates = ["active", "queued_jobs"]
+        .iter()
+        .filter_map(|k| data[k].as_array())
+        .flatten()
+        .filter_map(|job| job["id"].as_str());
+    match_prefix(input, candidates, "active or queued job")
+}
+
+/// Resolve a user-provided ID (full UUID or unique prefix) against the catalogued
+/// models reported by `ListModels`.
+async fn resolve_model_id(client: &mut IpcClient, input: &str) -> Result<Uuid> {
+    if let Ok(uuid) = Uuid::parse_str(input) {
+        return Ok(uuid);
+    }
+
+    let data = ok_data(client.send(&Request::ListModels).await?)?;
+    let candidates = data
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["id"].as_str());
+    match_prefix(input, candidates, "catalogued model")
+}
+
+fn ok_data(response: Response) -> Result<serde_json::Value> {
+    match response {
+        Response::Ok(data) => Ok(data),
+        Response::Err { message } => bail!("daemon error: {message}"),
+    }
+}
+
+fn match_prefix<'a>(
+    input: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+    kind: &str,
+) -> Result<Uuid> {
+    let matches: Vec<Uuid> = candidates
+        .into_iter()
+        .filter(|s| s.starts_with(input))
+        .filter_map(|s| Uuid::parse_str(s).ok())
+        .collect();
+    match matches.len() {
+        0 => bail!("no {kind} matches id '{input}'"),
+        1 => Ok(matches[0]),
+        n => bail!("id prefix '{input}' is ambiguous ({n} matches); use a longer prefix"),
+    }
 }
 
 fn progress_bar(pct: u64, width: usize) -> String {

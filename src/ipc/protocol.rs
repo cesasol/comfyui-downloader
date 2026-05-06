@@ -26,6 +26,9 @@ pub enum Request {
         model_id: u64,
         version_id: u64,
     },
+    RedownloadMissing {
+        all: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
