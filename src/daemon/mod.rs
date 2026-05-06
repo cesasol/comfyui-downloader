@@ -98,6 +98,7 @@ pub async fn run() -> Result<()> {
     let cat_s = catalog.clone();
     let prog_s = progress.clone();
     let bus_s = event_bus.clone();
+    let models_dir_s = config.paths.models_dir.clone();
 
     server
         .serve(
@@ -114,7 +115,8 @@ pub async fn run() -> Result<()> {
                 let cat = cat_s.clone();
                 let prog = prog_s.clone();
                 let bus = bus_s.clone();
-                async move { run_subscribe(writer, cat, prog, bus).await }
+                let mdir = models_dir_s.clone();
+                async move { run_subscribe(writer, cat, prog, bus, mdir).await }
             },
         )
         .await?;
@@ -278,16 +280,84 @@ async fn handle_request(
     }
 }
 
-pub(crate) async fn run_subscribe(
+pub async fn run_subscribe(
     mut writer: crate::ipc::server::SubscribeWriter,
-    _catalog: Arc<Mutex<Catalog>>,
-    _progress: ProgressMap,
-    _bus: crate::daemon::events::EventBus,
+    catalog: Arc<Mutex<Catalog>>,
+    progress: ProgressMap,
+    bus: crate::daemon::events::EventBus,
+    models_dir: std::path::PathBuf,
 ) {
+    use crate::daemon::events::Event;
     use crate::ipc::protocol::Frame;
-    let _ = writer.send(&Frame::Subscribed).await;
-    // Real implementation lands in Task 6.
+
+    if writer.send(&Frame::Subscribed).await.is_err() {
+        return;
+    }
+
+    let mut rx = bus.subscribe();
+    let mut seq: u64 = 0;
+    let mut catalog_dirty = false;
+    let mut updates_dirty = false;
+
+    // Initial snapshot.
+    seq += 1;
+    let snap = build_snapshot(&catalog, &progress, &models_dir, false, false, seq).await;
+    if writer.send(&Frame::Snapshot(snap)).await.is_err() {
+        return;
+    }
+
+    loop {
+        let event = match rx.recv().await {
+            Ok(ev) => ev,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                // Re-sync: send a fresh full snapshot.
+                seq += 1;
+                let snap =
+                    build_snapshot(&catalog, &progress, &models_dir, true, true, seq).await;
+                if writer.send(&Frame::Snapshot(snap)).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+
+        match event {
+            Event::CatalogChanged => catalog_dirty = true,
+            Event::UpdatesChanged => updates_dirty = true,
+            Event::QueueChanged | Event::ProgressTick => {}
+        }
+
+        // Coalesce: drain anything else that arrived in the last 10 ms.
+        let coalesce = tokio::time::sleep(std::time::Duration::from_millis(10));
+        tokio::pin!(coalesce);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut coalesce => break,
+                ev = rx.recv() => match ev {
+                    Ok(Event::CatalogChanged) => catalog_dirty = true,
+                    Ok(Event::UpdatesChanged) => updates_dirty = true,
+                    Ok(_) => {}
+                    Err(_) => break,
+                },
+            }
+        }
+
+        seq += 1;
+        let snap =
+            build_snapshot(&catalog, &progress, &models_dir, catalog_dirty, updates_dirty, seq)
+                .await;
+        catalog_dirty = false;
+        updates_dirty = false;
+        if writer.send(&Frame::Snapshot(snap)).await.is_err() {
+            return;
+        }
+    }
 }
+
+#[doc(hidden)]
+pub use run_subscribe as run_subscribe_for_test;
 
 async fn build_snapshot(
     catalog: &Arc<Mutex<Catalog>>,
