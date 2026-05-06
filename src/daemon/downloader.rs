@@ -33,6 +33,8 @@ struct VersionResolution {
 struct ModelMetadata {
     file_name: String,
     model_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version_name: Option<String>,
     file_path: String,
     size: u64,
     modified: f64,
@@ -544,6 +546,10 @@ async fn write_metadata(
         .unwrap_or_default();
     let file_path = dest.to_string_lossy().into_owned();
     let preview_url = preview_path.map(|p| p.to_string_lossy().into_owned());
+    let version_name = resolution
+        .model_version
+        .as_ref()
+        .map(|v| v.name.clone());
     let civitai = resolution
         .model_version
         .as_ref()
@@ -552,6 +558,7 @@ async fn write_metadata(
     let meta = ModelMetadata {
         file_name,
         model_name: resolution.model_name.clone(),
+        version_name,
         file_path,
         size,
         modified,

@@ -42,6 +42,7 @@ pub struct EnrichedModel {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub model_name: Option<String>,
+    pub version_name: Option<String>,
     pub base_model: Option<String>,
     pub preview_path: Option<String>,
     pub preview_nsfw_level: Option<u32>,

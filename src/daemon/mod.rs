@@ -257,10 +257,13 @@ async fn enrich_models(models: Vec<DownloadJob>) -> Vec<EnrichedModel> {
             Some(dest) => read_sidecar_metadata(Path::new(dest)).await,
             None => None,
         };
-        let (model_name, base_model, preview_path, preview_nsfw_level, file_size, sha256) =
+        let (model_name, version_name, base_model, preview_path, preview_nsfw_level, file_size, sha256) =
             match metadata {
                 Some(meta) => (
                     meta.get("model_name")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    meta.get("version_name")
                         .and_then(|v| v.as_str())
                         .map(String::from),
                     meta.get("base_model")
@@ -277,7 +280,7 @@ async fn enrich_models(models: Vec<DownloadJob>) -> Vec<EnrichedModel> {
                         .and_then(|v| v.as_str())
                         .map(String::from),
                 ),
-                None => (None, None, None, None, None, None),
+                None => (None, None, None, None, None, None, None),
             };
         enriched.push(EnrichedModel {
             id: job.id,
@@ -289,6 +292,7 @@ async fn enrich_models(models: Vec<DownloadJob>) -> Vec<EnrichedModel> {
             created_at: job.created_at,
             updated_at: job.updated_at,
             model_name,
+            version_name,
             base_model,
             preview_path,
             preview_nsfw_level,
