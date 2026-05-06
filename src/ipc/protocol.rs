@@ -40,7 +40,7 @@ pub enum Request {
 
 /// Server-pushed messages sent on a `Subscribe` connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Frame {
     /// Acknowledgement: subscription is active.
     Subscribed,
@@ -130,6 +130,7 @@ mod tests {
     fn frame_subscribed_round_trips() {
         let f = Frame::Subscribed;
         let s = serde_json::to_string(&f).unwrap();
+        // Unit variant: adjacent-tag produces the same wire format as internal-tag.
         assert_eq!(s, r#"{"type":"subscribed"}"#);
         let back: Frame = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, Frame::Subscribed));

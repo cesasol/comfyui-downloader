@@ -260,7 +260,7 @@ async fn handle_request(
             }
         }
         Request::Subscribe => {
-            Response::err("subscribe is a streaming variant; use IpcSubscriber after Task 5")
+            Response::err("subscribe is a streaming variant; not yet implemented in this build")
         }
     }
 }
