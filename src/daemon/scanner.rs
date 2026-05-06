@@ -2,6 +2,7 @@ use crate::catalog::Catalog;
 use crate::civitai::CivitaiClient;
 use crate::config::Config;
 use crate::daemon::downloader;
+use crate::daemon::events::EventBus;
 use hex;
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -25,7 +26,12 @@ const KNOWN_SUBDIRS: &[&str] = &[
     "other",
 ];
 
-pub async fn run(config: Arc<Config>, civitai: Arc<CivitaiClient>, catalog: Arc<Mutex<Catalog>>) {
+pub async fn run(
+    config: Arc<Config>,
+    civitai: Arc<CivitaiClient>,
+    catalog: Arc<Mutex<Catalog>>,
+    _bus: EventBus,
+) {
     if config.civitai.api_key.is_none() {
         warn!("Skipping startup scan: no CivitAI API key configured");
         return;

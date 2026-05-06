@@ -1,4 +1,5 @@
 pub mod downloader;
+pub mod events;
 pub mod notifier;
 pub mod queue;
 pub mod scanner;
@@ -33,13 +34,15 @@ pub async fn run() -> Result<()> {
     let active: ActiveTasks = Arc::new(Mutex::new(HashMap::new()));
     let progress: ProgressMap = Arc::new(Mutex::new(HashMap::new()));
     let update_wake: Arc<Notify> = Arc::new(Notify::new());
+    let event_bus: crate::daemon::events::EventBus = crate::daemon::events::new_bus();
 
     let scanner_handle = {
         let cfg = config.clone();
         let civ = civitai.clone();
         let cat = catalog.clone();
+        let bus = event_bus.clone();
         tokio::spawn(async move {
-            scanner::run(cfg, civ, cat).await;
+            scanner::run(cfg, civ, cat, bus).await;
         })
     };
 
@@ -49,8 +52,24 @@ pub async fn run() -> Result<()> {
         let civ = civitai.clone();
         let act = active.clone();
         let prog = progress.clone();
+        let bus = event_bus.clone();
         tokio::spawn(async move {
-            queue::run(cfg, cat, civ, act, prog).await;
+            queue::run(cfg, cat, civ, act, prog, bus).await;
+        })
+    };
+
+    let tick_handle = {
+        let bus = event_bus.clone();
+        let prog = progress.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if !prog.lock().await.is_empty() {
+                    let _ = bus.send(crate::daemon::events::Event::ProgressTick);
+                }
+            }
         })
     };
 
@@ -59,8 +78,9 @@ pub async fn run() -> Result<()> {
         let cat = catalog.clone();
         let civ = civitai.clone();
         let wake = update_wake.clone();
+        let bus = event_bus.clone();
         tokio::spawn(async move {
-            updater::run(cfg, cat, civ, wake).await;
+            updater::run(cfg, cat, civ, wake, bus).await;
         })
     };
 
@@ -71,18 +91,21 @@ pub async fn run() -> Result<()> {
     let act = active.clone();
     let prog = progress.clone();
     let wake = update_wake.clone();
+    let bus = event_bus.clone();
     server
         .serve(move |req| {
             let cat = cat.clone();
             let act = act.clone();
             let prog = prog.clone();
             let wake = wake.clone();
-            async move { handle_request(req, cat, act, prog, wake).await }
+            let bus = bus.clone();
+            async move { handle_request(req, cat, act, prog, wake, bus).await }
         })
         .await?;
 
     scanner_handle.abort();
     queue_handle.abort();
+    tick_handle.abort();
     updater_handle.abort();
     Ok(())
 }
@@ -93,6 +116,7 @@ async fn handle_request(
     active: ActiveTasks,
     progress: ProgressMap,
     update_wake: Arc<Notify>,
+    bus: crate::daemon::events::EventBus,
 ) -> Response {
     match req {
         Request::AddDownload { url, model_type } => {
@@ -102,7 +126,11 @@ async fn handle_request(
                 model_type.as_deref(),
                 crate::catalog::DownloadReason::CliAdd,
             ) {
-                Ok(job) => Response::ok(job),
+                Ok(job) => {
+                    let _ = bus.send(crate::daemon::events::Event::CatalogChanged);
+                    let _ = bus.send(crate::daemon::events::Event::QueueChanged);
+                    Response::ok(job)
+                }
                 Err(e) => Response::err(e.to_string()),
             }
         }
@@ -141,6 +169,7 @@ async fn handle_request(
                             warn!("Failed to delete file {}: {}", path.display(), e);
                         }
                     }
+                    let _ = bus.send(crate::daemon::events::Event::CatalogChanged);
                     Response::ok(serde_json::json!({ "deleted": id }))
                 }
                 Err(e) => Response::err(e.to_string()),
@@ -207,11 +236,15 @@ async fn handle_request(
                 }
             };
             if cancelled {
+                let _ = bus.send(crate::daemon::events::Event::QueueChanged);
                 Response::ok(serde_json::json!({ "cancelled": id }))
             } else {
                 let cat = catalog.lock().await;
                 match cat.set_status(id, crate::catalog::JobStatus::Cancelled, None) {
-                    Ok(()) => Response::ok(serde_json::json!({ "cancelled": id })),
+                    Ok(()) => {
+                        let _ = bus.send(crate::daemon::events::Event::QueueChanged);
+                        Response::ok(serde_json::json!({ "cancelled": id }))
+                    }
                     Err(e) => Response::err(e.to_string()),
                 }
             }
@@ -226,10 +259,14 @@ async fn handle_request(
         Request::RedownloadMissing { all } => {
             let cat = catalog.lock().await;
             match cat.requeue_done(!all) {
-                Ok(jobs) => Response::ok(serde_json::json!({
-                    "requeued": jobs.len(),
-                    "jobs": jobs,
-                })),
+                Ok(jobs) => {
+                    let _ = bus.send(crate::daemon::events::Event::CatalogChanged);
+                    let _ = bus.send(crate::daemon::events::Event::QueueChanged);
+                    Response::ok(serde_json::json!({
+                        "requeued": jobs.len(),
+                        "jobs": jobs,
+                    }))
+                }
                 Err(e) => Response::err(e.to_string()),
             }
         }
@@ -242,6 +279,8 @@ async fn handle_request(
             match cat.enqueue(&url, None, crate::catalog::DownloadReason::CliAdd) {
                 Ok(job) => {
                     let _ = cat.clear_update_flag(model_id);
+                    let _ = bus.send(crate::daemon::events::Event::CatalogChanged);
+                    let _ = bus.send(crate::daemon::events::Event::QueueChanged);
                     Response::ok(job)
                 }
                 Err(e) => Response::err(e.to_string()),

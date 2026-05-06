@@ -2,6 +2,7 @@ use crate::catalog::{Catalog, DownloadReason, JobStatus};
 use crate::civitai::{CivitaiAccessError, CivitaiClient};
 use crate::config::Config;
 use crate::daemon::downloader;
+use crate::daemon::events::{Event, EventBus};
 use crate::daemon::notifier;
 use std::collections::HashMap;
 use std::path::Path;
@@ -34,6 +35,7 @@ pub async fn run(
     civitai: Arc<CivitaiClient>,
     active: ActiveTasks,
     progress: ProgressMap,
+    bus: EventBus,
 ) {
     let max = config.daemon.max_concurrent_downloads.max(1);
     let sem = Arc::new(Semaphore::new(max));
@@ -96,6 +98,7 @@ pub async fn run(
             let cat = catalog.lock().await;
             let _ = cat.set_status(job.id, JobStatus::Downloading, None);
         }
+        let _ = bus.send(Event::QueueChanged);
 
         let token = CancellationToken::new();
         {
@@ -109,6 +112,7 @@ pub async fn run(
         let active_ref = active.clone();
         let job_id = job.id;
         let prog = progress.clone();
+        let task_bus = bus.clone();
 
         tokio::spawn(async move {
             let _permit = permit; // released when task finishes
@@ -122,12 +126,14 @@ pub async fn run(
                         let _ = cat.set_model_type(job_id, &model_type);
                     }
                     let _ = cat.set_status(job_id, JobStatus::Done, None);
+                    let _ = task_bus.send(Event::QueueChanged);
                     let _ = notifier::notify_success(&dest.display().to_string());
                 }
                 Err(e) if e.to_string().contains("cancelled") => {
                     info!("Job {job_id} cancelled");
                     let cat = cat.lock().await;
                     let _ = cat.set_status(job_id, JobStatus::Cancelled, None);
+                    let _ = task_bus.send(Event::QueueChanged);
                 }
                 Err(ref e) if e.downcast_ref::<CivitaiAccessError>().is_some() => {
                     let status = e.downcast_ref::<CivitaiAccessError>().unwrap().status;
@@ -137,6 +143,7 @@ pub async fn run(
                         let msg = format!("access denied (HTTP {status})");
                         let _ = cat.set_status(job_id, JobStatus::Failed, Some(&msg));
                     }
+                    let _ = task_bus.send(Event::QueueChanged);
                     try_enqueue_fallback_version(&job, status, &cat, &civ).await;
                 }
                 Err(e) => {
@@ -144,6 +151,7 @@ pub async fn run(
                     error!("Job {job_id} failed: {msg}");
                     let cat = cat.lock().await;
                     let _ = cat.set_status(job_id, JobStatus::Failed, Some(&msg));
+                    let _ = task_bus.send(Event::QueueChanged);
                     let _ = notifier::notify_error(&msg);
                 }
             }
