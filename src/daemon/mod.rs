@@ -93,6 +93,7 @@ pub async fn run() -> Result<()> {
     let prog = progress.clone();
     let wake = update_wake.clone();
     let bus = event_bus.clone();
+    let models_dir = config.paths.models_dir.clone();
     server
         .serve(move |req| {
             let cat = cat.clone();
@@ -100,7 +101,8 @@ pub async fn run() -> Result<()> {
             let prog = prog.clone();
             let wake = wake.clone();
             let bus = bus.clone();
-            async move { handle_request(req, cat, act, prog, wake, bus).await }
+            let models_dir = models_dir.clone();
+            async move { handle_request(req, cat, act, prog, wake, bus, &models_dir).await }
         })
         .await?;
 
@@ -118,6 +120,7 @@ async fn handle_request(
     progress: ProgressMap,
     update_wake: Arc<Notify>,
     bus: crate::daemon::events::EventBus,
+    models_dir: &std::path::Path,
 ) -> Response {
     match req {
         Request::AddDownload { url, model_type } => {
@@ -177,7 +180,7 @@ async fn handle_request(
             }
         }
         Request::GetStatus => {
-            let snap = build_snapshot(&catalog, &progress, false, false, 0).await;
+            let snap = build_snapshot(&catalog, &progress, models_dir, false, false, 0).await;
             Response::ok(snap)
         }
         Request::CheckUpdates => {
@@ -251,6 +254,7 @@ async fn handle_request(
 async fn build_snapshot(
     catalog: &Arc<Mutex<Catalog>>,
     progress: &ProgressMap,
+    models_dir: &std::path::Path,
     catalog_dirty: bool,
     updates_dirty: bool,
     seq: u64,
@@ -286,10 +290,7 @@ async fn build_snapshot(
             download_reason: Some(j.download_reason.to_string()),
         })
         .collect();
-    let free_bytes = crate::config::Config::load()
-        .ok()
-        .map(|c| crate::daemon::downloader::free_disk_bytes(&c.paths.models_dir).unwrap_or(0))
-        .unwrap_or(0);
+    let free_bytes = crate::daemon::downloader::free_disk_bytes(models_dir).unwrap_or(0);
 
     Snapshot {
         active,
@@ -362,8 +363,14 @@ async fn read_sidecar_metadata(model_path: &Path) -> Option<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::read_sidecar_metadata;
+    use super::{build_snapshot, read_sidecar_metadata};
+    use crate::catalog::{Catalog, DownloadReason};
+    use crate::daemon::queue::{DownloadProgress, ProgressMap};
+    use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use uuid::Uuid;
 
     /// Verify that `read_sidecar_metadata` correctly reads and returns the
     /// `version_name` key from a sidecar JSON file written next to the model
@@ -438,5 +445,76 @@ mod tests {
             .and_then(|v| v.as_str())
             .map(String::from);
         assert_eq!(version_name, None);
+    }
+
+    /// `build_snapshot` must correctly populate `active` from the ProgressMap
+    /// and `queued` from the catalog, without re-reading config from disk.
+    #[tokio::test]
+    async fn test_build_snapshot_active_and_queued() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let db_path = tmp.path().join("catalog.db");
+
+        // Open a fresh catalog and enqueue one queued job.
+        let catalog = Arc::new(Mutex::new(
+            Catalog::open(&db_path).expect("open catalog"),
+        ));
+        let queued_job = {
+            let cat = catalog.lock().await;
+            cat.enqueue(
+                "https://civitai.com/models/42?modelVersionId=99",
+                Some("loras"),
+                DownloadReason::CliAdd,
+            )
+            .expect("enqueue")
+        };
+
+        // Build a ProgressMap with one synthetic active job.
+        let active_id = Uuid::new_v4();
+        let progress: ProgressMap = Arc::new(Mutex::new({
+            let mut m = HashMap::new();
+            m.insert(
+                active_id,
+                DownloadProgress {
+                    bytes_received: 1024,
+                    total_bytes: Some(4096),
+                    model_name: Some("TestModel".into()),
+                    version_name: Some("v1".into()),
+                    dest_path: Some("/tmp/test.safetensors".into()),
+                    model_type: Some("checkpoints".into()),
+                    download_reason: Some("cli_add".into()),
+                    started_at: None,
+                },
+            );
+            m
+        }));
+
+        let snap = build_snapshot(&catalog, &progress, tmp.path(), false, false, 7).await;
+
+        // Sequence number must be propagated.
+        assert_eq!(snap.seq, 7);
+        assert!(!snap.catalog_dirty);
+        assert!(!snap.updates_dirty);
+
+        // Active jobs: exactly the one we put in the ProgressMap.
+        assert_eq!(snap.active.len(), 1);
+        let active_entry = &snap.active[0];
+        assert_eq!(active_entry.id, active_id);
+        assert_eq!(active_entry.model_name.as_deref(), Some("TestModel"));
+        assert_eq!(active_entry.version_name.as_deref(), Some("v1"));
+        assert_eq!(active_entry.model_type.as_deref(), Some("checkpoints"));
+
+        // Queued jobs: exactly the one we enqueued.
+        assert_eq!(snap.queued.len(), 1);
+        let queued_entry = &snap.queued[0];
+        assert_eq!(queued_entry.id, queued_job.id);
+        // Queued jobs are not enriched yet — names stay None.
+        assert!(queued_entry.model_name.is_none());
+        assert!(queued_entry.version_name.is_none());
+        assert_eq!(queued_entry.model_type.as_deref(), Some("loras"));
+        assert_eq!(
+            queued_entry.download_reason.as_deref(),
+            Some("cli_add"),
+            "download_reason must be DownloadReason::CliAdd.to_string()"
+        );
     }
 }
