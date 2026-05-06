@@ -1,6 +1,6 @@
 # comfyui-downloader justfile
 # Usage: just [recipe]
-# Recipes: build, build-gui, test, lint, fmt, fmt-check, check, install, uninstall, update, clean
+# Recipes: build, build-gui, test, lint, fmt, fmt-check, check, install, install-user, uninstall, uninstall-user, update, clean
 
 # Default recipe — shows available recipes
 [private]
@@ -13,6 +13,14 @@ BINDIR  := env_var_or_default("DESTDIR", "") + PREFIX + "/bin"
 SYSTEMD := env_var_or_default("DESTDIR", "") + "/usr/lib/systemd/user"
 APPDIR  := env_var_or_default("DESTDIR", "") + PREFIX + "/share/applications"
 ICONDIR := env_var_or_default("DESTDIR", "") + PREFIX + "/share/icons/hicolor/128x128/apps"
+
+# Per-user install paths (XDG; no sudo required)
+USER_DATA    := env_var_or_default("XDG_DATA_HOME", env_var("HOME") + "/.local/share")
+USER_CONFIG  := env_var_or_default("XDG_CONFIG_HOME", env_var("HOME") + "/.config")
+USER_BINDIR  := env_var("HOME") + "/.local/bin"
+USER_SYSTEMD := USER_CONFIG + "/systemd/user"
+USER_APPDIR  := USER_DATA + "/applications"
+USER_ICONDIR := USER_DATA + "/icons/hicolor/128x128/apps"
 
 # Build the daemon and CLI binaries
 build:
@@ -62,6 +70,25 @@ uninstall:
     rm -f {{SYSTEMD}}/comfyui-downloader.service
     rm -f {{APPDIR}}/comfyui-downloader.desktop
     rm -f {{ICONDIR}}/comfyui-downloader.png
+
+# Install into the current user's $HOME (no sudo). Ensure ~/.local/bin is on PATH.
+install-user: build
+    install -Dm755 target/release/comfyui-downloader {{USER_BINDIR}}/comfyui-downloader
+    install -Dm755 target/release/comfyui-dl         {{USER_BINDIR}}/comfyui-dl
+    install -Dm644 systemd/comfyui-downloader.service {{USER_SYSTEMD}}/comfyui-downloader.service
+    install -Dm644 comfyui-downloader.desktop         {{USER_APPDIR}}/comfyui-downloader.desktop
+    install -Dm644 src-tauri/icons/128x128.png        {{USER_ICONDIR}}/comfyui-downloader.png
+    @echo "Installed to {{USER_BINDIR}}. Reload the user units with:"
+    @echo "  systemctl --user daemon-reload"
+    @echo "  systemctl --user enable --now comfyui-downloader.service"
+
+# Uninstall the per-user install
+uninstall-user:
+    rm -f {{USER_BINDIR}}/comfyui-downloader
+    rm -f {{USER_BINDIR}}/comfyui-dl
+    rm -f {{USER_SYSTEMD}}/comfyui-downloader.service
+    rm -f {{USER_APPDIR}}/comfyui-downloader.desktop
+    rm -f {{USER_ICONDIR}}/comfyui-downloader.png
 
 # Pull latest changes and rebuild
 update:
