@@ -88,22 +88,35 @@ pub async fn run() -> Result<()> {
     let server = IpcServer::bind(&config.daemon.socket_path)?;
     info!("Daemon ready");
 
-    let cat = catalog.clone();
-    let act = active.clone();
-    let prog = progress.clone();
-    let wake = update_wake.clone();
-    let bus = event_bus.clone();
-    let models_dir = config.paths.models_dir.clone();
+    let cat_h = catalog.clone();
+    let act_h = active.clone();
+    let prog_h = progress.clone();
+    let wake_h = update_wake.clone();
+    let bus_h = event_bus.clone();
+    let models_dir_h = config.paths.models_dir.clone();
+
+    let cat_s = catalog.clone();
+    let prog_s = progress.clone();
+    let bus_s = event_bus.clone();
+
     server
-        .serve(move |req| {
-            let cat = cat.clone();
-            let act = act.clone();
-            let prog = prog.clone();
-            let wake = wake.clone();
-            let bus = bus.clone();
-            let models_dir = models_dir.clone();
-            async move { handle_request(req, cat, act, prog, wake, bus, &models_dir).await }
-        })
+        .serve(
+            move |req| {
+                let cat = cat_h.clone();
+                let act = act_h.clone();
+                let prog = prog_h.clone();
+                let wake = wake_h.clone();
+                let bus = bus_h.clone();
+                let models_dir = models_dir_h.clone();
+                async move { handle_request(req, cat, act, prog, wake, bus, &models_dir).await }
+            },
+            move |writer| {
+                let cat = cat_s.clone();
+                let prog = prog_s.clone();
+                let bus = bus_s.clone();
+                async move { run_subscribe(writer, cat, prog, bus).await }
+            },
+        )
         .await?;
 
     scanner_handle.abort();
@@ -263,6 +276,17 @@ async fn handle_request(
             Response::err("subscribe is a streaming variant; not yet implemented in this build")
         }
     }
+}
+
+pub(crate) async fn run_subscribe(
+    mut writer: crate::ipc::server::SubscribeWriter,
+    _catalog: Arc<Mutex<Catalog>>,
+    _progress: ProgressMap,
+    _bus: crate::daemon::events::EventBus,
+) {
+    use crate::ipc::protocol::Frame;
+    let _ = writer.send(&Frame::Subscribed).await;
+    // Real implementation lands in Task 6.
 }
 
 async fn build_snapshot(
