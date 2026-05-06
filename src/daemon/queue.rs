@@ -144,7 +144,7 @@ pub async fn run(
                         let _ = cat.set_status(job_id, JobStatus::Failed, Some(&msg));
                     }
                     let _ = task_bus.send(Event::QueueChanged);
-                    try_enqueue_fallback_version(&job, status, &cat, &civ).await;
+                    try_enqueue_fallback_version(&job, status, &cat, &civ, &task_bus).await;
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
@@ -167,6 +167,7 @@ async fn try_enqueue_fallback_version(
     status: u16,
     catalog: &Arc<Mutex<Catalog>>,
     civitai: &Arc<CivitaiClient>,
+    bus: &EventBus,
 ) {
     let Some(model_id) = job.model_id else {
         let msg = format!("access denied (HTTP {status}), no model ID for fallback");
@@ -217,6 +218,8 @@ async fn try_enqueue_fallback_version(
             .is_ok()
         {
             enqueued = Some(candidate.id);
+            let _ = bus.send(Event::CatalogChanged);
+            let _ = bus.send(Event::QueueChanged);
         }
         break;
     }
