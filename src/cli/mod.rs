@@ -1,8 +1,10 @@
 use crate::config::Config;
+use crate::ipc::protocol::{FileVariantInfo, VersionInfo};
 use crate::ipc::{IpcClient, Request, Response};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -49,6 +51,55 @@ enum Command {
     },
 }
 
+fn select_variant(files: &[FileVariantInfo]) -> Option<String> {
+    if files.len() <= 1 {
+        return files.first().map(|f| f.name.clone());
+    }
+    if std::io::stdout().is_terminal() {
+        let items: Vec<String> = files.iter().map(format_variant).collect();
+        match dialoguer::Select::new()
+            .with_prompt("Multiple variants available. Select one to download")
+            .items(&items)
+            .default(0)
+            .interact()
+        {
+            Ok(idx) => Some(files[idx].name.clone()),
+            Err(_) => select_largest(files),
+        }
+    } else {
+        select_largest(files)
+    }
+}
+
+fn select_largest(files: &[FileVariantInfo]) -> Option<String> {
+    files
+        .iter()
+        .max_by(|a, b| {
+            a.size_kb
+                .partial_cmp(&b.size_kb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|f| f.name.clone())
+}
+
+fn format_variant(f: &FileVariantInfo) -> String {
+    let size = format_bytes((f.size_kb * 1024.0) as u64);
+    let mut parts = vec![f.name.clone(), format!("({size})")];
+    if let Some(ref fmt) = f.format {
+        parts.push(fmt.clone());
+    }
+    if let Some(ref s) = f.size {
+        parts.push(s.clone());
+    }
+    if let Some(ref fp) = f.fp {
+        parts.push(fp.clone());
+    }
+    if let Some(ref qt) = f.quant_type {
+        parts.push(qt.clone());
+    }
+    parts.join(" | ")
+}
+
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -68,7 +119,22 @@ pub async fn run() -> Result<()> {
 
     let req = match cli.command {
         None | Some(Command::Status) => Request::GetStatus,
-        Some(Command::Add { url, model_type }) => Request::AddDownload { url, model_type },
+        Some(Command::Add { url, model_type }) => {
+            let preferred = match client
+                .send(&Request::GetVersionInfo { url: url.clone() })
+                .await
+            {
+                Ok(Response::Ok(data)) => serde_json::from_value::<VersionInfo>(data)
+                    .ok()
+                    .and_then(|v| select_variant(&v.files)),
+                _ => None,
+            };
+            Request::AddDownload {
+                url,
+                model_type,
+                preferred_file_name: preferred,
+            }
+        }
         Some(Command::List) => Request::ListModels,
         Some(Command::Delete { id }) => Request::DeleteModel {
             id: resolve_model_id(&mut client, &id).await?,
@@ -401,5 +467,72 @@ mod tests {
 
         let bar_empty = progress_bar(0, 5);
         assert_eq!(bar_empty, "[\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}]");
+    }
+
+    #[test]
+    fn test_select_variant_single_file() {
+        let files = vec![FileVariantInfo {
+            name: "model.safetensors".to_string(),
+            size_kb: 1000.0,
+            primary: Some(true),
+            format: Some("SafeTensor".to_string()),
+            size: None,
+            fp: None,
+            quant_type: None,
+            component_type: None,
+        }];
+        assert_eq!(
+            select_variant(&files),
+            Some("model.safetensors".to_string())
+        );
+    }
+
+    #[test]
+    fn test_select_largest_picks_max_size() {
+        let files = vec![
+            FileVariantInfo {
+                name: "small.safetensors".to_string(),
+                size_kb: 1000.0,
+                primary: Some(true),
+                format: None,
+                size: None,
+                fp: None,
+                quant_type: None,
+                component_type: None,
+            },
+            FileVariantInfo {
+                name: "large.safetensors".to_string(),
+                size_kb: 5000.0,
+                primary: Some(false),
+                format: None,
+                size: None,
+                fp: None,
+                quant_type: None,
+                component_type: None,
+            },
+        ];
+        assert_eq!(
+            select_largest(&files),
+            Some("large.safetensors".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_variant_shows_all_metadata() {
+        let f = FileVariantInfo {
+            name: "model.safetensors".to_string(),
+            size_kb: 1024.0,
+            primary: Some(true),
+            format: Some("SafeTensor".to_string()),
+            size: Some("pruned".to_string()),
+            fp: Some("fp16".to_string()),
+            quant_type: None,
+            component_type: None,
+        };
+        let s = format_variant(&f);
+        assert!(s.contains("model.safetensors"));
+        assert!(s.contains("SafeTensor"));
+        assert!(s.contains("pruned"));
+        assert!(s.contains("fp16"));
     }
 }

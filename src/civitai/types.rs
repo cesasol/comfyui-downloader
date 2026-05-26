@@ -42,13 +42,22 @@ pub struct ModelImage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FileMetadata {
+    pub format: Option<String>,
     pub size: Option<String>,
+    pub fp: Option<String>,
+    #[serde(rename = "quantType")]
+    pub quant_type: Option<String>,
+    #[serde(rename = "componentType")]
+    pub component_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelFile {
+    #[serde(default)]
+    pub id: Option<u64>,
     pub name: String,
     #[serde(rename = "sizeKB")]
     pub size_kb: f64,

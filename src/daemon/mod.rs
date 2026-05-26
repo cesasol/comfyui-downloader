@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::daemon::queue::{ActiveTasks, ProgressMap};
 use crate::ipc::protocol::EnrichedModel;
 use crate::ipc::{IpcServer, Request, Response};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -28,6 +28,23 @@ pub async fn run() -> Result<()> {
             .join("comfyui-downloader")
             .join("catalog.db"),
     )?));
+
+    // Collapse any duplicate `done` rows accumulated by older daemon versions
+    // before they get a chance to trigger redundant downloads (e.g. via
+    // `redownload-missing`).
+    {
+        let cat = catalog.lock().await;
+        match cat.dedupe_done_jobs() {
+            Ok(0) => {}
+            Ok(n) => info!("Removed {n} duplicate done row(s) from catalog at startup"),
+            Err(e) => warn!("Startup dedupe of done rows failed: {e:#}"),
+        }
+        match cat.cancel_redundant_pending_jobs() {
+            Ok(0) => {}
+            Ok(n) => info!("Cancelled {n} pending job(s) whose version is already completed"),
+            Err(e) => warn!("Startup cancellation of redundant pending jobs failed: {e:#}"),
+        }
+    }
 
     let civitai = Arc::new(CivitaiClient::new(config.civitai.api_key.clone())?);
     let active: ActiveTasks = Arc::new(Mutex::new(HashMap::new()));
@@ -67,6 +84,8 @@ pub async fn run() -> Result<()> {
     let server = IpcServer::bind(&config.daemon.socket_path)?;
     info!("Daemon ready");
 
+    let civ = civitai.clone();
+    let cfg = config.clone();
     let cat = catalog.clone();
     let act = active.clone();
     let prog = progress.clone();
@@ -77,7 +96,9 @@ pub async fn run() -> Result<()> {
             let act = act.clone();
             let prog = prog.clone();
             let wake = wake.clone();
-            async move { handle_request(req, cat, act, prog, wake).await }
+            let civ = civ.clone();
+            let cfg = cfg.clone();
+            async move { handle_request(req, cat, act, prog, wake, civ, cfg).await }
         })
         .await?;
 
@@ -93,16 +114,72 @@ async fn handle_request(
     active: ActiveTasks,
     progress: ProgressMap,
     update_wake: Arc<Notify>,
+    civitai: Arc<CivitaiClient>,
+    config: Arc<Config>,
 ) -> Response {
     match req {
-        Request::AddDownload { url, model_type } => {
+        Request::AddDownload {
+            url,
+            model_type,
+            preferred_file_name,
+        } => {
             let cat = catalog.lock().await;
             match cat.enqueue(
                 &url,
                 model_type.as_deref(),
                 crate::catalog::DownloadReason::CliAdd,
+                preferred_file_name.as_deref(),
             ) {
                 Ok(job) => Response::ok(job),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::GetVersionInfo { url } => {
+            let (model_id, version_id) = crate::catalog::parse_civitai_url(&url);
+            let result = async {
+                let version = if let Some(vid) = version_id {
+                    civitai.get_model_version(vid).await?
+                } else if let Some(mid) = model_id {
+                    let model_info = civitai.get_model(mid).await?;
+                    let latest = model_info
+                        .model_versions
+                        .iter()
+                        .find(|v| {
+                            !config.daemon.skip_early_access
+                                || v.availability.as_deref() != Some("EarlyAccess")
+                        })
+                        .context("no publicly available version")?;
+                    civitai.get_model_version(latest.id).await?
+                } else {
+                    anyhow::bail!("URL does not contain a model or version ID")
+                };
+
+                let files: Vec<crate::ipc::protocol::FileVariantInfo> = version
+                    .files
+                    .iter()
+                    .map(|f| crate::ipc::protocol::FileVariantInfo {
+                        name: f.name.clone(),
+                        size_kb: f.size_kb,
+                        primary: f.primary,
+                        format: f.metadata.as_ref().and_then(|m| m.format.clone()),
+                        size: f.metadata.as_ref().and_then(|m| m.size.clone()),
+                        fp: f.metadata.as_ref().and_then(|m| m.fp.clone()),
+                        quant_type: f.metadata.as_ref().and_then(|m| m.quant_type.clone()),
+                        component_type: f.metadata.as_ref().and_then(|m| m.component_type.clone()),
+                    })
+                    .collect();
+
+                Ok(crate::ipc::protocol::VersionInfo {
+                    version_id: version.id,
+                    version_name: version.name.clone(),
+                    base_model: version.base_model.clone(),
+                    files,
+                })
+            }
+            .await;
+
+            match result {
+                Ok(info) => Response::ok(info),
                 Err(e) => Response::err(e.to_string()),
             }
         }
@@ -239,7 +316,7 @@ async fn handle_request(
         } => {
             let cat = catalog.lock().await;
             let url = format!("https://civitai.com/models/{model_id}?modelVersionId={version_id}");
-            match cat.enqueue(&url, None, crate::catalog::DownloadReason::CliAdd) {
+            match cat.enqueue(&url, None, crate::catalog::DownloadReason::CliAdd, None) {
                 Ok(job) => {
                     let _ = cat.clear_update_flag(model_id);
                     Response::ok(job)

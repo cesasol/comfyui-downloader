@@ -1,6 +1,6 @@
 use crate::catalog::DownloadJob;
 use crate::civitai::CivitaiClient;
-use crate::civitai::types::ModelVersion;
+use crate::civitai::types::{ModelFile, ModelVersion};
 use crate::config::Config;
 use crate::daemon::notifier;
 use crate::daemon::queue::{DownloadProgress, ProgressMap};
@@ -50,6 +50,23 @@ struct ModelMetadata {
 
 /// Resolve the authoritative download URL, expected SHA-256, model type, and base model
 /// from the CivitAI API. Falls back to the stored job URL only when no IDs are available.
+fn select_file<'a>(version: &'a ModelVersion, preferred: Option<&str>) -> Option<&'a ModelFile> {
+    if let Some(name) = preferred {
+        let found = version.files.iter().find(|f| f.name == name);
+        if found.is_none() {
+            warn!(
+                "Preferred file '{name}' not found in version {}, falling back",
+                version.id
+            );
+        }
+        found
+    } else {
+        None
+    }
+    .or_else(|| version.files.iter().find(|f| f.primary == Some(true)))
+    .or_else(|| version.files.first())
+}
+
 async fn resolve_version(
     job: &DownloadJob,
     civitai: &CivitaiClient,
@@ -69,11 +86,7 @@ async fn resolve_version(
                 .find(|v| v.id == version_id)
                 .and_then(|v| v.base_model.clone())
                 .or_else(|| version.base_model.clone());
-            let file = version
-                .files
-                .iter()
-                .find(|f| f.primary == Some(true))
-                .or_else(|| version.files.first())
+            let file = select_file(&version, job.preferred_file_name.as_deref())
                 .context("no files in version metadata")?;
             let model_type_subdir = Some(model_info.r#type.models_subdir().to_string());
             let download_url = file.download_url.clone().with_context(|| {
@@ -110,11 +123,7 @@ async fn resolve_version(
                 .await
                 .context("fetching version metadata")?;
             let base_model = version.base_model.clone();
-            let file = version
-                .files
-                .iter()
-                .find(|f| f.primary == Some(true))
-                .or_else(|| version.files.first())
+            let file = select_file(&version, job.preferred_file_name.as_deref())
                 .context("no files in version metadata")?;
             let model_type_subdir = version
                 .model
@@ -168,11 +177,7 @@ async fn resolve_version(
                 .get_model_version(version_id)
                 .await
                 .context("fetching latest version metadata")?;
-            let file = version
-                .files
-                .iter()
-                .find(|f| f.primary == Some(true))
-                .or_else(|| version.files.first())
+            let file = select_file(&version, job.preferred_file_name.as_deref())
                 .context("no files in latest version")?;
             let model_type_subdir = Some(model_info.r#type.models_subdir().to_string());
             let download_url = file.download_url.clone().with_context(|| {

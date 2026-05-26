@@ -26,4 +26,5 @@ pub const ALTER_MIGRATIONS: &[&str] = &[
     "ALTER TABLE jobs ADD COLUMN available_version_id INTEGER",
     "ALTER TABLE jobs ADD COLUMN available_version_name TEXT",
     "ALTER TABLE jobs ADD COLUMN last_update_check TEXT",
+    "ALTER TABLE jobs ADD COLUMN preferred_file_name TEXT",
 ];

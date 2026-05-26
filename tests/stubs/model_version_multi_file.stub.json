@@ -1,0 +1,58 @@
+{
+  "id": 5550004,
+  "name": "Multi File Version",
+  "modelId": 990002,
+  "baseModel": "SDXL 1.0",
+  "availability": "Public",
+  "files": [
+    {
+      "id": 1001,
+      "name": "model_fp16.safetensors",
+      "type": "Model",
+      "sizeKB": 6930636.0,
+      "metadata": {
+        "format": "SafeTensor",
+        "size": "full",
+        "fp": "fp16"
+      },
+      "hashes": {
+        "SHA256": "AAA"
+      },
+      "primary": true,
+      "downloadUrl": "https://example.com/api/download/models/5550004"
+    },
+    {
+      "id": 1002,
+      "name": "model_fp8.safetensors",
+      "type": "Model",
+      "sizeKB": 3465318.0,
+      "metadata": {
+        "format": "SafeTensor",
+        "size": "pruned",
+        "fp": "fp8"
+      },
+      "hashes": {
+        "SHA256": "BBB"
+      },
+      "primary": false,
+      "downloadUrl": "https://example.com/api/download/models/5550004?type=Model&format=SafeTensor&size=pruned&fp=fp8"
+    },
+    {
+      "id": 1003,
+      "name": "model_q4.gguf",
+      "type": "Model",
+      "sizeKB": 2000000.0,
+      "metadata": {
+        "format": "GGUF",
+        "quantType": "Q4_K_M"
+      },
+      "hashes": {
+        "SHA256": "CCC"
+      },
+      "primary": false,
+      "downloadUrl": "https://example.com/api/download/models/5550004?type=Model&format=GGUF&quantType=Q4_K_M"
+    }
+  ],
+  "images": [],
+  "downloadUrl": "https://example.com/api/download/models/5550004"
+}

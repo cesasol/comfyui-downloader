@@ -210,6 +210,7 @@ async fn register_in_catalog(
         model_type.as_deref(),
         path,
         crate::catalog::DownloadReason::StartupScan,
+        None,
     ) {
         Ok(Some(job)) => {
             info!(

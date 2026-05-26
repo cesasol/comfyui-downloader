@@ -9,6 +9,11 @@ pub enum Request {
     AddDownload {
         url: String,
         model_type: Option<String>,
+        #[serde(default)]
+        preferred_file_name: Option<String>,
+    },
+    GetVersionInfo {
+        url: String,
     },
     ListQueue,
     ListModels,
@@ -29,6 +34,26 @@ pub enum Request {
     RedownloadMissing {
         all: bool,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileVariantInfo {
+    pub name: String,
+    pub size_kb: f64,
+    pub primary: Option<bool>,
+    pub format: Option<String>,
+    pub size: Option<String>,
+    pub fp: Option<String>,
+    pub quant_type: Option<String>,
+    pub component_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionInfo {
+    pub version_id: u64,
+    pub version_name: String,
+    pub base_model: Option<String>,
+    pub files: Vec<FileVariantInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

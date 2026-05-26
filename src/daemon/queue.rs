@@ -205,6 +205,7 @@ async fn try_enqueue_fallback_version(
                 &url,
                 job.model_type.as_deref(),
                 DownloadReason::AccessDeniedFallback,
+                None,
             )
             .is_ok()
         {
