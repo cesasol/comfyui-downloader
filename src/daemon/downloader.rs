@@ -1,6 +1,6 @@
 use crate::catalog::DownloadJob;
 use crate::civitai::CivitaiClient;
-use crate::civitai::types::{ModelFile, ModelVersion};
+use crate::civitai::types::{ModelFile, ModelImage, ModelVersion};
 use crate::config::Config;
 use crate::daemon::notifier;
 use crate::daemon::queue::{DownloadProgress, ProgressMap};
@@ -97,8 +97,9 @@ async fn resolve_version(
             })?;
             let expected_hash = file.hashes.sha256.clone();
             let filename = file.name.clone();
-            let preview_image_url = version.images.first().map(|img| img.url.clone());
-            let preview_nsfw_level = version.images.first().and_then(|img| img.nsfw_level);
+            let preview_image = select_preview_image(&version.images);
+            let preview_image_url = preview_image.map(|img| img.url.clone());
+            let preview_nsfw_level = preview_image.and_then(|img| img.nsfw_level);
             let model_name = Some(model_info.name);
             info!(
                 "Resolved: type={:?} base_model={:?} file={}",
@@ -137,8 +138,9 @@ async fn resolve_version(
             })?;
             let expected_hash = file.hashes.sha256.clone();
             let filename = file.name.clone();
-            let preview_image_url = version.images.first().map(|img| img.url.clone());
-            let preview_nsfw_level = version.images.first().and_then(|img| img.nsfw_level);
+            let preview_image = select_preview_image(&version.images);
+            let preview_image_url = preview_image.map(|img| img.url.clone());
+            let preview_nsfw_level = preview_image.and_then(|img| img.nsfw_level);
             let model_name = version.model.as_ref().map(|m| m.name.clone());
             info!(
                 "Resolved: type={:?} base_model={:?} file={}",
@@ -188,8 +190,9 @@ async fn resolve_version(
             })?;
             let expected_hash = file.hashes.sha256.clone();
             let filename = file.name.clone();
-            let preview_image_url = version.images.first().map(|img| img.url.clone());
-            let preview_nsfw_level = version.images.first().and_then(|img| img.nsfw_level);
+            let preview_image = select_preview_image(&version.images);
+            let preview_image_url = preview_image.map(|img| img.url.clone());
+            let preview_nsfw_level = preview_image.and_then(|img| img.nsfw_level);
             let model_name = Some(model_info.name);
             info!(
                 "Resolved: type={:?} base_model={:?} file={}",
@@ -340,6 +343,10 @@ pub async fn download(
 
     let mut dest = dest_dir.join(&filename);
     let tmp = dest.with_extension("tmp");
+    let notification_preview_path = resolution
+        .preview_image_url
+        .as_deref()
+        .map(|url| preview_path_for_url(&dest, url));
 
     if tmp != provisional_tmp
         && provisional_tmp.exists()
@@ -357,6 +364,13 @@ pub async fn download(
         "Downloading '{}' → {}/{}",
         filename, model_type_str, filename
     );
+
+    if let (Some(url), Some(path)) = (
+        resolution.preview_image_url.as_deref(),
+        notification_preview_path.as_ref(),
+    ) {
+        download_preview(url, path).await;
+    }
 
     let calculated_total_bytes = if resume_from > 0 {
         Some(resume_from + resp.content_length().unwrap_or(0))
@@ -383,7 +397,7 @@ pub async fn download(
         );
     }
 
-    let notif_id = notifier::notify_download_start(&filename);
+    let notif_id = notifier::notify_download_start(&filename, notification_preview_path.as_deref());
     let mut last_notif_pct: u64 = 0;
 
     let mut file = if resume_from > 0 {
@@ -419,7 +433,13 @@ pub async fn download(
                             let pct = bytes_received * 100 / total;
                             if pct >= last_notif_pct + 10 {
                                 last_notif_pct = pct;
-                                notifier::update_download_progress(nid, &filename, bytes_received, total_bytes);
+                                notifier::update_download_progress(
+                                    nid,
+                                    &filename,
+                                    bytes_received,
+                                    total_bytes,
+                                    notification_preview_path.as_deref(),
+                                );
                             }
                         }
                     }
@@ -506,16 +526,18 @@ pub async fn download(
 
     fs::rename(&tmp, &dest).await?;
 
-    let preview_path = resolution.preview_image_url.as_deref().map(|url| {
-        let ext = url
-            .split('?')
-            .next()
-            .unwrap_or(url)
-            .rsplit('.')
-            .next()
-            .unwrap_or("jpg");
-        dest.with_extension(format!("preview.{ext}"))
-    });
+    let preview_path = resolution
+        .preview_image_url
+        .as_deref()
+        .map(|url| preview_path_for_url(&dest, url));
+    if let (Some(notification_path), Some(final_path)) =
+        (notification_preview_path.as_ref(), preview_path.as_ref())
+        && notification_path != final_path
+        && notification_path.exists()
+        && let Err(e) = tokio::fs::rename(notification_path, final_path).await
+    {
+        warn!("Failed to move preview sidecar: {e}");
+    }
     write_metadata(&dest, &resolution, &digest, preview_path.as_ref()).await;
     if let (Some(url), Some(path)) = (
         resolution.preview_image_url.as_deref(),
@@ -524,6 +546,39 @@ pub async fn download(
         download_preview(url, path).await;
     }
     Ok((dest, Some(model_type_str)))
+}
+
+fn select_preview_image(images: &[ModelImage]) -> Option<&ModelImage> {
+    images.iter().find(|image| {
+        image
+            .r#type
+            .as_deref()
+            .is_none_or(|kind| kind.eq_ignore_ascii_case("image"))
+            && static_image_extension(&image.url).is_some()
+    })
+}
+
+fn static_image_extension(url: &str) -> Option<&str> {
+    let ext = url
+        .split('?')
+        .next()
+        .unwrap_or(url)
+        .rsplit('.')
+        .next()
+        .unwrap_or("");
+    if matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "apng" | "avif" | "bmp" | "gif" | "jpeg" | "jpg" | "png" | "svg" | "webp"
+    ) {
+        Some(ext)
+    } else {
+        None
+    }
+}
+
+fn preview_path_for_url(dest: &Path, url: &str) -> PathBuf {
+    let ext = static_image_extension(url).unwrap_or("jpg");
+    dest.with_extension(format!("preview.{ext}"))
 }
 
 async fn write_metadata(
@@ -584,19 +639,49 @@ async fn download_preview(url: &str, path: &PathBuf) {
     }
     let http = reqwest::Client::new();
     match http.get(url).send().await {
-        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-            Ok(bytes) => {
-                if let Err(e) = tokio::fs::write(path, &bytes).await {
-                    warn!("Failed to write preview image {}: {e}", path.display());
-                } else {
-                    info!("Preview saved: {}", path.display());
+        Ok(resp) if resp.status().is_success() && is_static_image_response(&resp) => {
+            match resp.bytes().await {
+                Ok(bytes) => {
+                    if let Err(e) = tokio::fs::write(path, &bytes).await {
+                        warn!("Failed to write preview image {}: {e}", path.display());
+                    } else {
+                        info!("Preview saved: {}", path.display());
+                    }
                 }
+                Err(e) => warn!("Failed to read preview image bytes: {e}"),
             }
-            Err(e) => warn!("Failed to read preview image bytes: {e}"),
-        },
+        }
+        Ok(resp) if resp.status().is_success() => warn!(
+            "Preview image request returned incompatible content type: {:?}",
+            resp.headers().get(reqwest::header::CONTENT_TYPE)
+        ),
         Ok(resp) => warn!("Preview image request failed with status {}", resp.status()),
         Err(e) => warn!("Failed to fetch preview image: {e}"),
     }
+}
+
+fn is_static_image_response(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|content_type| {
+            let mime = content_type
+                .split(';')
+                .next()
+                .unwrap_or(content_type)
+                .trim();
+            matches!(
+                mime.to_ascii_lowercase().as_str(),
+                "image/apng"
+                    | "image/avif"
+                    | "image/bmp"
+                    | "image/gif"
+                    | "image/jpeg"
+                    | "image/png"
+                    | "image/svg+xml"
+                    | "image/webp"
+            )
+        })
 }
 
 /// Write metadata and/or download a preview image for a model file that was not
@@ -612,18 +697,12 @@ pub(crate) async fn save_artifacts(
 ) {
     let model_name = version.model.as_ref().map(|m| m.name.clone());
     let base_model = version.base_model.clone();
-    let preview_image_url = version.images.first().map(|img| img.url.clone());
-    let preview_nsfw_level = version.images.first().and_then(|img| img.nsfw_level);
-    let preview_path = preview_image_url.as_deref().map(|url| {
-        let ext = url
-            .split('?')
-            .next()
-            .unwrap_or(url)
-            .rsplit('.')
-            .next()
-            .unwrap_or("jpg");
-        dest.with_extension(format!("preview.{ext}"))
-    });
+    let preview_image = select_preview_image(&version.images);
+    let preview_image_url = preview_image.map(|img| img.url.clone());
+    let preview_nsfw_level = preview_image.and_then(|img| img.nsfw_level);
+    let preview_path = preview_image_url
+        .as_deref()
+        .map(|url| preview_path_for_url(dest, url));
     let resolution = VersionResolution {
         download_url: String::new(),
         expected_hash: None,
@@ -687,6 +766,8 @@ fn parse_filename_from_cd(header: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::civitai::types::ModelImage;
+
     #[test]
     fn test_parse_filename_from_cd_quoted() {
         let result =
@@ -698,6 +779,37 @@ mod tests {
     fn test_parse_filename_from_cd_unquoted() {
         let result = super::parse_filename_from_cd("attachment; filename=model.bin");
         assert_eq!(result, Some("model.bin".to_string()));
+    }
+
+    #[test]
+    fn test_select_preview_image_skips_video() {
+        let images = vec![
+            ModelImage {
+                url: "https://example.com/preview.mp4".to_string(),
+                r#type: Some("video".to_string()),
+                nsfw_level: Some(1),
+            },
+            ModelImage {
+                url: "https://example.com/preview.webp".to_string(),
+                r#type: Some("image".to_string()),
+                nsfw_level: Some(2),
+            },
+        ];
+
+        let selected = super::select_preview_image(&images).unwrap();
+        assert_eq!(selected.url, "https://example.com/preview.webp");
+        assert_eq!(selected.nsfw_level, Some(2));
+    }
+
+    #[test]
+    fn test_select_preview_image_rejects_unknown_extension() {
+        let images = vec![ModelImage {
+            url: "https://example.com/preview.mp4".to_string(),
+            r#type: None,
+            nsfw_level: Some(1),
+        }];
+
+        assert!(super::select_preview_image(&images).is_none());
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use notify_rust::{Hint, Notification, Timeout};
+use std::path::Path;
 
 const TITLE: &str = "ComfyUI Downloader";
 
@@ -42,17 +43,20 @@ pub fn notify_update_available(model_name: &str, version: &str) -> Result<()> {
 
 /// Show a persistent "downloading" notification and return its ID for later updates.
 /// Returns None if the notification system is unavailable.
-pub fn notify_download_start(filename: &str) -> Option<u32> {
-    Notification::new()
+pub fn notify_download_start(filename: &str, image_path: Option<&Path>) -> Option<u32> {
+    let mut notification = Notification::new();
+    notification
         .appname(TITLE)
         .summary("downloading")
         .body(filename)
         .icon("document-save")
         .hint(Hint::Category("transfer".to_owned()))
-        .timeout(Timeout::Never)
-        .show()
-        .ok()
-        .map(|h| h.id())
+        .hint(Hint::CustomInt("value".to_owned(), 0))
+        .timeout(Timeout::Never);
+
+    add_image_hint(&mut notification, image_path);
+
+    notification.show().ok().map(|h| h.id())
 }
 
 /// Replace the progress notification (identified by `id`) with updated progress text.
@@ -62,28 +66,57 @@ pub fn update_download_progress(
     filename: &str,
     bytes_received: u64,
     total_bytes: Option<u64>,
+    image_path: Option<&Path>,
 ) {
-    let body = match total_bytes {
+    let (body, pct) = match total_bytes {
         Some(total) if total > 0 => {
             let pct = bytes_received * 100 / total;
             let recv_mib = bytes_received / (1024 * 1024);
             let total_mib = total / (1024 * 1024);
-            format!("{pct}% — {recv_mib} / {total_mib} MiB\n{filename}")
+            (
+                format!("{pct}% — {recv_mib} / {total_mib} MiB\n{filename}"),
+                Some(pct.min(100) as i32),
+            )
         }
         _ => {
             let recv_mib = bytes_received / (1024 * 1024);
-            format!("{recv_mib} MiB downloaded\n{filename}")
+            (format!("{recv_mib} MiB downloaded\n{filename}"), None)
         }
     };
-    let _ = Notification::new()
+    let mut notification = Notification::new();
+    notification
         .id(id)
         .appname(TITLE)
         .summary("downloading")
         .body(&body)
         .hint(Hint::Category("transfer".to_owned()))
         .icon("document-save")
-        .timeout(Timeout::Never)
-        .show();
+        .timeout(Timeout::Never);
+
+    if let Some(pct) = pct {
+        notification.hint(Hint::CustomInt("value".to_owned(), pct));
+    }
+    add_image_hint(&mut notification, image_path);
+
+    let _ = notification.show();
+}
+
+fn add_image_hint(notification: &mut Notification, image_path: Option<&Path>) {
+    let Some(path) = image_path.filter(|p| p.exists() && is_static_image_path(p)) else {
+        return;
+    };
+    notification.hint(Hint::ImagePath(format!("file://{}", path.display())));
+}
+
+fn is_static_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "apng" | "avif" | "bmp" | "gif" | "jpeg" | "jpg" | "png" | "svg" | "webp"
+            )
+        })
 }
 
 pub fn notify_file_moved(filename: &str, from: &str, to: &str) -> Result<()> {
