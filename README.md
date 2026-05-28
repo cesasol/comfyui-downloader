@@ -61,7 +61,8 @@ comfyui-downloader/
 │   └── cli/
 │       └── mod.rs        # CLI argument parsing and output formatting (clap)
 ├── systemd/
-│   └── comfyui-downloader.service
+│   ├── comfyui-downloader.service
+│   └── comfyui-downloader-user.service
 ├── PKGBUILD              # Arch Linux / AUR package
 ├── Cargo.toml
 └── README.md
@@ -240,7 +241,7 @@ The AppImage bundles all GUI dependencies. The daemon and CLI are distributed se
 cargo build --release -p comfyui-downloader
 cp target/release/comfyui-downloader ~/.local/bin/
 cp target/release/comfyui-dl ~/.local/bin/
-cp systemd/comfyui-downloader.service ~/.config/systemd/user/
+cp systemd/comfyui-downloader-user.service ~/.config/systemd/user/comfyui-downloader.service
 systemctl --user daemon-reload
 systemctl --user enable --now comfyui-downloader
 ```

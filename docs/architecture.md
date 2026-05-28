@@ -232,4 +232,4 @@ XDG base directories are read from `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME`, fallin
 
 ## SystemD integration
 
-The unit file (`systemd/comfyui-downloader.service`) is a **user service** (`WantedBy=default.target`). It starts after `network-online.target`, sets `RUST_LOG=info`, and restarts on failure with a 5 s back-off. The binary must be on `$PATH` (the service uses a bare `ExecStart=comfyui-downloader`).
+The packaged unit file (`systemd/comfyui-downloader.service`) is a **user service** (`WantedBy=default.target`). It starts after `network-online.target`, sets `RUST_LOG=info`, and restarts on failure with a 5 s back-off. The packaged binary must be on `$PATH` because this unit uses a bare `ExecStart=comfyui-downloader`. Per-user installs use `systemd/comfyui-downloader-user.service`, installed as `comfyui-downloader.service`, with `ExecStart=%h/.local/bin/comfyui-downloader` so the unit does not depend on systemd's user-service PATH.
