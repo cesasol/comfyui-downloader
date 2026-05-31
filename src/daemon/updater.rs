@@ -177,7 +177,9 @@ async fn relocate_if_needed(
         return;
     };
     let mut expected_subdir = model.r#type.models_subdir().to_string();
-    if expected_subdir == "checkpoints" {
+    if expected_subdir == "checkpoints"
+        && !downloader::is_video_checkpoint(version.base_model.as_deref())
+    {
         let ext = current_path.extension().and_then(|e| e.to_str());
         match ext {
             Some("gguf") => {

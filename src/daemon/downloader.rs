@@ -495,7 +495,7 @@ pub async fn download(
         warn!("No SHA-256 hash available for this file, skipping verification");
     }
 
-    if model_type_str == "checkpoints" {
+    if model_type_str == "checkpoints" && !is_video_checkpoint(resolution.base_model.as_deref()) {
         let ext = dest.extension().and_then(|e| e.to_str());
         let reroute = match ext {
             Some("gguf") => true,
@@ -743,6 +743,24 @@ pub(crate) fn free_disk_bytes(path: &std::path::Path) -> Result<u64> {
     Ok(stat.f_bavail * stat.f_frsize)
 }
 
+/// Check whether a checkpoint model is a video-generation model (LTXV, CogVideo,
+/// WAN, Mochi, HunyuanVideo, etc.) These are full checkpoints that do not bundle
+/// VAE/CLIP weights, so the standard "no VAE/CLIP → diffusion_models" reroute
+/// should not apply to them.
+pub(crate) fn is_video_checkpoint(base_model: Option<&str>) -> bool {
+    let Some(bm) = base_model else {
+        return false;
+    };
+    let bm_lower = bm.to_ascii_lowercase();
+    // Known video model base_model prefixes on CivitAI.
+    bm_lower.starts_with("ltxv")
+        || bm_lower.starts_with("cogvideo")
+        || bm_lower.starts_with("wan")
+        || bm_lower.starts_with("mochi")
+        || bm_lower.starts_with("hunyuanvideo")
+        || bm_lower.starts_with("hunyuan")
+}
+
 /// Sanitize a string for use as a directory name component.
 /// Strips characters that are unsafe on common filesystems (slashes, null bytes, etc.).
 pub(crate) fn sanitize_dir_name(s: &str) -> String {
@@ -859,5 +877,36 @@ mod tests {
         let latest = info.model_versions.first().expect("should have versions");
         assert_eq!(latest.id, 5550003);
         assert_eq!(latest.availability.as_deref(), Some("EarlyAccess"));
+    }
+
+    #[test]
+    fn test_is_video_checkpoint_ltxv() {
+        assert!(super::is_video_checkpoint(Some("LTXV 2.3")));
+        assert!(super::is_video_checkpoint(Some("ltxv 2")));
+        assert!(super::is_video_checkpoint(Some("LTXV")));
+    }
+
+    #[test]
+    fn test_is_video_checkpoint_other_video_models() {
+        assert!(super::is_video_checkpoint(Some("CogVideoX")));
+        assert!(super::is_video_checkpoint(Some("WAN 2.1")));
+        assert!(super::is_video_checkpoint(Some("Wan2.1")));
+        assert!(super::is_video_checkpoint(Some("Mochi 1")));
+        assert!(super::is_video_checkpoint(Some("HunyuanVideo")));
+        assert!(super::is_video_checkpoint(Some("Hunyuan")));
+    }
+
+    #[test]
+    fn test_is_video_checkpoint_non_video() {
+        assert!(!super::is_video_checkpoint(Some("Flux.1 D")));
+        assert!(!super::is_video_checkpoint(Some("SDXL 1.0")));
+        assert!(!super::is_video_checkpoint(Some("SD1.5")));
+        assert!(!super::is_video_checkpoint(Some("Pony")));
+        assert!(!super::is_video_checkpoint(Some("Illustrious")));
+    }
+
+    #[test]
+    fn test_is_video_checkpoint_none() {
+        assert!(!super::is_video_checkpoint(None));
     }
 }
