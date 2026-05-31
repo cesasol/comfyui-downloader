@@ -33,6 +33,7 @@ struct VersionResolution {
 struct ModelMetadata {
     file_name: String,
     model_name: Option<String>,
+    version_name: Option<String>,
     file_path: String,
     size: u64,
     modified: f64,
@@ -386,6 +387,7 @@ pub async fn download(
                 bytes_received: resume_from,
                 total_bytes: calculated_total_bytes,
                 model_name: resolution.model_name.clone(),
+                version_name: resolution.model_version.as_ref().map(|v| v.name.clone()),
                 dest_path: Some(dest.to_string_lossy().into_owned()),
                 model_type: resolution
                     .model_type_subdir
@@ -604,6 +606,10 @@ async fn write_metadata(
         .unwrap_or_default();
     let file_path = dest.to_string_lossy().into_owned();
     let preview_url = preview_path.map(|p| p.to_string_lossy().into_owned());
+    let version_name = resolution
+        .model_version
+        .as_ref()
+        .map(|v| v.name.clone());
     let civitai = resolution
         .model_version
         .as_ref()
@@ -612,6 +618,7 @@ async fn write_metadata(
     let meta = ModelMetadata {
         file_name,
         model_name: resolution.model_name.clone(),
+        version_name,
         file_path,
         size,
         modified,

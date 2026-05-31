@@ -2,6 +2,7 @@ use crate::catalog::{Catalog, DownloadReason, JobStatus};
 use crate::civitai::{CivitaiAccessError, CivitaiClient};
 use crate::config::Config;
 use crate::daemon::downloader;
+use crate::daemon::events::{Event, EventBus};
 use crate::daemon::notifier;
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,6 +21,7 @@ pub struct DownloadProgress {
     pub bytes_received: u64,
     pub total_bytes: Option<u64>,
     pub model_name: Option<String>,
+    pub version_name: Option<String>,
     pub dest_path: Option<String>,
     pub model_type: Option<String>,
     pub download_reason: Option<String>,
@@ -34,6 +36,7 @@ pub async fn run(
     civitai: Arc<CivitaiClient>,
     active: ActiveTasks,
     progress: ProgressMap,
+    bus: EventBus,
 ) {
     let max = config.daemon.max_concurrent_downloads.max(1);
     let sem = Arc::new(Semaphore::new(max));
@@ -96,6 +99,7 @@ pub async fn run(
             let cat = catalog.lock().await;
             let _ = cat.set_status(job.id, JobStatus::Downloading, None);
         }
+        let _ = bus.send(Event::QueueChanged);
 
         let token = CancellationToken::new();
         {
@@ -109,6 +113,7 @@ pub async fn run(
         let active_ref = active.clone();
         let job_id = job.id;
         let prog = progress.clone();
+        let task_bus = bus.clone();
 
         tokio::spawn(async move {
             let _permit = permit; // released when task finishes
@@ -122,12 +127,14 @@ pub async fn run(
                         let _ = cat.set_model_type(job_id, &model_type);
                     }
                     let _ = cat.set_status(job_id, JobStatus::Done, None);
+                    let _ = task_bus.send(Event::QueueChanged);
                     let _ = notifier::notify_success(&dest.display().to_string());
                 }
                 Err(e) if e.to_string().contains("cancelled") => {
                     info!("Job {job_id} cancelled");
                     let cat = cat.lock().await;
                     let _ = cat.set_status(job_id, JobStatus::Cancelled, None);
+                    let _ = task_bus.send(Event::QueueChanged);
                 }
                 Err(ref e) if e.downcast_ref::<CivitaiAccessError>().is_some() => {
                     let status = e.downcast_ref::<CivitaiAccessError>().unwrap().status;
@@ -137,13 +144,15 @@ pub async fn run(
                         let msg = format!("access denied (HTTP {status})");
                         let _ = cat.set_status(job_id, JobStatus::Failed, Some(&msg));
                     }
-                    try_enqueue_fallback_version(&job, status, &cat, &civ).await;
+                    let _ = task_bus.send(Event::QueueChanged);
+                    try_enqueue_fallback_version(&job, status, &cat, &civ, &task_bus).await;
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
                     error!("Job {job_id} failed: {msg}");
                     let cat = cat.lock().await;
                     let _ = cat.set_status(job_id, JobStatus::Failed, Some(&msg));
+                    let _ = task_bus.send(Event::QueueChanged);
                     let _ = notifier::notify_error(&msg);
                 }
             }
@@ -159,6 +168,7 @@ async fn try_enqueue_fallback_version(
     status: u16,
     catalog: &Arc<Mutex<Catalog>>,
     civitai: &Arc<CivitaiClient>,
+    bus: &EventBus,
 ) {
     let Some(model_id) = job.model_id else {
         let msg = format!("access denied (HTTP {status}), no model ID for fallback");
@@ -210,6 +220,8 @@ async fn try_enqueue_fallback_version(
             .is_ok()
         {
             enqueued = Some(candidate.id);
+            let _ = bus.send(Event::CatalogChanged);
+            let _ = bus.send(Event::QueueChanged);
         }
         break;
     }

@@ -513,6 +513,23 @@ impl Catalog {
         Ok(requeued)
     }
 
+    /// Re-queue a single model by ID, recycling the existing row in place
+    /// (UUID, model_id, version_id, model_type, url all preserved).
+    /// Errors if the row isn't `Done`.
+    pub fn requeue_one(&self, id: Uuid) -> Result<DownloadJob> {
+        let job = self.get_job(id)?.context("model not found")?;
+        if job.status != JobStatus::Done {
+            anyhow::bail!("model is not in Done state (status = {})", job.status);
+        }
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE jobs SET status = 'queued', dest_path = NULL, error = NULL, updated_at = ?1 \
+             WHERE id = ?2",
+            params![now, id.to_string()],
+        )?;
+        self.get_job(id)?.context("job not found after requeue_one")
+    }
+
     pub fn list_queued(&self) -> Result<Vec<DownloadJob>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {JOB_COLUMNS} FROM jobs WHERE status = 'queued' ORDER BY created_at ASC"
@@ -1291,6 +1308,56 @@ mod tests {
             params![id.to_string(), version_id, now],
         ).unwrap();
         id
+    }
+
+    #[test]
+    fn test_requeue_one_preserves_uuid_and_clears_path() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog
+            .enqueue("https://civitai.com/models/1", None, DownloadReason::CliAdd, None)
+            .unwrap();
+        let original_id = job.id;
+        catalog
+            .set_dest_path(job.id, std::path::Path::new("/tmp/model.safetensors"))
+            .unwrap();
+        catalog.set_status(job.id, JobStatus::Done, None).unwrap();
+
+        let requeued = catalog.requeue_one(original_id).unwrap();
+
+        // UUID must be preserved (in-place update, not a new INSERT).
+        assert_eq!(requeued.id, original_id, "UUID must be preserved");
+        // Status must flip to Queued.
+        assert_eq!(requeued.status, JobStatus::Queued);
+        // dest_path must be cleared.
+        assert!(requeued.dest_path.is_none());
+
+        // list_done_models must be empty after requeue.
+        let done = catalog.list_done_models().unwrap();
+        assert!(done.is_empty(), "Done list must be empty after requeue_one");
+
+        // list_queued must have exactly one entry with the original id.
+        let queued = catalog.list_queued().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, original_id);
+    }
+
+    #[test]
+    fn test_requeue_one_errors_on_wrong_state() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog
+            .enqueue("https://civitai.com/models/2", None, DownloadReason::CliAdd, None)
+            .unwrap();
+        // Advance to Failed without going through Done.
+        catalog
+            .set_status(job.id, JobStatus::Failed, Some("network error"))
+            .unwrap();
+
+        let result = catalog.requeue_one(job.id);
+        assert!(result.is_err(), "requeue_one must fail for non-Done jobs");
+
+        // Row must remain Failed.
+        let after = catalog.get_job(job.id).unwrap().unwrap();
+        assert_eq!(after.status, JobStatus::Failed);
     }
 
     #[test]

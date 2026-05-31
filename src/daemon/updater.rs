@@ -2,6 +2,7 @@ use crate::catalog::{Catalog, DownloadJob, JobStatus};
 use crate::civitai::CivitaiClient;
 use crate::civitai::types::ModelInfo;
 use crate::config::Config;
+use crate::daemon::events::{Event, EventBus};
 use crate::daemon::{downloader, notifier};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,7 @@ pub async fn run(
     catalog: Arc<Mutex<Catalog>>,
     civitai: Arc<CivitaiClient>,
     wake: Arc<Notify>,
+    bus: EventBus,
 ) {
     let interval = Duration::from_secs(config.daemon.update_interval_hours * 3600);
     loop {
@@ -22,6 +24,7 @@ pub async fn run(
         if let Err(e) = check_updates(&config, &catalog, &civitai).await {
             error!("Update check failed: {e}");
         }
+        let _ = bus.send(Event::UpdatesChanged);
         tokio::select! {
             _ = sleep(interval) => {}
             _ = wake.notified() => {
