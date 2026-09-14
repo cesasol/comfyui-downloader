@@ -129,7 +129,9 @@ pub async fn run() -> Result<()> {
                 let models_dir = models_dir_h.clone();
                 let civ = civ_h.clone();
                 let cfg = cfg_h.clone();
-                async move { handle_request(req, cat, act, prog, wake, bus, &models_dir, civ, cfg).await }
+                async move {
+                    handle_request(req, cat, act, prog, wake, bus, &models_dir, civ, cfg).await
+                }
             },
             move |writer| {
                 let cat = cat_s.clone();
@@ -181,6 +183,39 @@ async fn handle_request(
                 Err(e) => Response::err(e.to_string()),
             }
         }
+        Request::AddDownloads { items } => {
+            let cat = catalog.lock().await;
+            let mut jobs = Vec::new();
+            let mut errors = Vec::new();
+            for item in &items {
+                match cat.enqueue(
+                    &item.url,
+                    item.model_type.as_deref(),
+                    crate::catalog::DownloadReason::CliAdd,
+                    None,
+                ) {
+                    Ok(job) => jobs.push(job),
+                    Err(e) => errors.push(format!("{}: {e}", item.url)),
+                }
+            }
+            if !jobs.is_empty() {
+                let _ = bus.send(crate::daemon::events::Event::CatalogChanged);
+                let _ = bus.send(crate::daemon::events::Event::QueueChanged);
+            }
+            if jobs.is_empty() && !errors.is_empty() {
+                Response::err(errors.join("; "))
+            } else {
+                Response::ok(serde_json::json!({ "queued": jobs, "errors": errors }))
+            }
+        }
+        Request::ListTemplates {
+            filter,
+            refresh,
+            include_unrunnable,
+        } => match list_templates(&config, filter, refresh, include_unrunnable).await {
+            Ok(listing) => Response::ok(listing),
+            Err(e) => Response::err(format!("{e:#}")),
+        },
         Request::GetVersionInfo { url } => {
             let (model_id, version_id) = crate::catalog::parse_civitai_url(&url);
             let result = async {
@@ -389,8 +424,7 @@ pub async fn run_subscribe(
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                 // Re-sync: send a fresh full snapshot.
                 seq += 1;
-                let snap =
-                    build_snapshot(&catalog, &progress, &models_dir, true, true, seq).await;
+                let snap = build_snapshot(&catalog, &progress, &models_dir, true, true, seq).await;
                 if writer.send(&Frame::Snapshot(snap)).await.is_err() {
                     return;
                 }
@@ -422,9 +456,15 @@ pub async fn run_subscribe(
         }
 
         seq += 1;
-        let snap =
-            build_snapshot(&catalog, &progress, &models_dir, catalog_dirty, updates_dirty, seq)
-                .await;
+        let snap = build_snapshot(
+            &catalog,
+            &progress,
+            &models_dir,
+            catalog_dirty,
+            updates_dirty,
+            seq,
+        )
+        .await;
         catalog_dirty = false;
         updates_dirty = false;
         if writer.send(&Frame::Snapshot(snap)).await.is_err() {
@@ -435,6 +475,44 @@ pub async fn run_subscribe(
 
 #[doc(hidden)]
 pub use run_subscribe as run_subscribe_for_test;
+
+/// Fetch the ComfyUI template catalog, resolve the model bundles of everything
+/// matching `filter`, and judge each bundle against the local GPU.
+async fn list_templates(
+    config: &crate::config::Config,
+    filter: crate::templates::TemplateFilter,
+    refresh: bool,
+    include_unrunnable: bool,
+) -> anyhow::Result<crate::ipc::protocol::TemplateListing> {
+    let gpu = crate::gpu::primary_gpu();
+    let vram_bytes = config
+        .gpu
+        .vram_bytes
+        .or_else(|| gpu.as_ref().map(|g| g.vram_bytes));
+
+    let cache_dir = crate::config::xdg_cache_home()
+        .join("comfyui-downloader")
+        .join("templates");
+    let catalog = crate::templates::TemplateCatalog::new(cache_dir)?;
+    let entries: Vec<crate::templates::TemplateEntry> = catalog
+        .index(refresh)
+        .await?
+        .into_iter()
+        .filter(|entry| filter.matches(entry))
+        .collect();
+
+    let hf = crate::huggingface::HfClient::new(config.huggingface.token.clone())?;
+    let resolved = catalog.bundles(entries, &hf, vram_bytes, refresh).await?;
+    let (bundles, hidden_unrunnable) =
+        crate::templates::prune_bundles(resolved, include_unrunnable);
+
+    Ok(crate::ipc::protocol::TemplateListing {
+        gpu,
+        vram_bytes,
+        hidden_unrunnable,
+        bundles,
+    })
+}
 
 async fn build_snapshot(
     catalog: &Arc<Mutex<Catalog>>,
@@ -494,31 +572,38 @@ async fn enrich_models(models: Vec<DownloadJob>) -> Vec<EnrichedModel> {
             Some(dest) => read_sidecar_metadata(Path::new(dest)).await,
             None => None,
         };
-        let (model_name, version_name, base_model, preview_path, preview_nsfw_level, file_size, sha256) =
-            match metadata {
-                Some(meta) => (
-                    meta.get("model_name")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    meta.get("version_name")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    meta.get("base_model")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    meta.get("preview_url")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    meta.get("preview_nsfw_level")
-                        .and_then(|v| v.as_u64())
-                        .map(|n| n as u32),
-                    meta.get("size").and_then(|v| v.as_u64()),
-                    meta.get("sha256")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                ),
-                None => (None, None, None, None, None, None, None),
-            };
+        let (
+            model_name,
+            version_name,
+            base_model,
+            preview_path,
+            preview_nsfw_level,
+            file_size,
+            sha256,
+        ) = match metadata {
+            Some(meta) => (
+                meta.get("model_name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                meta.get("version_name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                meta.get("base_model")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                meta.get("preview_url")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                meta.get("preview_nsfw_level")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32),
+                meta.get("size").and_then(|v| v.as_u64()),
+                meta.get("sha256")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+            ),
+            None => (None, None, None, None, None, None, None),
+        };
         enriched.push(EnrichedModel {
             id: job.id,
             url: job.url,
@@ -640,9 +725,7 @@ mod tests {
         let db_path = tmp.path().join("catalog.db");
 
         // Open a fresh catalog and enqueue one queued job.
-        let catalog = Arc::new(Mutex::new(
-            Catalog::open(&db_path).expect("open catalog"),
-        ));
+        let catalog = Arc::new(Mutex::new(Catalog::open(&db_path).expect("open catalog")));
         let queued_job = {
             let cat = catalog.lock().await;
             cat.enqueue(

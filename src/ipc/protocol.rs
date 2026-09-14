@@ -12,6 +12,22 @@ pub enum Request {
         #[serde(default)]
         preferred_file_name: Option<String>,
     },
+    /// Enqueue several files at once (used by the template picker).
+    AddDownloads {
+        items: Vec<QueueItem>,
+    },
+    /// List the ComfyUI default workflow templates with their model bundles and
+    /// the VRAM verdict for the local GPU.
+    ListTemplates {
+        #[serde(default)]
+        filter: crate::templates::TemplateFilter,
+        /// Bypass the on-disk catalog cache.
+        #[serde(default)]
+        refresh: bool,
+        /// Keep bundles that cannot run on this GPU at all.
+        #[serde(default)]
+        include_unrunnable: bool,
+    },
     GetVersionInfo {
         url: String,
     },
@@ -53,6 +69,27 @@ pub enum Frame {
     Snapshot(Snapshot),
     /// Server-side error on the subscription stream.
     Error { message: String },
+}
+
+/// One file to enqueue, with the ComfyUI subdirectory it belongs in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueItem {
+    pub url: String,
+    #[serde(default)]
+    pub model_type: Option<String>,
+}
+
+/// Response payload of [`Request::ListTemplates`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateListing {
+    /// GPU the verdicts were computed for, when one was detected.
+    pub gpu: Option<crate::gpu::GpuInfo>,
+    /// VRAM used for the verdicts (detected or configured override).
+    pub vram_bytes: Option<u64>,
+    /// Templates matching the filter, alphabetical by template name.
+    pub bundles: Vec<crate::templates::TemplateBundle>,
+    /// Bundles dropped because they cannot run on this GPU.
+    pub hidden_unrunnable: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

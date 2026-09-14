@@ -1,9 +1,12 @@
 use crate::config::Config;
-use crate::ipc::protocol::{FileVariantInfo, VersionInfo};
+use crate::ipc::protocol::{FileVariantInfo, QueueItem, TemplateListing, VersionInfo};
 use crate::ipc::{IpcClient, Request, Response};
-use anyhow::{Result, bail};
+use crate::templates::{TemplateBundle, TemplateFilter};
+use crate::vram::{Feasibility, WorkloadKind};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
+use std::collections::BTreeSet;
 use std::io::IsTerminal;
 use uuid::Uuid;
 
@@ -49,6 +52,216 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Browse the ComfyUI default workflow templates and download their models.
+    ///
+    /// Each template is judged against the local GPU: bundles that fit
+    /// entirely in VRAM, bundles that fit only with the text encoders and VAE
+    /// on the CPU, and bundles that cannot run at all (hidden by default).
+    Templates {
+        /// Free text matched against title, description, tags and model family.
+        query: Option<String>,
+        /// Generation type: image, video, audio, 3d or llm (repeatable).
+        #[arg(long = "type", value_name = "KIND")]
+        kind: Vec<String>,
+        /// Task tag, e.g. "image edit" or "text to video" (repeatable).
+        #[arg(long, value_name = "TAG")]
+        task: Vec<String>,
+        /// Model family, e.g. z-image-turbo (repeatable).
+        #[arg(long, value_name = "FAMILY")]
+        model: Vec<String>,
+        /// Exact template name (repeatable).
+        #[arg(long, value_name = "NAME")]
+        name: Vec<String>,
+        /// Only bundles that fit entirely in VRAM.
+        #[arg(long)]
+        comfortable_only: bool,
+        /// Include cloud-API templates, which download no weights.
+        #[arg(long)]
+        include_api: bool,
+        /// Include bundles that cannot run on this GPU.
+        #[arg(long)]
+        include_unrunnable: bool,
+        /// Re-fetch the catalog instead of using the local cache.
+        #[arg(long)]
+        refresh: bool,
+        /// Print the resolved listing as JSON instead of picking.
+        #[arg(long)]
+        json: bool,
+        /// Queue every matching template without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_templates(
+    client: &mut IpcClient,
+    query: Option<String>,
+    kinds: Vec<String>,
+    tasks: Vec<String>,
+    families: Vec<String>,
+    names: Vec<String>,
+    comfortable_only: bool,
+    include_api: bool,
+    include_unrunnable: bool,
+    refresh: bool,
+    json: bool,
+    yes: bool,
+) -> Result<()> {
+    let filter = TemplateFilter {
+        text: query,
+        kinds: kinds
+            .iter()
+            .map(|raw| parse_kind(raw))
+            .collect::<Result<Vec<_>>>()?,
+        tasks,
+        families,
+        names,
+        include_api,
+    };
+
+    let data = ok_data(
+        client
+            .send(&Request::ListTemplates {
+                filter,
+                refresh,
+                include_unrunnable,
+            })
+            .await?,
+    )?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&data)?);
+        return Ok(());
+    }
+
+    let listing: TemplateListing =
+        serde_json::from_value(data).context("parsing template listing")?;
+    let mut bundles = listing.bundles;
+    if comfortable_only {
+        bundles.retain(|b| b.feasibility != Some(Feasibility::CpuOffload));
+    }
+    bundles.sort_by(|a, b| {
+        a.feasibility
+            .cmp(&b.feasibility)
+            .then_with(|| a.template.title.cmp(&b.template.title))
+    });
+
+    match listing.gpu {
+        Some(ref gpu) => println!(
+            "GPU: {} ({} VRAM)",
+            gpu.name,
+            format_bytes(listing.vram_bytes.unwrap_or(gpu.vram_bytes))
+        ),
+        None => match listing.vram_bytes {
+            Some(bytes) => println!("VRAM budget: {} (from config)", format_bytes(bytes)),
+            None => println!("No GPU detected — feasibility is not being judged."),
+        },
+    }
+    if listing.hidden_unrunnable > 0 {
+        println!(
+            "{} template(s) hidden: they cannot run on this GPU (--include-unrunnable to show).",
+            listing.hidden_unrunnable
+        );
+    }
+
+    if bundles.is_empty() {
+        println!("No templates match that filter.");
+        return Ok(());
+    }
+
+    let items: Vec<String> = bundles.iter().map(format_bundle).collect();
+    let selected: Vec<usize> = if yes || !std::io::stdout().is_terminal() {
+        (0..bundles.len()).collect()
+    } else {
+        println!("\nSpace toggles, Enter confirms. Everything is selected by default.");
+        dialoguer::MultiSelect::new()
+            .with_prompt("Models to download")
+            .items(&items)
+            .defaults(&vec![true; bundles.len()])
+            .interact()
+            .context("template selection cancelled")?
+    };
+
+    if selected.is_empty() {
+        println!("Nothing selected.");
+        return Ok(());
+    }
+
+    // Selecting a template takes its whole dependency set — diffusion model,
+    // text encoders, VAE, LoRAs — deduplicated across templates.
+    let mut seen = BTreeSet::new();
+    let mut queue = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for index in &selected {
+        let Some(bundle) = bundles.get(*index) else {
+            continue;
+        };
+        for model in &bundle.models {
+            if !seen.insert(model.url.clone()) {
+                continue;
+            }
+            total_bytes += model.size_bytes.unwrap_or(0);
+            queue.push(QueueItem {
+                url: model.url.clone(),
+                model_type: Some(model.role.clone()),
+            });
+        }
+    }
+
+    println!(
+        "\nQueueing {} file(s) from {} template(s), {} to download.",
+        queue.len(),
+        selected.len(),
+        format_bytes(total_bytes)
+    );
+
+    let data = ok_data(client.send(&Request::AddDownloads { items: queue }).await?)?;
+    let queued = data["queued"].as_array().map(|a| a.len()).unwrap_or(0);
+    println!("{queued} job(s) queued. Track them with `comfyui-dl status`.");
+    if let Some(errors) = data["errors"].as_array().filter(|e| !e.is_empty()) {
+        for err in errors {
+            eprintln!("warning: {err}");
+        }
+    }
+    Ok(())
+}
+
+fn parse_kind(raw: &str) -> Result<WorkloadKind> {
+    let kind = WorkloadKind::from_template_type(raw);
+    if kind == WorkloadKind::Unknown {
+        bail!("unknown --type '{raw}' (expected image, video, audio, 3d or llm)");
+    }
+    Ok(kind)
+}
+
+fn format_bundle(bundle: &TemplateBundle) -> String {
+    let tier = match bundle.feasibility {
+        Some(Feasibility::Comfortable) => "fits in VRAM",
+        Some(Feasibility::CpuOffload) => "needs CPU offload for encoders/VAE",
+        Some(Feasibility::WontRun) => "will not run",
+        None => "unknown fit",
+    };
+    let roles: Vec<&str> = bundle.models_by_role().keys().copied().collect();
+    format!(
+        "{}  [{}]  {}  — {tier}  ({} files: {})",
+        bundle.template.title,
+        kind_label(bundle.template.kind),
+        format_bytes(bundle.download_bytes),
+        bundle.models.len(),
+        roles.join(", ")
+    )
+}
+
+fn kind_label(kind: WorkloadKind) -> &'static str {
+    match kind {
+        WorkloadKind::Image => "image",
+        WorkloadKind::Video => "video",
+        WorkloadKind::Audio => "audio",
+        WorkloadKind::ThreeD => "3d",
+        WorkloadKind::Llm => "llm",
+        WorkloadKind::Unknown => "other",
+    }
 }
 
 fn select_variant(files: &[FileVariantInfo]) -> Option<String> {
@@ -115,6 +328,39 @@ pub async fn run() -> Result<()> {
     let config = Config::load()?;
     let mut client = IpcClient::connect(&config.daemon.socket_path).await?;
 
+    // The template picker is interactive and needs several round trips, so it
+    // runs its own request flow instead of the single request/response path.
+    if let Some(Command::Templates {
+        query,
+        kind,
+        task,
+        model,
+        name,
+        comfortable_only,
+        include_api,
+        include_unrunnable,
+        refresh,
+        json,
+        yes,
+    }) = cli.command
+    {
+        return run_templates(
+            &mut client,
+            query,
+            kind,
+            task,
+            model,
+            name,
+            comfortable_only,
+            include_api,
+            include_unrunnable,
+            refresh,
+            json,
+            yes,
+        )
+        .await;
+    }
+
     let is_status = cli.command.is_none() || matches!(cli.command, Some(Command::Status));
 
     let req = match cli.command {
@@ -152,7 +398,7 @@ pub async fn run() -> Result<()> {
             version_id,
         },
         Some(Command::RedownloadMissing { all }) => Request::RedownloadMissing { all },
-        Some(Command::SetKey { .. }) => unreachable!(),
+        Some(Command::SetKey { .. }) | Some(Command::Templates { .. }) => unreachable!(),
     };
 
     let is_updates = matches!(req, Request::ListUpdates);
