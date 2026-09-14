@@ -73,6 +73,9 @@ async fn resolve_version(
     civitai: &CivitaiClient,
     config: &Config,
 ) -> Result<VersionResolution> {
+    if let Some(reference) = crate::huggingface::parse_hf_url(&job.url) {
+        return resolve_huggingface(job, &reference, config).await;
+    }
     match (job.version_id, job.model_id) {
         (Some(version_id), Some(model_id)) => {
             // Both IDs known: use get_model for reliable type and base_model,
@@ -232,6 +235,60 @@ async fn resolve_version(
     }
 }
 
+/// Resolve a HuggingFace file: the download URL is deterministic, and the tree
+/// API supplies the LFS SHA-256 so the usual checksum verification still runs.
+/// The target subdirectory comes from the job (set by the template picker) or
+/// from the file's directory inside the repo (`split_files/vae/...` → `vae`).
+async fn resolve_huggingface(
+    job: &DownloadJob,
+    reference: &crate::huggingface::HfFileRef,
+    config: &Config,
+) -> Result<VersionResolution> {
+    let client = crate::huggingface::HfClient::new(config.huggingface.token.clone())?;
+    let meta = match client.file_meta(reference).await {
+        Ok(meta) => Some(meta),
+        Err(e) => {
+            // Metadata is an optimisation: without it we simply download
+            // without checksum verification.
+            warn!(
+                "HuggingFace metadata lookup failed for {}: {e:#}",
+                reference.path
+            );
+            None
+        }
+    };
+    let model_type_subdir = job.model_type.clone().or_else(|| {
+        reference
+            .dir()
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())
+            .and_then(crate::templates::normalize_role)
+    });
+    info!(
+        "Resolved HuggingFace file {}/{} → {:?}",
+        reference.repo, reference.path, model_type_subdir
+    );
+    Ok(VersionResolution {
+        download_url: reference.resolve_url(),
+        expected_hash: meta.and_then(|m| m.sha256),
+        model_type_subdir,
+        base_model: None,
+        filename: Some(reference.file_name().to_string()),
+        model_name: Some(format!("{} ({})", reference.file_name(), reference.repo)),
+        preview_image_url: None,
+        preview_nsfw_level: None,
+        model_version: None,
+    })
+}
+
+/// Attach the bearer token for the download host, when one is configured.
+fn with_auth(req: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBuilder {
+    match token {
+        Some(token) => req.bearer_auth(token),
+        None => req,
+    }
+}
+
 /// Download the file for `job`, verify its checksum, and return `(dest_path, resolved_model_type)`.
 /// `resolved_model_type` is the CivitAI-reported subdir (e.g. "checkpoints") if available.
 pub async fn download(
@@ -241,9 +298,17 @@ pub async fn download(
     token: CancellationToken,
     progress: ProgressMap,
 ) -> Result<(PathBuf, Option<String>)> {
-    let key = config.civitai.api_key.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("CivitAI API key is not configured (set civitai.api_key in config.toml)")
-    })?;
+    let from_huggingface = crate::huggingface::is_huggingface_url(&job.url);
+    let auth_token: Option<&str> = if from_huggingface {
+        // Public HuggingFace files need no credentials; gated repos need a token.
+        config.huggingface.token.as_deref()
+    } else {
+        Some(config.civitai.api_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "CivitAI API key is not configured (set civitai.api_key in config.toml)"
+            )
+        })?)
+    };
 
     let resolution = resolve_version(job, civitai, config).await?;
 
@@ -294,7 +359,7 @@ pub async fn download(
     };
 
     let http = reqwest::Client::new();
-    let mut req = http.get(&resolution.download_url).bearer_auth(key);
+    let mut req = with_auth(http.get(&resolution.download_url), auth_token);
 
     if resume_from > 0 {
         req = req.header("Range", format!("bytes={}-", resume_from));
@@ -310,9 +375,7 @@ pub async fn download(
         let _ = tokio::fs::remove_file(&provisional_tmp).await;
         resume_from = 0;
 
-        resp = http
-            .get(&resolution.download_url)
-            .bearer_auth(key)
+        resp = with_auth(http.get(&resolution.download_url), auth_token)
             .send()
             .await
             .context("restarting download")?;
@@ -322,6 +385,11 @@ pub async fn download(
         s if s.is_success() => {}
         reqwest::StatusCode::PARTIAL_CONTENT => {}
         s @ (reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN) => {
+            if from_huggingface {
+                bail!(
+                    "HuggingFace returned HTTP {s}: the repo may be gated — accept its licence and set huggingface.token in config.toml"
+                );
+            }
             return Err(crate::civitai::CivitaiAccessError { status: s.as_u16() }.into());
         }
         s => bail!("download failed with status {s}"),
@@ -606,10 +674,7 @@ async fn write_metadata(
         .unwrap_or_default();
     let file_path = dest.to_string_lossy().into_owned();
     let preview_url = preview_path.map(|p| p.to_string_lossy().into_owned());
-    let version_name = resolution
-        .model_version
-        .as_ref()
-        .map(|v| v.name.clone());
+    let version_name = resolution.model_version.as_ref().map(|v| v.name.clone());
     let civitai = resolution
         .model_version
         .as_ref()

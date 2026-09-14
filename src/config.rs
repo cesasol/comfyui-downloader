@@ -7,14 +7,32 @@ pub struct Config {
     #[serde(default)]
     pub civitai: CivitaiConfig,
     #[serde(default)]
+    pub huggingface: HuggingfaceConfig,
+    #[serde(default)]
     pub paths: PathsConfig,
     #[serde(default)]
     pub daemon: DaemonConfig,
+    #[serde(default)]
+    pub gpu: GpuConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CivitaiConfig {
     pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HuggingfaceConfig {
+    /// Access token for gated or private repositories. Public files need none.
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GpuConfig {
+    /// Overrides the detected VRAM capacity (bytes) used to judge whether a
+    /// model bundle can run. Set this when detection is wrong or when sizing
+    /// downloads for another machine.
+    pub vram_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +118,13 @@ pub fn xdg_data_home() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".local/share"))
+}
+
+/// Returns `$XDG_CACHE_HOME`, falling back to `$HOME/.cache`.
+pub fn xdg_cache_home() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".cache"))
 }
 
 fn home_dir() -> PathBuf {
