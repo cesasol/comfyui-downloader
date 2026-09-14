@@ -1314,7 +1314,12 @@ mod tests {
     fn test_requeue_one_preserves_uuid_and_clears_path() {
         let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
         let job = catalog
-            .enqueue("https://civitai.com/models/1", None, DownloadReason::CliAdd, None)
+            .enqueue(
+                "https://civitai.com/models/1",
+                None,
+                DownloadReason::CliAdd,
+                None,
+            )
             .unwrap();
         let original_id = job.id;
         catalog
@@ -1345,7 +1350,12 @@ mod tests {
     fn test_requeue_one_errors_on_wrong_state() {
         let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
         let job = catalog
-            .enqueue("https://civitai.com/models/2", None, DownloadReason::CliAdd, None)
+            .enqueue(
+                "https://civitai.com/models/2",
+                None,
+                DownloadReason::CliAdd,
+                None,
+            )
             .unwrap();
         // Advance to Failed without going through Done.
         catalog

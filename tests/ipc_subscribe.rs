@@ -2,9 +2,9 @@
 //! client observes the corresponding snapshot frames.
 
 use comfyui_downloader::catalog::Catalog;
-use comfyui_downloader::daemon::events::{new_bus, Event, EventBus};
-use comfyui_downloader::ipc::protocol::{Frame, Request};
+use comfyui_downloader::daemon::events::{Event, EventBus, new_bus};
 use comfyui_downloader::ipc::IpcServer;
+use comfyui_downloader::ipc::protocol::{Frame, Request};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
