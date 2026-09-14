@@ -246,6 +246,23 @@ fn model_type_from_path(models_dir: &Path, path: &Path) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+async fn compute_sha256(path: PathBuf) -> anyhow::Result<String> {
+    tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::open(&path)?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 128 * 1024];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(hex::encode(hasher.finalize()))
+    })
+    .await?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,21 +371,4 @@ mod tests {
             std::fs::metadata(stub_path("model.stub.safetensors")).expect("stub binary missing");
         assert_eq!(meta.len(), 100);
     }
-}
-
-async fn compute_sha256(path: PathBuf) -> anyhow::Result<String> {
-    tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::open(&path)?;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 128 * 1024];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-        Ok(hex::encode(hasher.finalize()))
-    })
-    .await?
 }
