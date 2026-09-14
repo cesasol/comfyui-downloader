@@ -3,5 +3,6 @@ pub(crate) mod civitai;
 pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod huggingface;
 pub mod ipc;
 pub(crate) mod safetensor;
