@@ -1,6 +1,6 @@
 # comfyui-downloader
 
-A Rust daemon that downloads, catalogs, and manages AI models from CivitAI into a directory structure compatible with ComfyUI.
+A Rust daemon that downloads, catalogs, and manages AI models from CivitAI and HuggingFace into a directory structure compatible with ComfyUI.
 
 ## Overview
 
@@ -9,6 +9,9 @@ A Rust daemon that downloads, catalogs, and manages AI models from CivitAI into 
 ## Features
 
 - **Download queue** — enqueue model downloads; the daemon processes them with configurable concurrency (default: 1)
+- **HuggingFace downloads** — enqueue any HuggingFace file URL; the subdirectory is derived from the path inside the repo, and the LFS SHA-256 is verified after download (a token is only needed for gated repos)
+- **ComfyUI template picker** — `comfyui-dl templates` browses the official ComfyUI workflow templates, filters them by generation type, task, or model family, and queues one, many, or all of them with their complete model dependency set
+- **VRAM feasibility tiers** — detects the local GPU and classifies every template as fitting in VRAM, needing CPU offload for the text encoders and VAE, or unable to run at all (hidden by default)
 - **Download resume** — resumes interrupted downloads using HTTP range requests when the server supports it
 - **Metadata sidecars** — writes a `.metadata.json` file alongside each downloaded model containing the SHA-256 hash, CivitAI API response, base model, preview path, and more
 - **Preview images** — downloads and saves the CivitAI preview image (`model.preview.jpg/webp`) next to each model file
@@ -103,7 +106,10 @@ Configuration is read from `$XDG_CONFIG_HOME/comfyui-downloader/config.toml` (de
 
 ```toml
 [civitai]
-api_key = ""              # CivitAI API key (required)
+api_key = ""              # CivitAI API key (required for CivitAI downloads)
+
+[huggingface]
+token = ""                # Optional; only needed for gated or private repos
 
 [paths]
 models_dir = "~/.local/share/comfyui/models"
@@ -113,6 +119,9 @@ update_interval_hours = 24
 max_concurrent_downloads = 1
 socket_path = "/run/user/$UID/comfyui-downloader.sock"
 skip_early_access = true  # Skip EarlyAccess model versions when resolving latest
+
+[gpu]
+vram_bytes = 0            # Optional override of the detected VRAM capacity
 ```
 
 The API key can also be set without editing the file manually:
@@ -130,6 +139,12 @@ comfyui-dl set-key <your-api-key>
 # Add a model by CivitAI URL
 comfyui-dl add https://civitai.com/models/12345
 comfyui-dl add https://civitai.com/models/12345?modelVersionId=67890
+
+# Add a model by HuggingFace file URL (resolve/ or blob/ links both work).
+# The target subdirectory is taken from the path inside the repo
+# (split_files/vae/ae.safetensors -> vae/), or from --model-type.
+comfyui-dl add https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors
+comfyui-dl add https://huggingface.co/org/repo/resolve/main/model.safetensors --model-type diffusion_models
 
 # Show daemon status, active downloads, and free disk space
 comfyui-dl status
@@ -152,6 +167,53 @@ comfyui-dl cancel <uuid>
 # Delete a model by job ID (removes files and catalog entry)
 comfyui-dl delete <uuid>
 ```
+
+### ComfyUI Template Picker
+
+`comfyui-dl templates` fetches the ComfyUI default workflow-template catalog
+(`Comfy-Org/workflow_templates`), resolves the model files each template needs
+from HuggingFace, and lets you pick one, many, or all of them. Everything shown
+is selected by default — press Enter to queue the lot.
+
+Selecting a template always queues its **complete dependency set**: diffusion
+model (or checkpoint), text encoders, VAE, LoRAs and any helper models, each
+routed to its ComfyUI subdirectory. Files shared between templates are queued
+once.
+
+Each template is judged against the detected GPU:
+
+| Tier | Meaning |
+|---|---|
+| fits in VRAM | All weights plus the activation working set fit on the card |
+| needs CPU offload | Fits only with the text encoders and VAE executed on the CPU |
+| will not run | The sampler weights alone exceed VRAM — hidden unless `--include-unrunnable` |
+
+```sh
+# Everything that can run on this GPU (interactive multi-select, all preselected)
+comfyui-dl templates
+
+# Filter by generation type: "all video models"
+comfyui-dl templates --type video
+
+# Filter by task tag: "all image edit models"
+comfyui-dl templates --task "image edit"
+
+# Filter by model family: "all Z-Image-Turbo"
+comfyui-dl templates --model z-image-turbo
+
+# Free text, combined filters, and only what fits without offloading
+comfyui-dl templates "upscale" --type image --comfortable-only
+
+# Show what cannot run, include cloud-API templates, refresh the cached catalog
+comfyui-dl templates --include-unrunnable --include-api --refresh
+
+# Non-interactive: queue every match; --json prints the resolved listing instead
+comfyui-dl templates --type audio --yes
+comfyui-dl templates --model wan2.2 --json
+```
+
+The catalog is cached under `$XDG_CACHE_HOME/comfyui-downloader/templates`
+(index for 6 hours, workflows for a week); `--refresh` bypasses it.
 
 ### Update Workflow
 
@@ -178,7 +240,9 @@ Communication over the Unix socket uses newline-delimited JSON:
 
 | Command | Payload | Description |
 |---|---|---|
-| `AddDownload` | `{ url, model_type? }` | Enqueue a CivitAI model URL |
+| `AddDownload` | `{ url, model_type? }` | Enqueue a CivitAI or HuggingFace model URL |
+| `AddDownloads` | `{ items: [{ url, model_type? }] }` | Enqueue several files at once (template picker) |
+| `ListTemplates` | `{ filter, refresh, include_unrunnable }` | ComfyUI templates with model bundles and VRAM verdicts |
 | `ListQueue` | — | Return current queue state |
 | `ListModels` | — | Return downloaded models from the catalog |
 | `ListModelsEnriched` | — | Return models enriched with sidecar metadata |

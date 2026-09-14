@@ -49,7 +49,9 @@ Communication between the CLI and daemon uses a Unix domain socket at `/run/user
 
 | `cmd` | Payload fields | Description |
 |---|---|---|
-| `add_download` | `url`, `model_type?` | Enqueue a CivitAI URL |
+| `add_download` | `url`, `model_type?` | Enqueue a CivitAI or HuggingFace URL |
+| `add_downloads` | `items[]` of `{url, model_type?}` | Enqueue several files at once (template picker) |
+| `list_templates` | `filter`, `refresh`, `include_unrunnable` | ComfyUI template bundles with VRAM verdicts |
 | `list_queue` | — | Return all jobs from the catalog |
 | `check_updates` | — | Trigger an immediate update scan |
 | `get_status` | — | Queue length, active progress, free disk bytes |
@@ -57,7 +59,32 @@ Communication between the CLI and daemon uses a Unix domain socket at `/run/user
 
 ### Server (`server.rs`)
 
-`IpcServer::serve` accepts connections in a `tokio::spawn` loop. Each connection gets its own task that reads lines, deserialises each into a `Request`, calls the handler closure, serialises the `Response`, and writes it back. Stale socket files are deleted on bind.
+`IpcServer::serve` accepts connections in a `tokio::spawn` loop. Each connection gets its own task that reads lines until EOF, deserialises each into a `Request`, calls the handler closure, serialises the `Response`, and writes it back — one connection therefore carries as many exchanges as the client sends, which the CLI depends on (`add` resolves version info first, `delete`/`cancel` resolve an ID prefix, the template picker lists before queueing). A `Subscribe` request takes over the connection for the streaming handler. Stale socket files are deleted on bind.
+
+---
+
+## Template catalog (`src/templates/`)
+
+The ComfyUI default workflow templates are published in `Comfy-Org/workflow_templates`. `TemplateCatalog` fetches `templates/index.json` (categories → templates with title, tags, model families and total size) and each matching template's workflow JSON, caching both under `$XDG_CACHE_HOME/comfyui-downloader/templates` (index 6 h, workflows 7 days).
+
+Model files are extracted from two sources and merged, deduplicated by URL:
+
+1. `nodes[].properties.models` — `{name, url, directory}`, authoritative for the target subdirectory.
+2. The `MarkdownNote` "Model links" section — `**role**` headings followed by `- [file](url)` links, used by templates that predate the node field. Role headings are normalised (`"Diffusion model"` → `diffusion_models`), and non-HuggingFace links (input assets, documentation) are discarded.
+
+File sizes and checksums come from one HuggingFace tree request per `(repo, revision, directory)` group, covering every file the templates reference there.
+
+### VRAM feasibility (`src/vram.rs`, `src/gpu.rs`)
+
+`gpu::detect_gpus` reads `mem_info_vram_total` for each `/sys/class/drm/card*` device (falling back to `nvidia-smi`), and `config.gpu.vram_bytes` overrides the result. A bundle's weights are split into GPU-resident roles (checkpoints, diffusion models, LoRAs, ControlNets) and offloadable roles (text encoders, VAE, CLIP vision, upscalers), then classified:
+
+| Tier | Condition |
+|---|---|
+| `comfortable` | all weights × overhead + activation headroom + driver reserve ≤ VRAM |
+| `cpu_offload` | only the GPU-resident half fits under the same budget |
+| `wont_run` | even the GPU-resident half does not fit |
+
+Activation headroom depends on the generation type (video reserves more than image, audio and LLM the least).
 
 ### Client (`client.rs`)
 
@@ -124,7 +151,9 @@ The semaphore permit is held by the spawned task and released automatically when
 
 ### Downloader (`downloader.rs`)
 
-**API resolution** (`resolve_version`): Before any HTTP download, the downloader calls the CivitAI API to obtain the authoritative download URL, expected SHA-256 hash, model type subdirectory, base model name, and preview image URL. Three resolution paths:
+**Source routing**: A job whose URL parses as a HuggingFace file reference (`src/huggingface`) is resolved against the HuggingFace tree API instead of CivitAI: the download URL is deterministic, the expected SHA-256 comes from the LFS object ID, and the target subdirectory comes from the job's `model_type` or from the file's directory inside the repo (`split_files/vae/ae.safetensors` → `vae`). HuggingFace downloads need no CivitAI key; the optional `huggingface.token` is sent only when configured, and a 401/403 reports the repo as possibly gated.
+
+**API resolution** (`resolve_version`): For CivitAI jobs, the downloader calls the CivitAI API to obtain the authoritative download URL, expected SHA-256 hash, model type subdirectory, base model name, and preview image URL. Three resolution paths:
 
 - Both `model_id` + `version_id` known → parallel `get_model` + `get_model_version` calls.
 - Only `version_id` → single `get_model_version` call.
