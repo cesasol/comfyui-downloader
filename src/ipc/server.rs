@@ -77,31 +77,31 @@ where
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    let line = match lines.next_line().await? {
-        Some(l) => l,
-        None => return Ok(()),
-    };
+    // One connection carries as many request/response exchanges as the client
+    // sends: the CLI resolves version info or an ID prefix before acting.
+    while let Some(line) = lines.next_line().await? {
+        let req = match serde_json::from_str::<Request>(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                let resp = Response::err(format!("bad request: {e}"));
+                let mut encoded = serde_json::to_string(&resp)?;
+                encoded.push('\n');
+                writer.write_all(encoded.as_bytes()).await?;
+                continue;
+            }
+        };
 
-    let req = match serde_json::from_str::<Request>(&line) {
-        Ok(r) => r,
-        Err(e) => {
-            let resp = Response::err(format!("bad request: {e}"));
-            let mut encoded = serde_json::to_string(&resp)?;
-            encoded.push('\n');
-            writer.write_all(encoded.as_bytes()).await?;
+        if matches!(req, Request::Subscribe) {
+            // A subscription takes over the connection until it disconnects.
+            let sw = SubscribeWriter { writer };
+            subscribe_handler(sw).await;
             return Ok(());
         }
-    };
 
-    if matches!(req, Request::Subscribe) {
-        let sw = SubscribeWriter { writer };
-        subscribe_handler(sw).await;
-        return Ok(());
+        let response = request_handler(req).await;
+        let mut encoded = serde_json::to_string(&response)?;
+        encoded.push('\n');
+        writer.write_all(encoded.as_bytes()).await?;
     }
-
-    let response = request_handler(req).await;
-    let mut encoded = serde_json::to_string(&response)?;
-    encoded.push('\n');
-    writer.write_all(encoded.as_bytes()).await?;
     Ok(())
 }
