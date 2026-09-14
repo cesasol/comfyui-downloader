@@ -139,7 +139,11 @@ async fn run_templates(
         serde_json::from_value(data).context("parsing template listing")?;
     let mut bundles = listing.bundles;
     if comfortable_only {
-        bundles.retain(|b| b.feasibility != Some(Feasibility::CpuOffload));
+        // Keep only bundles that fit outright; an unjudged bundle (no GPU
+        // figure) stays, anything needing offload or unable to run does not.
+        bundles.retain(|b| {
+            matches!(b.feasibility, Some(Feasibility::Comfortable)) || b.feasibility.is_none()
+        });
     }
     bundles.sort_by(|a, b| {
         a.feasibility
