@@ -7,5 +7,6 @@ pub mod gpu;
 pub mod huggingface;
 pub mod ipc;
 pub(crate) mod safetensor;
+pub mod secrets;
 pub mod templates;
 pub mod vram;

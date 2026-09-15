@@ -44,7 +44,7 @@ impl CivitaiClient {
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
         let key = self.api_key.as_deref().ok_or_else(|| {
             anyhow::anyhow!(
-                "CivitAI API key is not configured (set civitai.api_key in config.toml)"
+                "CivitAI API key is not configured (run `comfyui-dl set-key <KEY>` to store it in the keyring)"
             )
         })?;
         let mut attempts = 0u32;

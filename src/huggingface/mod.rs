@@ -227,7 +227,7 @@ impl HfClient {
                 }
                 status @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
                     anyhow::bail!(
-                        "HuggingFace HTTP {status} for {repo}/{dir}: the repo may be gated and a token may be required (set huggingface.token in config.toml)"
+                        "HuggingFace HTTP {status} for {repo}/{dir}: the repo may be gated and a token may be required (run `comfyui-dl set-key --service huggingface <TOKEN>`)"
                     );
                 }
                 StatusCode::NOT_FOUND => {
