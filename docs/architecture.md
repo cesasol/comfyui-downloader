@@ -59,7 +59,7 @@ Communication between the CLI and daemon uses a Unix domain socket at `/run/user
 
 ### Server (`server.rs`)
 
-`IpcServer::serve` accepts connections in a `tokio::spawn` loop. Each connection gets its own task that reads lines until EOF, deserialises each into a `Request`, calls the handler closure, serialises the `Response`, and writes it back — one connection therefore carries as many exchanges as the client sends, which the CLI depends on (`add` resolves version info first, `delete`/`cancel` resolve an ID prefix, the template picker lists before queueing). A `Subscribe` request takes over the connection for the streaming handler. Stale socket files are deleted on bind.
+`IpcServer::serve` accepts connections in a `tokio::spawn` loop. Each connection gets its own task that reads lines until EOF, deserialises each into a `Request`, calls the handler closure, serialises the `Response`, and writes it back — one connection therefore carries as many exchanges as the client sends, which the CLI depends on (`add` resolves version info first, `delete`/`cancel` resolve an ID prefix, the template picker lists before queueing). Stale socket files are deleted on bind.
 
 ---
 
@@ -248,7 +248,6 @@ Read from `$XDG_CONFIG_HOME/comfyui-downloader/config.toml` (default: `~/.config
 
 | Key | Default |
 |---|---|
-| `civitai.api_key` | `None` |
 | `paths.models_dir` | `$XDG_DATA_HOME/comfyui/models` |
 | `daemon.update_interval_hours` | `24` |
 | `daemon.max_concurrent_downloads` | `1` |
@@ -256,6 +255,22 @@ Read from `$XDG_CONFIG_HOME/comfyui-downloader/config.toml` (default: `~/.config
 | `daemon.skip_early_access` | `true` |
 
 XDG base directories are read from `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME`, falling back to `$HOME/.config` / `$HOME/.local/share`.
+
+The deprecated `civitai.api_key` and `huggingface.token` fields still deserialise, but they are not where credentials belong (see below).
+
+---
+
+## Credentials (`src/secrets.rs`)
+
+Secrets are kept in the freedesktop Secret Service over D-Bus (`org.freedesktop.secrets`: gnome-keyring, KWallet, ...) rather than in `config.toml`. `Store::open` negotiates one encrypted session and is reused for every credential; items are addressed by the attributes `application=comfyui-downloader` and `credential=civitai-api-key` / `huggingface-token`, so labels are cosmetic.
+
+`Config::resolve_credentials` runs once at daemon startup and fills `Config::secrets`, a `#[serde(skip)]` field that therefore can never be written back to disk. Resolution order per credential:
+
+1. keyring item, if present
+2. otherwise the plaintext config field, which is written into the keyring and stripped from `config.toml`
+3. if the Secret Service is unreachable, the plaintext field is used as-is and a warning is logged
+
+Runtime code never touches the config fields directly; it calls `Config::civitai_api_key()` / `Config::huggingface_token()`, which prefer the resolved secret and treat a blank value as unset. `comfyui-dl set-key [--service civitai|huggingface] <VALUE>` writes to the keyring without a daemon connection and clears any plaintext leftover.
 
 ---
 
