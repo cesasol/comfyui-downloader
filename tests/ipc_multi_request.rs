@@ -19,16 +19,13 @@ async fn one_connection_serves_multiple_requests() {
     let counter = handled.clone();
     tokio::spawn(async move {
         let _ = server
-            .serve(
-                move |_req| {
-                    let counter = counter.clone();
-                    async move {
-                        let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                        Response::ok(serde_json::json!({ "handled": n }))
-                    }
-                },
-                |_writer| async move {},
-            )
+            .serve(move |_req| {
+                let counter = counter.clone();
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    Response::ok(serde_json::json!({ "handled": n }))
+                }
+            })
             .await;
     });
 

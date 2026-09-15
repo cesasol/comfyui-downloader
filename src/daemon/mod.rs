@@ -1,5 +1,4 @@
 pub mod downloader;
-pub mod events;
 pub mod notifier;
 pub mod queue;
 pub mod scanner;
@@ -20,7 +19,10 @@ use tokio::sync::{Mutex, Notify};
 use tracing::{info, warn};
 
 pub async fn run() -> Result<()> {
-    let config = Config::load()?;
+    let mut config = Config::load()?;
+    // Credentials live in the Secret Service; this also migrates any plaintext
+    // ones left in config.toml by an older version.
+    config.resolve_credentials().await?;
     config.save()?; // Persist any new fields added since the config was last written.
     info!("Loaded config from {}", Config::config_path().display());
     let config = Arc::new(config);
@@ -46,21 +48,29 @@ pub async fn run() -> Result<()> {
             Ok(n) => info!("Cancelled {n} pending job(s) whose version is already completed"),
             Err(e) => warn!("Startup cancellation of redundant pending jobs failed: {e:#}"),
         }
+        // Recover jobs stranded in `downloading`/`verifying` by a previous
+        // daemon that exited mid-download; otherwise they sit at 0% forever
+        // because the worker only ever selects `queued` rows.
+        match cat.requeue_interrupted() {
+            Ok(0) => {}
+            Ok(n) => info!("Re-queued {n} interrupted download(s) from a previous run"),
+            Err(e) => warn!("Startup re-queue of interrupted downloads failed: {e:#}"),
+        }
     }
 
-    let civitai = Arc::new(CivitaiClient::new(config.civitai.api_key.clone())?);
+    let civitai = Arc::new(CivitaiClient::new(
+        config.civitai_api_key().map(str::to_owned),
+    )?);
     let active: ActiveTasks = Arc::new(Mutex::new(HashMap::new()));
     let progress: ProgressMap = Arc::new(Mutex::new(HashMap::new()));
     let update_wake: Arc<Notify> = Arc::new(Notify::new());
-    let event_bus: crate::daemon::events::EventBus = crate::daemon::events::new_bus();
 
     let scanner_handle = {
         let cfg = config.clone();
         let civ = civitai.clone();
         let cat = catalog.clone();
-        let bus = event_bus.clone();
         tokio::spawn(async move {
-            scanner::run(cfg, civ, cat, bus).await;
+            scanner::run(cfg, civ, cat).await;
         })
     };
 
@@ -70,24 +80,8 @@ pub async fn run() -> Result<()> {
         let civ = civitai.clone();
         let act = active.clone();
         let prog = progress.clone();
-        let bus = event_bus.clone();
         tokio::spawn(async move {
-            queue::run(cfg, cat, civ, act, prog, bus).await;
-        })
-    };
-
-    let tick_handle = {
-        let bus = event_bus.clone();
-        let prog = progress.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                if !prog.lock().await.is_empty() {
-                    let _ = bus.send(crate::daemon::events::Event::ProgressTick);
-                }
-            }
+            queue::run(cfg, cat, civ, act, prog).await;
         })
     };
 
@@ -96,9 +90,8 @@ pub async fn run() -> Result<()> {
         let cat = catalog.clone();
         let civ = civitai.clone();
         let wake = update_wake.clone();
-        let bus = event_bus.clone();
         tokio::spawn(async move {
-            updater::run(cfg, cat, civ, wake, bus).await;
+            updater::run(cfg, cat, civ, wake).await;
         })
     };
 
@@ -109,43 +102,25 @@ pub async fn run() -> Result<()> {
     let act_h = active.clone();
     let prog_h = progress.clone();
     let wake_h = update_wake.clone();
-    let bus_h = event_bus.clone();
     let models_dir_h = config.paths.models_dir.clone();
     let civ_h = civitai.clone();
     let cfg_h = config.clone();
 
-    let cat_s = catalog.clone();
-    let prog_s = progress.clone();
-    let bus_s = event_bus.clone();
-    let models_dir_s = config.paths.models_dir.clone();
     server
-        .serve(
-            move |req| {
-                let cat = cat_h.clone();
-                let act = act_h.clone();
-                let prog = prog_h.clone();
-                let wake = wake_h.clone();
-                let bus = bus_h.clone();
-                let models_dir = models_dir_h.clone();
-                let civ = civ_h.clone();
-                let cfg = cfg_h.clone();
-                async move {
-                    handle_request(req, cat, act, prog, wake, bus, &models_dir, civ, cfg).await
-                }
-            },
-            move |writer| {
-                let cat = cat_s.clone();
-                let prog = prog_s.clone();
-                let bus = bus_s.clone();
-                let mdir = models_dir_s.clone();
-                async move { run_subscribe(writer, cat, prog, bus, mdir).await }
-            },
-        )
+        .serve(move |req| {
+            let cat = cat_h.clone();
+            let act = act_h.clone();
+            let prog = prog_h.clone();
+            let wake = wake_h.clone();
+            let models_dir = models_dir_h.clone();
+            let civ = civ_h.clone();
+            let cfg = cfg_h.clone();
+            async move { handle_request(req, cat, act, prog, wake, &models_dir, civ, cfg).await }
+        })
         .await?;
 
     scanner_handle.abort();
     queue_handle.abort();
-    tick_handle.abort();
     updater_handle.abort();
     Ok(())
 }
@@ -157,7 +132,6 @@ async fn handle_request(
     active: ActiveTasks,
     progress: ProgressMap,
     update_wake: Arc<Notify>,
-    bus: crate::daemon::events::EventBus,
     models_dir: &std::path::Path,
     civitai: Arc<crate::civitai::CivitaiClient>,
     config: Arc<crate::config::Config>,
@@ -175,11 +149,7 @@ async fn handle_request(
                 crate::catalog::DownloadReason::CliAdd,
                 preferred_file_name.as_deref(),
             ) {
-                Ok(job) => {
-                    let _ = bus.send(crate::daemon::events::Event::CatalogChanged);
-                    let _ = bus.send(crate::daemon::events::Event::QueueChanged);
-                    Response::ok(job)
-                }
+                Ok(job) => Response::ok(job),
                 Err(e) => Response::err(e.to_string()),
             }
         }
@@ -197,10 +167,6 @@ async fn handle_request(
                     Ok(job) => jobs.push(job),
                     Err(e) => errors.push(format!("{}: {e}", item.url)),
                 }
-            }
-            if !jobs.is_empty() {
-                let _ = bus.send(crate::daemon::events::Event::CatalogChanged);
-                let _ = bus.send(crate::daemon::events::Event::QueueChanged);
             }
             if jobs.is_empty() && !errors.is_empty() {
                 Response::err(errors.join("; "))
@@ -300,14 +266,13 @@ async fn handle_request(
                             warn!("Failed to delete file {}: {}", path.display(), e);
                         }
                     }
-                    let _ = bus.send(crate::daemon::events::Event::CatalogChanged);
                     Response::ok(serde_json::json!({ "deleted": id }))
                 }
                 Err(e) => Response::err(e.to_string()),
             }
         }
         Request::GetStatus => {
-            let snap = build_snapshot(&catalog, &progress, models_dir, false, false, 0).await;
+            let snap = build_snapshot(&catalog, &progress, models_dir).await;
             Response::ok(snap)
         }
         Request::CheckUpdates => {
@@ -325,15 +290,11 @@ async fn handle_request(
                 }
             };
             if cancelled {
-                let _ = bus.send(crate::daemon::events::Event::QueueChanged);
                 Response::ok(serde_json::json!({ "cancelled": id }))
             } else {
                 let cat = catalog.lock().await;
                 match cat.set_status(id, crate::catalog::JobStatus::Cancelled, None) {
-                    Ok(()) => {
-                        let _ = bus.send(crate::daemon::events::Event::QueueChanged);
-                        Response::ok(serde_json::json!({ "cancelled": id }))
-                    }
+                    Ok(()) => Response::ok(serde_json::json!({ "cancelled": id })),
                     Err(e) => Response::err(e.to_string()),
                 }
             }
@@ -348,14 +309,10 @@ async fn handle_request(
         Request::RedownloadMissing { all } => {
             let cat = catalog.lock().await;
             match cat.requeue_done(!all) {
-                Ok(jobs) => {
-                    let _ = bus.send(crate::daemon::events::Event::CatalogChanged);
-                    let _ = bus.send(crate::daemon::events::Event::QueueChanged);
-                    Response::ok(serde_json::json!({
-                        "requeued": jobs.len(),
-                        "jobs": jobs,
-                    }))
-                }
+                Ok(jobs) => Response::ok(serde_json::json!({
+                    "requeued": jobs.len(),
+                    "jobs": jobs,
+                })),
                 Err(e) => Response::err(e.to_string()),
             }
         }
@@ -368,8 +325,6 @@ async fn handle_request(
             match cat.enqueue(&url, None, crate::catalog::DownloadReason::CliAdd, None) {
                 Ok(job) => {
                     let _ = cat.clear_update_flag(model_id);
-                    let _ = bus.send(crate::daemon::events::Event::CatalogChanged);
-                    let _ = bus.send(crate::daemon::events::Event::QueueChanged);
                     Response::ok(job)
                 }
                 Err(e) => Response::err(e.to_string()),
@@ -378,103 +333,12 @@ async fn handle_request(
         Request::RedownloadModel { id } => {
             let cat = catalog.lock().await;
             match cat.requeue_one(id) {
-                Ok(job) => {
-                    let _ = bus.send(crate::daemon::events::Event::CatalogChanged);
-                    let _ = bus.send(crate::daemon::events::Event::QueueChanged);
-                    Response::ok(job)
-                }
+                Ok(job) => Response::ok(job),
                 Err(e) => Response::err(e.to_string()),
             }
         }
-        Request::Subscribe => {
-            Response::err("subscribe is a streaming variant; not yet implemented in this build")
-        }
     }
 }
-
-pub async fn run_subscribe(
-    mut writer: crate::ipc::server::SubscribeWriter,
-    catalog: Arc<Mutex<Catalog>>,
-    progress: ProgressMap,
-    bus: crate::daemon::events::EventBus,
-    models_dir: std::path::PathBuf,
-) {
-    use crate::daemon::events::Event;
-    use crate::ipc::protocol::Frame;
-
-    if writer.send(&Frame::Subscribed).await.is_err() {
-        return;
-    }
-
-    let mut rx = bus.subscribe();
-    let mut seq: u64 = 0;
-    let mut catalog_dirty = false;
-    let mut updates_dirty = false;
-
-    // Initial snapshot.
-    seq += 1;
-    let snap = build_snapshot(&catalog, &progress, &models_dir, false, false, seq).await;
-    if writer.send(&Frame::Snapshot(snap)).await.is_err() {
-        return;
-    }
-
-    loop {
-        let event = match rx.recv().await {
-            Ok(ev) => ev,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                // Re-sync: send a fresh full snapshot.
-                seq += 1;
-                let snap = build_snapshot(&catalog, &progress, &models_dir, true, true, seq).await;
-                if writer.send(&Frame::Snapshot(snap)).await.is_err() {
-                    return;
-                }
-                continue;
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-        };
-
-        match event {
-            Event::CatalogChanged => catalog_dirty = true,
-            Event::UpdatesChanged => updates_dirty = true,
-            Event::QueueChanged | Event::ProgressTick => {}
-        }
-
-        // Coalesce: drain anything else that arrived in the last 10 ms.
-        let coalesce = tokio::time::sleep(std::time::Duration::from_millis(10));
-        tokio::pin!(coalesce);
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut coalesce => break,
-                ev = rx.recv() => match ev {
-                    Ok(Event::CatalogChanged) => catalog_dirty = true,
-                    Ok(Event::UpdatesChanged) => updates_dirty = true,
-                    Ok(_) => {}
-                    Err(_) => break,
-                },
-            }
-        }
-
-        seq += 1;
-        let snap = build_snapshot(
-            &catalog,
-            &progress,
-            &models_dir,
-            catalog_dirty,
-            updates_dirty,
-            seq,
-        )
-        .await;
-        catalog_dirty = false;
-        updates_dirty = false;
-        if writer.send(&Frame::Snapshot(snap)).await.is_err() {
-            return;
-        }
-    }
-}
-
-#[doc(hidden)]
-pub use run_subscribe as run_subscribe_for_test;
 
 /// Fetch the ComfyUI template catalog, resolve the model bundles of everything
 /// matching `filter`, and judge each bundle against the local GPU.
@@ -501,7 +365,7 @@ async fn list_templates(
         .filter(|entry| filter.matches(entry))
         .collect();
 
-    let hf = crate::huggingface::HfClient::new(config.huggingface.token.clone())?;
+    let hf = crate::huggingface::HfClient::new(config.huggingface_token().map(str::to_owned))?;
     let resolved = catalog.bundles(entries, &hf, vram_bytes, refresh).await?;
     let (bundles, hidden_unrunnable) =
         crate::templates::prune_bundles(resolved, include_unrunnable);
@@ -518,9 +382,6 @@ async fn build_snapshot(
     catalog: &Arc<Mutex<Catalog>>,
     progress: &ProgressMap,
     models_dir: &std::path::Path,
-    catalog_dirty: bool,
-    updates_dirty: bool,
-    seq: u64,
 ) -> Snapshot {
     let queued_jobs = {
         let cat = catalog.lock().await;
@@ -559,9 +420,6 @@ async fn build_snapshot(
         active,
         queued,
         free_bytes,
-        catalog_dirty,
-        updates_dirty,
-        seq,
     }
 }
 
@@ -757,12 +615,7 @@ mod tests {
             m
         }));
 
-        let snap = build_snapshot(&catalog, &progress, tmp.path(), false, false, 7).await;
-
-        // Sequence number must be propagated.
-        assert_eq!(snap.seq, 7);
-        assert!(!snap.catalog_dirty);
-        assert!(!snap.updates_dirty);
+        let snap = build_snapshot(&catalog, &progress, tmp.path()).await;
 
         // Active jobs: exactly the one we put in the ProgressMap.
         assert_eq!(snap.active.len(), 1);
