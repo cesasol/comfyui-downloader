@@ -25,11 +25,15 @@ pub struct DownloadJob {
     pub available_version_name: Option<String>,
     pub last_update_check: Option<DateTime<Utc>>,
     pub preferred_file_name: Option<String>,
+    /// SHA-256 of the file content, when known. Populated from the source
+    /// metadata before download and reconciled with the computed digest after.
+    /// Used to deduplicate byte-identical files across repos and platforms.
+    pub sha256: Option<String>,
 }
 
 const JOB_COLUMNS: &str = "id, url, model_id, version_id, model_type, dest_path, status, \
      created_at, updated_at, error, download_reason, \
-     available_version_id, available_version_name, last_update_check, preferred_file_name";
+     available_version_id, available_version_name, last_update_check, preferred_file_name, sha256";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -216,6 +220,47 @@ impl Catalog {
             params![path.to_string_lossy().as_ref(), now, id.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Record the SHA-256 of a job's file. Stored lowercase so lookups are
+    /// case-insensitive across sources (CivitAI and HuggingFace differ).
+    pub fn set_sha256(&self, id: Uuid, sha256: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE jobs SET sha256 = ?1, updated_at = ?2 WHERE id = ?3",
+            params![sha256.to_ascii_lowercase(), now, id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Find a completed job whose file has the given SHA-256 and still exists on
+    /// disk. Excludes `exclude_id` so a job never matches itself. This is the
+    /// content-addressed dedup: it catches byte-identical files served from a
+    /// different repo or platform (HuggingFace vs CivitAI), which URL/version
+    /// matching cannot see through.
+    pub fn find_done_job_by_sha256(
+        &self,
+        sha256: &str,
+        exclude_id: Uuid,
+    ) -> Result<Option<DownloadJob>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {JOB_COLUMNS} FROM jobs \
+             WHERE sha256 = ?1 AND status = 'done' AND id != ?2 \
+             ORDER BY created_at ASC"
+        ))?;
+        let mut rows = stmt.query(params![sha256.to_ascii_lowercase(), exclude_id.to_string()])?;
+        while let Some(row) = rows.next()? {
+            let job = row_to_job(row)?;
+            // A `done` row whose file was deleted is stale; keep looking.
+            if job
+                .dest_path
+                .as_ref()
+                .is_some_and(|p| std::path::Path::new(p).exists())
+            {
+                return Ok(Some(job));
+            }
+        }
+        Ok(None)
     }
 
     pub fn count_by_status(&self, status: JobStatus) -> Result<u64> {
@@ -549,6 +594,21 @@ impl Catalog {
             Ok(None)
         }
     }
+
+    /// Reset jobs left mid-flight by a crashed or restarted daemon back to
+    /// `queued` so the worker picks them up again. `Downloading`/`Verifying`
+    /// rows only ever reach a terminal state through a running worker; if the
+    /// process dies first they are stranded, since `next_queued` never selects
+    /// them. Returns the number of jobs that were re-queued.
+    pub fn requeue_interrupted(&self) -> Result<usize> {
+        let now = Utc::now().to_rfc3339();
+        let count = self.conn.execute(
+            "UPDATE jobs SET status = 'queued', error = NULL, updated_at = ?1 \
+             WHERE status IN ('downloading', 'verifying')",
+            params![now],
+        )?;
+        Ok(count)
+    }
 }
 
 /// Extract (model_id, version_id) from a CivitAI URL.
@@ -596,6 +656,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadJob> {
         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
         .map(|dt| dt.with_timezone(&Utc));
     let preferred_file_name: Option<String> = row.get(14)?;
+    let sha256: Option<String> = row.get(15)?;
     Ok(DownloadJob {
         id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
         url: row.get(1)?,
@@ -616,6 +677,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadJob> {
         available_version_name: row.get(12)?,
         last_update_check,
         preferred_file_name,
+        sha256,
     })
 }
 
@@ -1344,6 +1406,161 @@ mod tests {
         let queued = catalog.list_queued().unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].id, original_id);
+    }
+
+    #[test]
+    fn test_requeue_interrupted_resets_stranded_jobs() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let downloading = catalog
+            .enqueue(
+                "https://civitai.com/models/1",
+                None,
+                DownloadReason::CliAdd,
+                None,
+            )
+            .unwrap();
+        let verifying = catalog
+            .enqueue(
+                "https://civitai.com/models/2",
+                None,
+                DownloadReason::CliAdd,
+                None,
+            )
+            .unwrap();
+        let queued = catalog
+            .enqueue(
+                "https://civitai.com/models/3",
+                None,
+                DownloadReason::CliAdd,
+                None,
+            )
+            .unwrap();
+        catalog
+            .set_status(downloading.id, JobStatus::Downloading, None)
+            .unwrap();
+        catalog
+            .set_status(verifying.id, JobStatus::Verifying, Some("stale"))
+            .unwrap();
+
+        let n = catalog.requeue_interrupted().unwrap();
+        assert_eq!(n, 2, "only downloading/verifying rows are re-queued");
+
+        assert_eq!(
+            catalog.get_job(downloading.id).unwrap().unwrap().status,
+            JobStatus::Queued
+        );
+        let recovered = catalog.get_job(verifying.id).unwrap().unwrap();
+        assert_eq!(recovered.status, JobStatus::Queued);
+        assert!(recovered.error.is_none(), "stale error must be cleared");
+        // An already-queued job is untouched (and not double-counted).
+        assert_eq!(
+            catalog.get_job(queued.id).unwrap().unwrap().status,
+            JobStatus::Queued
+        );
+    }
+
+    #[test]
+    fn test_find_done_job_by_sha256_matches_existing_file_on_disk() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog
+            .enqueue(
+                "https://huggingface.co/org/repo/resolve/main/a.safetensors",
+                None,
+                DownloadReason::CliAdd,
+                None,
+            )
+            .unwrap();
+        let tmp = std::env::temp_dir().join(format!("sha-dedup-{}.bin", job.id));
+        std::fs::write(&tmp, b"content").unwrap();
+        catalog.set_dest_path(job.id, &tmp).unwrap();
+        catalog.set_sha256(job.id, "ABCDEF").unwrap();
+        catalog.set_status(job.id, JobStatus::Done, None).unwrap();
+
+        // Case-insensitive match, and the querying job excludes itself.
+        let other = Uuid::new_v4();
+        let found = catalog.find_done_job_by_sha256("abcdef", other).unwrap();
+        assert!(found.is_some(), "identical hash must match");
+        assert_eq!(found.unwrap().id, job.id);
+
+        // A job never dedups against itself.
+        let self_match = catalog.find_done_job_by_sha256("abcdef", job.id).unwrap();
+        assert!(self_match.is_none());
+
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_find_done_job_by_sha256_skips_missing_file() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog
+            .enqueue(
+                "https://civitai.com/models/1?modelVersionId=2",
+                None,
+                DownloadReason::CliAdd,
+                None,
+            )
+            .unwrap();
+        // Point at a path that does not exist: a stale done row must not match.
+        catalog
+            .set_dest_path(
+                job.id,
+                std::path::Path::new("/nonexistent/model.safetensors"),
+            )
+            .unwrap();
+        catalog.set_sha256(job.id, "deadbeef").unwrap();
+        catalog.set_status(job.id, JobStatus::Done, None).unwrap();
+
+        let found = catalog
+            .find_done_job_by_sha256("deadbeef", Uuid::new_v4())
+            .unwrap();
+        assert!(
+            found.is_none(),
+            "stale done row (file gone) must be skipped"
+        );
+    }
+
+    #[test]
+    fn test_find_done_job_by_sha256_ignores_non_done_status() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog
+            .enqueue(
+                "https://civitai.com/models/3",
+                None,
+                DownloadReason::CliAdd,
+                None,
+            )
+            .unwrap();
+        let tmp = std::env::temp_dir().join(format!("sha-nondone-{}.bin", job.id));
+        std::fs::write(&tmp, b"x").unwrap();
+        catalog.set_dest_path(job.id, &tmp).unwrap();
+        catalog.set_sha256(job.id, "cafe").unwrap();
+        // Still downloading, not done -> must not be a dedup target.
+        catalog
+            .set_status(job.id, JobStatus::Downloading, None)
+            .unwrap();
+
+        let found = catalog
+            .find_done_job_by_sha256("cafe", Uuid::new_v4())
+            .unwrap();
+        assert!(found.is_none());
+
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_set_sha256_stores_lowercase() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog
+            .enqueue(
+                "https://civitai.com/models/9",
+                None,
+                DownloadReason::CliAdd,
+                None,
+            )
+            .unwrap();
+        catalog.set_sha256(job.id, "AABBCCDD").unwrap();
+        let after = catalog.get_job(job.id).unwrap().unwrap();
+        assert_eq!(after.sha256.as_deref(), Some("aabbccdd"));
     }
 
     #[test]
