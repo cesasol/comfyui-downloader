@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Credentials in the system keyring** — the CivitAI API key and the HuggingFace token are stored in the freedesktop Secret Service (`org.freedesktop.secrets`) instead of plaintext `config.toml`; `comfyui-dl set-key` writes there and gained `--service civitai|huggingface`. Existing plaintext values are migrated into the keyring on daemon startup and removed from the file, and remain a fallback when no Secret Service is reachable
+
+### Removed
+
+- **Tauri desktop app** — the Svelte GUI, the `src-tauri` crate, the desktop entry and its icon, and the AppImage build are gone; the daemon is driven by `comfyui-dl` only
+- **Streaming subscription IPC** — the `subscribe` request, its `Frame` snapshot stream, and the daemon event bus that fed the planned terminal UI; `get_status` still reports queue and progress on demand
+
 ## [0.1.0] - 2026-03-26
 
 ### Added
