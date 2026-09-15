@@ -1,11 +1,13 @@
 use crate::config::Config;
 use crate::ipc::protocol::{FileVariantInfo, QueueItem, TemplateListing, VersionInfo};
 use crate::ipc::{IpcClient, Request, Response};
+use crate::secrets;
 use crate::templates::{TemplateBundle, TemplateFilter};
 use crate::vram::{Feasibility, WorkloadKind};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
+use console::{Alignment, Key, Term, measure_text_width, pad_str, style, truncate_str};
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
 use uuid::Uuid;
@@ -38,8 +40,16 @@ enum Command {
     Cancel {
         id: String,
     },
+    /// Store an API credential in the system keyring (Secret Service).
+    ///
+    /// Omit KEY to enter it at a hidden prompt; passing it inline leaks the
+    /// secret into your shell history. The key can also be piped on stdin.
     SetKey {
-        key: String,
+        /// The credential value. Omit to type it at a hidden prompt.
+        key: Option<String>,
+        /// Which credential to store: civitai (default) or huggingface.
+        #[arg(long, value_name = "SERVICE", default_value = "civitai")]
+        service: String,
     },
     Updates,
     DownloadVersion {
@@ -174,17 +184,20 @@ async fn run_templates(
         return Ok(());
     }
 
-    let items: Vec<String> = bundles.iter().map(format_bundle).collect();
+    let rows: Vec<PickRow> = bundles.iter().map(PickRow::from_bundle).collect();
     let selected: Vec<usize> = if yes || !std::io::stdout().is_terminal() {
         (0..bundles.len()).collect()
     } else {
-        println!("\nSpace toggles, Enter confirms. Everything is selected by default.");
-        dialoguer::MultiSelect::new()
-            .with_prompt("Models to download")
-            .items(&items)
-            .defaults(&vec![true; bundles.len()])
-            .interact()
-            .context("template selection cancelled")?
+        match multi_select(
+            "Models to download (nothing is selected by default):",
+            &rows,
+        )? {
+            Some(sel) => sel,
+            None => {
+                println!("Selection cancelled.");
+                return Ok(());
+            }
+        }
     };
 
     if selected.is_empty() {
@@ -239,22 +252,220 @@ fn parse_kind(raw: &str) -> Result<WorkloadKind> {
     Ok(kind)
 }
 
-fn format_bundle(bundle: &TemplateBundle) -> String {
-    let tier = match bundle.feasibility {
-        Some(Feasibility::Comfortable) => "fits in VRAM",
-        Some(Feasibility::CpuOffload) => "needs CPU offload for encoders/VAE",
-        Some(Feasibility::WontRun) => "will not run",
-        None => "unknown fit",
-    };
-    let roles: Vec<&str> = bundle.models_by_role().keys().copied().collect();
-    format!(
-        "{}  [{}]  {}  — {tier}  ({} files: {})",
-        bundle.template.title,
-        kind_label(bundle.template.kind),
-        format_bytes(bundle.download_bytes),
-        bundle.models.len(),
-        roles.join(", ")
-    )
+/// One selectable template rendered as a set of aligned table cells.
+struct PickRow {
+    title: String,
+    kind: &'static str,
+    size: String,
+    tier: &'static str,
+    feasibility: Option<Feasibility>,
+    files: String,
+}
+
+impl PickRow {
+    fn from_bundle(bundle: &TemplateBundle) -> Self {
+        let roles: Vec<&str> = bundle.models_by_role().keys().copied().collect();
+        let tier = match bundle.feasibility {
+            Some(Feasibility::Comfortable) => "fits",
+            Some(Feasibility::CpuOffload) => "offload",
+            Some(Feasibility::WontRun) => "won't run",
+            None => "unknown",
+        };
+        Self {
+            title: bundle.template.title.clone(),
+            kind: kind_label(bundle.template.kind),
+            size: format_bytes(bundle.download_bytes),
+            tier,
+            feasibility: bundle.feasibility,
+            files: format!("{} files: {}", bundle.models.len(), roles.join(", ")),
+        }
+    }
+}
+
+/// Pad `s` to exactly `width` display columns, ellipsizing only when it is
+/// strictly wider (`pad_str` alone truncates exact-fit strings too).
+fn fit(s: &str, width: usize, align: Alignment) -> String {
+    if measure_text_width(s) > width {
+        let truncated = truncate_str(s, width, "\u{2026}");
+        pad_str(&truncated, width, align, None).into_owned()
+    } else {
+        pad_str(s, width, align, None).into_owned()
+    }
+}
+
+/// Colour the feasibility cell by tier: green fits, yellow offload, red won't
+/// run, dim unknown.
+fn tier_cell(text: std::borrow::Cow<'_, str>, feasibility: Option<Feasibility>) -> String {
+    let styled = style(text);
+    match feasibility {
+        Some(Feasibility::Comfortable) => styled.green(),
+        Some(Feasibility::CpuOffload) => styled.yellow(),
+        Some(Feasibility::WontRun) => styled.red(),
+        None => styled.dim(),
+    }
+    .to_string()
+}
+
+/// Restore the terminal cursor no matter how the picker loop exits.
+struct CursorGuard<'a>(&'a Term);
+
+impl Drop for CursorGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.show_cursor();
+    }
+}
+
+/// Scrolling multi-select picker. Nothing is selected by default; returns the
+/// chosen indices, or `None` when the user cancels.
+///
+/// Keys: arrows move, space or `x` toggle the row, `a` toggles select-all,
+/// backspace clears every selection, enter confirms, esc/`q` cancels.
+fn multi_select(prompt: &str, rows: &[PickRow]) -> Result<Option<Vec<usize>>> {
+    let len = rows.len();
+    if len == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    let term = Term::stderr();
+    let (term_rows, term_cols) = term.size();
+    let cols = term_cols as usize;
+    // Reserve rows for the prompt, key legend, table header, footer and a spare.
+    let page = (term_rows as usize).saturating_sub(5).clamp(1, len);
+
+    // Column widths, sized to the widest cell (and the heading) in each column.
+    let kind_w = rows.iter().map(|r| r.kind.len()).chain([4]).max().unwrap();
+    let size_w = rows
+        .iter()
+        .map(|r| measure_text_width(&r.size))
+        .chain([4])
+        .max()
+        .unwrap();
+    let tier_w = rows.iter().map(|r| r.tier.len()).chain([3]).max().unwrap();
+    // Fixed chrome: pointer, checkbox and the five 2-space gaps between cells.
+    let fixed = 15 + kind_w + size_w + tier_w;
+    let avail = cols.saturating_sub(fixed).max(24);
+    let max_title = rows
+        .iter()
+        .map(|r| measure_text_width(&r.title))
+        .chain([8])
+        .max()
+        .unwrap();
+    let title_w = max_title.min(avail.saturating_sub(14)).max(8);
+    let files_w = avail.saturating_sub(title_w).max(6);
+
+    let mut checked = vec![false; len];
+    let mut cursor = 0usize;
+    let mut offset = 0usize;
+
+    term.write_line(&style(prompt).bold().to_string())?;
+    term.write_line(
+        &style("  arrows move \u{b7} space/x toggle \u{b7} a select all \u{b7} backspace clear \u{b7} enter confirm \u{b7} esc cancel")
+            .dim()
+            .to_string(),
+    )?;
+    // Table header aligned under the data columns (7 cols of pointer + box).
+    let header = format!(
+        "       {}  {}  {}  {}  {}",
+        pad_str("TEMPLATE", title_w, Alignment::Left, None),
+        pad_str("TYPE", kind_w, Alignment::Left, None),
+        pad_str("SIZE", size_w, Alignment::Right, None),
+        pad_str("FIT", tier_w, Alignment::Left, None),
+        "MODELS",
+    );
+    term.write_line(&style(header).bold().underlined().to_string())?;
+    term.hide_cursor()?;
+    let _guard = CursorGuard(&term);
+
+    let mut drawn = 0usize;
+    loop {
+        if cursor < offset {
+            offset = cursor;
+        } else if cursor >= offset + page {
+            offset = cursor + 1 - page;
+        }
+
+        if drawn > 0 {
+            term.clear_last_lines(drawn)?;
+        }
+        drawn = 0;
+
+        let end = (offset + page).min(len);
+        for (i, row) in rows.iter().enumerate().take(end).skip(offset) {
+            let on_cursor = i == cursor;
+            let pointer = if on_cursor {
+                style('>').cyan().bold().to_string()
+            } else {
+                " ".to_string()
+            };
+            let checkbox = if checked[i] {
+                style("[x]").green().to_string()
+            } else {
+                style("[ ]").dim().to_string()
+            };
+            let title = fit(&row.title, title_w, Alignment::Left);
+            let title = if on_cursor {
+                style(title).bold().to_string()
+            } else {
+                title
+            };
+            let kind = style(pad_str(row.kind, kind_w, Alignment::Left, None))
+                .cyan()
+                .to_string();
+            let size = style(pad_str(&row.size, size_w, Alignment::Right, None))
+                .dim()
+                .to_string();
+            let tier = tier_cell(
+                pad_str(row.tier, tier_w, Alignment::Left, None),
+                row.feasibility,
+            );
+            let files = style(truncate_str(&row.files, files_w, "\u{2026}"))
+                .dim()
+                .to_string();
+            term.write_line(&format!(
+                "{pointer} {checkbox}  {title}  {kind}  {size}  {tier}  {files}"
+            ))?;
+            drawn += 1;
+        }
+
+        let nsel = checked.iter().filter(|&&c| c).count();
+        let footer = if len > page {
+            format!(
+                "  {nsel}/{len} selected \u{b7} showing {}-{} of {len}",
+                offset + 1,
+                end
+            )
+        } else {
+            format!("  {nsel}/{len} selected")
+        };
+        term.write_line(&style(footer).dim().to_string())?;
+        drawn += 1;
+
+        match term.read_key()? {
+            Key::ArrowUp => cursor = if cursor == 0 { len - 1 } else { cursor - 1 },
+            Key::ArrowDown => cursor = (cursor + 1) % len,
+            Key::Char(' ') | Key::Char('x') | Key::Char('X') => checked[cursor] = !checked[cursor],
+            Key::Char('a') | Key::Char('A') => {
+                let all = checked.iter().all(|&c| c);
+                checked.iter_mut().for_each(|c| *c = !all);
+            }
+            Key::Backspace => checked.iter_mut().for_each(|c| *c = false),
+            Key::Enter => {
+                term.clear_last_lines(drawn)?;
+                let sel = checked
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &c)| c)
+                    .map(|(i, _)| i)
+                    .collect();
+                return Ok(Some(sel));
+            }
+            Key::Escape | Key::CtrlC | Key::Char('q') => {
+                term.clear_last_lines(drawn)?;
+                return Ok(None);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn kind_label(kind: WorkloadKind) -> &'static str {
@@ -317,16 +528,62 @@ fn format_variant(f: &FileVariantInfo) -> String {
     parts.join(" | ")
 }
 
+/// Stores a credential in the Secret Service and drops any plaintext copy
+/// left in `config.toml`.
+async fn set_key(key: Option<String>, service: &str) -> Result<()> {
+    let cred = secrets::parse_service(service)
+        .with_context(|| format!("unknown service {service:?}; expected civitai or huggingface"))?;
+
+    let raw = match key {
+        Some(inline) => inline,
+        None if std::io::stdin().is_terminal() => {
+            let term = Term::stderr();
+            term.write_str(&format!("Enter the {} key: ", cred.service_name()))?;
+            term.read_secure_line()
+                .context("reading the key from the terminal")?
+        }
+        None => {
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .context("reading the key from stdin")?;
+            line
+        }
+    };
+    let secret = secrets::non_empty(&raw).context("the credential is empty")?;
+
+    let store = secrets::Store::open().await.with_context(|| {
+        format!(
+            "no keyring available to store {}; start a Secret Service provider (gnome-keyring, kwallet) or set {} in {}",
+            cred.service_name(),
+            cred.config_field(),
+            Config::config_path().display()
+        )
+    })?;
+    store.set(cred, &secret).await?;
+    println!(
+        "Stored the {} credential in the system keyring.",
+        cred.service_name()
+    );
+
+    let mut config = Config::load()?;
+    if config.forget_plaintext(cred)? {
+        println!(
+            "Removed the plaintext {} from {}.",
+            cred.config_field(),
+            Config::config_path().display()
+        );
+    }
+    println!("Restart the daemon to pick it up.");
+    Ok(())
+}
+
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    // SetKey runs without a daemon connection — it writes directly to the config file.
-    if let Some(Command::SetKey { key }) = cli.command {
-        let mut config = Config::load()?;
-        config.civitai.api_key = Some(key);
-        config.save()?;
-        println!("API key saved to {}", Config::config_path().display());
-        return Ok(());
+    // SetKey runs without a daemon connection — it writes to the keyring.
+    if let Some(Command::SetKey { key, service }) = cli.command {
+        return set_key(key, &service).await;
     }
 
     let config = Config::load()?;
