@@ -1,5 +1,5 @@
 use anyhow::Result;
-use notify_rust::{Hint, Notification, Timeout};
+use notify_rust::{Hint, Notification, Timeout, Urgency};
 use std::path::Path;
 
 const TITLE: &str = "ComfyUI Downloader";
@@ -25,8 +25,10 @@ pub fn notify_error(msg: &str) -> Result<()> {
         .summary("error")
         .hint(notify_rust::Hint::SoundName(String::from("dialog-error")))
         .hint(Hint::Category("transfer.error".to_owned()))
+        .urgency(Urgency::Critical)
         .body(msg)
         .icon("dialog-error")
+        .timeout(Timeout::Never)
         .show()?;
     Ok(())
 }
