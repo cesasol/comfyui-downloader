@@ -2,7 +2,6 @@ use crate::catalog::Catalog;
 use crate::civitai::CivitaiClient;
 use crate::config::Config;
 use crate::daemon::downloader;
-use crate::daemon::events::EventBus;
 use hex;
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -26,13 +25,8 @@ const KNOWN_SUBDIRS: &[&str] = &[
     "other",
 ];
 
-pub async fn run(
-    config: Arc<Config>,
-    civitai: Arc<CivitaiClient>,
-    catalog: Arc<Mutex<Catalog>>,
-    _bus: EventBus,
-) {
-    if config.civitai.api_key.is_none() {
+pub async fn run(config: Arc<Config>, civitai: Arc<CivitaiClient>, catalog: Arc<Mutex<Catalog>>) {
+    if config.civitai_api_key().is_none() {
         warn!("Skipping startup scan: no CivitAI API key configured");
         return;
     }
@@ -158,6 +152,7 @@ async fn process_file(
         &download_url,
         model_id,
         Some(version_id),
+        Some(&sha256),
         catalog,
         models_dir,
     )
@@ -187,6 +182,7 @@ async fn register_from_metadata(
 
     let version_id = meta["civitai"]["id"].as_u64();
     let model_id = meta["civitai"]["modelId"].as_u64();
+    let sha256 = meta["sha256"].as_str();
     let download_url = meta["civitai"]["downloadUrl"]
         .as_str()
         .map(|s| s.to_string())
@@ -196,14 +192,19 @@ async fn register_from_metadata(
         return false;
     };
 
-    register_in_catalog(path, &url, model_id, version_id, catalog, models_dir).await
+    register_in_catalog(
+        path, &url, model_id, version_id, sha256, catalog, models_dir,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn register_in_catalog(
     path: &Path,
     url: &str,
     model_id: Option<u64>,
     version_id: Option<u64>,
+    sha256: Option<&str>,
     catalog: &Arc<Mutex<Catalog>>,
     models_dir: &Path,
 ) -> bool {
@@ -219,6 +220,13 @@ async fn register_in_catalog(
         None,
     ) {
         Ok(Some(job)) => {
+            // Record the content hash so this pre-existing file participates in
+            // content-addressed dedup for future downloads.
+            if let Some(sha256) = sha256
+                && let Err(e) = cat.set_sha256(job.id, sha256)
+            {
+                warn!("Failed to record sha256 for {}: {e}", path.display());
+            }
             info!(
                 "Registered {} in catalog (version_id={:?})",
                 path.display(),

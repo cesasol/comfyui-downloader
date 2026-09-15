@@ -1,4 +1,4 @@
-use crate::catalog::DownloadJob;
+use crate::catalog::{Catalog, DownloadJob};
 use crate::civitai::CivitaiClient;
 use crate::civitai::types::{ModelFile, ModelImage, ModelVersion};
 use crate::config::Config;
@@ -8,10 +8,26 @@ use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+/// Result of a completed (or deduplicated) download.
+pub struct DownloadOutcome {
+    /// Final on-disk location of the model file.
+    pub dest: PathBuf,
+    /// Resolved ComfyUI model-type subdir, when the source reported one.
+    pub model_type: Option<String>,
+    /// SHA-256 of the file content, when known. From the source metadata on a
+    /// deduplicated hit, or the computed digest after a real download.
+    pub sha256: Option<String>,
+    /// True when the bytes were reused from an existing identical file instead
+    /// of being downloaded again.
+    pub deduplicated: bool,
+}
 
 struct VersionResolution {
     download_url: String,
@@ -244,7 +260,7 @@ async fn resolve_huggingface(
     reference: &crate::huggingface::HfFileRef,
     config: &Config,
 ) -> Result<VersionResolution> {
-    let client = crate::huggingface::HfClient::new(config.huggingface.token.clone())?;
+    let client = crate::huggingface::HfClient::new(config.huggingface_token().map(str::to_owned))?;
     let meta = match client.file_meta(reference).await {
         Ok(meta) => Some(meta),
         Err(e) => {
@@ -289,28 +305,60 @@ fn with_auth(req: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::Requ
     }
 }
 
-/// Download the file for `job`, verify its checksum, and return `(dest_path, resolved_model_type)`.
-/// `resolved_model_type` is the CivitAI-reported subdir (e.g. "checkpoints") if available.
+/// Download the file for `job`, verify its checksum, and return a
+/// [`DownloadOutcome`] describing the final path, model type, and hash.
+///
+/// `catalog` is used for content-addressed deduplication: if another completed
+/// job already holds a byte-identical file (matched by the source-declared
+/// SHA-256, even from a different repo or platform), the transfer is skipped
+/// and that file's path is reused.
 pub async fn download(
     job: &DownloadJob,
     config: &Config,
     civitai: &CivitaiClient,
+    catalog: &Arc<Mutex<Catalog>>,
     token: CancellationToken,
     progress: ProgressMap,
-) -> Result<(PathBuf, Option<String>)> {
+) -> Result<DownloadOutcome> {
     let from_huggingface = crate::huggingface::is_huggingface_url(&job.url);
     let auth_token: Option<&str> = if from_huggingface {
         // Public HuggingFace files need no credentials; gated repos need a token.
-        config.huggingface.token.as_deref()
+        config.huggingface_token()
     } else {
-        Some(config.civitai.api_key.as_deref().ok_or_else(|| {
+        Some(config.civitai_api_key().ok_or_else(|| {
             anyhow::anyhow!(
-                "CivitAI API key is not configured (set civitai.api_key in config.toml)"
+                "CivitAI API key is not configured (run `comfyui-dl set-key <KEY>` to store it in the keyring)"
             )
         })?)
     };
 
     let resolution = resolve_version(job, civitai, config).await?;
+
+    // Content-addressed dedup: if the source declared a SHA-256 and another
+    // completed job already holds a file with that exact hash on disk, reuse it
+    // instead of downloading the same bytes again. This consolidates copies of
+    // the same file across repos and across HuggingFace and CivitAI.
+    if let Some(expected) = resolution.expected_hash.as_deref() {
+        let existing = {
+            let cat = catalog.lock().await;
+            cat.find_done_job_by_sha256(expected, job.id).ok().flatten()
+        };
+        if let Some(existing) = existing
+            && let Some(dest_path) = existing.dest_path.as_deref()
+        {
+            let dest = PathBuf::from(dest_path);
+            info!(
+                "Identical file already present (sha256 {expected}), reusing {}",
+                dest.display()
+            );
+            return Ok(DownloadOutcome {
+                dest,
+                model_type: resolution.model_type_subdir.clone(),
+                sha256: Some(expected.to_ascii_lowercase()),
+                deduplicated: true,
+            });
+        }
+    }
 
     let mut model_type_str = resolution
         .model_type_subdir
@@ -329,11 +377,21 @@ pub async fn download(
                 "File already exists, skipping download: {}",
                 existing.display()
             );
-            return Ok((existing, resolution.model_type_subdir));
+            return Ok(DownloadOutcome {
+                dest: existing,
+                model_type: resolution.model_type_subdir.clone(),
+                sha256: resolution
+                    .expected_hash
+                    .clone()
+                    .map(|h| h.to_ascii_lowercase()),
+                deduplicated: true,
+            });
         }
     }
 
-    fs::create_dir_all(&dest_dir).await?;
+    fs::create_dir_all(&dest_dir)
+        .await
+        .with_context(|| format!("creating model directory {}", dest_dir.display()))?;
 
     check_disk_space(&dest_dir)?;
 
@@ -387,7 +445,7 @@ pub async fn download(
         s @ (reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN) => {
             if from_huggingface {
                 bail!(
-                    "HuggingFace returned HTTP {s}: the repo may be gated — accept its licence and set huggingface.token in config.toml"
+                    "HuggingFace returned HTTP {s}: the repo may be gated — accept its licence and run `comfyui-dl set-key --service huggingface <TOKEN>`"
                 );
             }
             return Err(crate::civitai::CivitaiAccessError { status: s.as_u16() }.into());
@@ -475,9 +533,12 @@ pub async fn download(
             .create(true)
             .append(true)
             .open(&tmp)
-            .await?
+            .await
+            .with_context(|| format!("opening {} to resume download", tmp.display()))?
     } else {
-        File::create(&tmp).await?
+        File::create(&tmp)
+            .await
+            .with_context(|| format!("creating temporary file {}", tmp.display()))?
     };
     let mut hasher = Sha256::new();
     let mut stream = resp.bytes_stream();
@@ -490,7 +551,9 @@ pub async fn download(
                     Some(Ok(chunk)) => {
                         bytes_received += chunk.len() as u64;
                         hasher.update(&chunk);
-                        file.write_all(&chunk).await?;
+                        file.write_all(&chunk)
+                            .await
+                            .with_context(|| format!("writing to {}", tmp.display()))?;
                         {
                             let mut prog = progress.lock().await;
                             if let Some(entry) = prog.get_mut(&job.id) {
@@ -527,7 +590,9 @@ pub async fn download(
             }
         }
     }
-    file.flush().await?;
+    file.flush()
+        .await
+        .with_context(|| format!("flushing {}", tmp.display()))?;
     drop(file);
 
     if let Some(nid) = notif_id {
@@ -589,12 +654,16 @@ pub async fn download(
             if let Some(ref base_model) = resolution.base_model {
                 dest_dir = dest_dir.join(sanitize_dir_name(base_model));
             }
-            fs::create_dir_all(&dest_dir).await?;
+            fs::create_dir_all(&dest_dir)
+                .await
+                .with_context(|| format!("creating model directory {}", dest_dir.display()))?;
             dest = dest_dir.join(&filename);
         }
     }
 
-    fs::rename(&tmp, &dest).await?;
+    fs::rename(&tmp, &dest)
+        .await
+        .with_context(|| format!("moving {} to {}", tmp.display(), dest.display()))?;
 
     let preview_path = resolution
         .preview_image_url
@@ -615,7 +684,12 @@ pub async fn download(
     ) {
         download_preview(url, path).await;
     }
-    Ok((dest, Some(model_type_str)))
+    Ok(DownloadOutcome {
+        dest,
+        model_type: Some(model_type_str),
+        sha256: Some(digest),
+        deduplicated: false,
+    })
 }
 
 fn select_preview_image(images: &[ModelImage]) -> Option<&ModelImage> {
