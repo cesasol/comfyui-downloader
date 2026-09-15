@@ -29,9 +29,90 @@ A Rust daemon that downloads, catalogs, and manages AI models from CivitAI and H
 - **CLI client** — `comfyui-dl` command for all daemon interactions
 - **SystemD integration** — ships a `.service` unit file for `systemctl --user`
 
-## Desktop Application
+## Quickstart — Template Workflow
 
-A companion desktop app is included, built with Tauri (Rust) and Svelte. It provides a model gallery with sidebar filters for model type and base model, and communicates with the daemon over the Unix socket.
+Get a working ComfyUI workflow downloaded and ready to use in about five minutes.
+
+### 1. Install and start the daemon
+
+```sh
+# Arch Linux (AUR)
+makepkg -si
+
+# Or manual build
+cargo build --release -p comfyui-downloader
+cp target/release/comfyui-downloader ~/.local/bin/
+cp target/release/comfyui-dl ~/.local/bin/
+cp systemd/comfyui-downloader-user.service ~/.config/systemd/user/comfyui-downloader.service
+systemctl --user daemon-reload
+systemctl --user enable --now comfyui-downloader
+```
+
+### 2. Set your CivitAI API key
+
+The daemon needs a CivitAI key to resolve model URLs. You only need a free account.
+
+```sh
+comfyui-dl set-key <your-api-key>
+```
+
+### 3. Browse available templates
+
+The template picker fetches the official ComfyUI workflow catalog, resolves every model dependency, and filters by what your GPU can run:
+
+```sh
+# List all templates that fit on this GPU
+comfyui-dl templates
+
+# Filter by type
+comfyui-dl templates --type image
+comfyui-dl templates --type video
+
+# Free-text search
+comfyui-dl templates "upscale"
+```
+
+Templates are tagged with a VRAM tier: **fits in VRAM**, **needs CPU offload**, or **will not run** (hidden by default). Pass `--comfortable-only` to show only templates that run entirely on the GPU.
+
+### 4. Queue a template
+
+The interactive picker starts with **nothing selected**. Move with the arrow keys, toggle a row with **space** or **x**, select every visible match with **a**, clear all selections with **backspace**, confirm with **Enter**, and cancel with **Esc**:
+
+```sh
+# Interactive — picks interactively
+comfyui-dl templates "flux"
+
+# Non-interactive — queues everything that matches without prompting
+comfyui-dl templates --type image --yes
+
+# Queue a specific template by name
+comfyui-dl templates --name "Flux.1 Dev" --yes
+```
+
+Queuing a template always downloads its **complete dependency set**: the diffusion model (or checkpoint), text encoders, VAE, LoRAs, and any helper models — each routed to the correct ComfyUI `models/` subdirectory. Files shared between templates are queued only once.
+
+### 5. Wait for downloads
+
+```sh
+comfyui-dl status
+```
+
+Active downloads show progress; completed jobs appear in the catalog. The daemon handles retries, resume, and checksum verification automatically.
+
+### 6. Load the workflow in ComfyUI
+
+Once downloads finish, the model files are in your ComfyUI `models/` directory (default: `~/.local/share/comfyui/models/`). The workflow itself ships with ComfyUI — this tool only fetches the weights it needs. Launch ComfyUI, open **Workflow → Browse Templates**, and pick the template you queued: its nodes now resolve to the downloaded files automatically, with no manual path configuration.
+
+### Full example
+
+```sh
+# One-shot: list, pick, download everything for image generation
+comfyui-dl set-key your-api-key
+systemctl --user start comfyui-downloader
+comfyui-dl templates --type image --yes
+comfyui-dl status          # watch progress
+# ... models land in models/ — open ComfyUI and go
+```
 
 ## Architecture
 
@@ -105,12 +186,6 @@ Model type is inferred from the CivitAI API response. For checkpoint safetensors
 Configuration is read from `$XDG_CONFIG_HOME/comfyui-downloader/config.toml` (default: `~/.config/comfyui-downloader/config.toml`). The file is created with defaults on first daemon startup.
 
 ```toml
-[civitai]
-api_key = ""              # CivitAI API key (required for CivitAI downloads)
-
-[huggingface]
-token = ""                # Optional; only needed for gated or private repos
-
 [paths]
 models_dir = "~/.local/share/comfyui/models"
 
@@ -124,17 +199,32 @@ skip_early_access = true  # Skip EarlyAccess model versions when resolving lates
 vram_bytes = 0            # Optional override of the detected VRAM capacity
 ```
 
-The API key can also be set without editing the file manually:
+### Credentials
+
+API credentials are **not** stored in `config.toml`. They live in the session
+keyring behind the freedesktop Secret Service D-Bus interface
+(`org.freedesktop.secrets`, implemented by gnome-keyring, KWallet and others),
+and are read by the daemon at startup:
 
 ```sh
-comfyui-dl set-key <your-api-key>
+comfyui-dl set-key <your-civitai-api-key>
+comfyui-dl set-key --service huggingface <your-hf-token>   # gated repos only
 ```
+
+Both commands work without a running daemon. A `civitai.api_key` or
+`huggingface.token` left in `config.toml` by an older version still works, but
+the daemon moves it into the keyring on the next start and removes it from the
+file. If no Secret Service is reachable (for example on a headless box without
+a keyring daemon), the plaintext fields remain as a fallback.
 
 ## CLI Usage
 
 ```sh
-# Set your CivitAI API key (writes to config file, no daemon needed)
+# Store your CivitAI API key in the system keyring (no daemon needed)
 comfyui-dl set-key <your-api-key>
+
+# Store a HuggingFace token for gated repos
+comfyui-dl set-key --service huggingface <your-hf-token>
 
 # Add a model by CivitAI URL
 comfyui-dl add https://civitai.com/models/12345
@@ -189,7 +279,7 @@ Each template is judged against the detected GPU:
 | will not run | The sampler weights alone exceed VRAM — hidden unless `--include-unrunnable` |
 
 ```sh
-# Everything that can run on this GPU (interactive multi-select, all preselected)
+# Everything that can run on this GPU (interactive multi-select; nothing preselected)
 comfyui-dl templates
 
 # Filter by generation type: "all video models"
@@ -287,17 +377,6 @@ makepkg -si
 ```
 
 Or use an AUR helper once the package is published.
-
-### AppImage (GUI)
-
-Prebuilt AppImages are published on GitLab Releases. Download the latest `ComfyUI-Downloader-*.AppImage` and make it executable:
-
-```sh
-chmod +x ComfyUI-Downloader-*.AppImage
-./ComfyUI-Downloader-*.AppImage
-```
-
-The AppImage bundles all GUI dependencies. The daemon and CLI are distributed separately via the PKGBUILD or manual install steps above.
 
 ### Manual
 
