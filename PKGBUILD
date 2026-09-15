@@ -8,6 +8,8 @@ url="https://gitlab.com/cesasol/comfyui-downloader"
 license=('GPL-3.0-only')
 depends=('gcc-libs' 'glibc' 'libnotify')
 makedepends=('cargo' 'rust')
+optdepends=('gnome-keyring: store API credentials in the system keyring'
+            'kwallet: store API credentials in the system keyring')
 provides=('comfyui-downloader' 'comfyui-dl')
 conflicts=('comfyui-downloader')
 source=("$pkgname::git+https://gitlab.com/cesasol/comfyui-downloader.git")
@@ -39,8 +41,4 @@ package() {
     "$pkgdir/usr/lib/systemd/user/comfyui-downloader.service"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
-  install -Dm644 comfyui-downloader.desktop \
-    "$pkgdir/usr/share/applications/comfyui-downloader.desktop"
-  install -Dm644 src-tauri/icons/128x128.png \
-    "$pkgdir/usr/share/icons/hicolor/128x128/apps/comfyui-downloader.png"
 }
