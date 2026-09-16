@@ -263,6 +263,12 @@ async fn relocate_if_needed(
         let _ = tokio::fs::remove_dir(old_dir).await;
     }
 
+    info!(
+        "Relocated {} → {}",
+        current_path.display(),
+        expected_path.display()
+    );
+
     let filename = current_filename.to_string_lossy();
     let _ = notifier::notify_file_moved(
         &filename,
