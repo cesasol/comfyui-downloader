@@ -7,6 +7,10 @@ pub struct ModelInfo {
     pub name: String,
     pub r#type: ModelType,
     pub model_versions: Vec<ModelVersion>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +18,10 @@ pub struct ModelInfo {
 pub struct ModelVersionModel {
     pub name: String,
     pub r#type: ModelType,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +39,8 @@ pub struct ModelVersion {
     pub model: Option<ModelVersionModel>,
     #[serde(default)]
     pub images: Vec<ModelImage>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +83,9 @@ pub struct ModelFile {
 pub struct FileHashes {
     pub sha256: Option<String>,
     pub blake3: Option<String>,
+    pub auto_v3: Option<String>,
+    pub auto_v2: Option<String>,
+    pub auto_v1: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

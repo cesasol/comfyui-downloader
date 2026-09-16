@@ -101,10 +101,15 @@
     "synthetic"
   ],
   "modelDescription": "<p>A synthetic test model for unit testing.</p>",
+  "notes": null,
   "civitai_deleted": false,
   "favorite": false,
   "exclude": false,
   "db_checked": false,
+  "skip_metadata_refresh": false,
   "last_checked_at": 0,
+  "hash_status": "completed",
+  "metadata_source": null,
+  "autov3": "EEFF00112233",
   "model_type": "checkpoint"
 }

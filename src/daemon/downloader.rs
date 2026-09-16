@@ -1,6 +1,6 @@
 use crate::catalog::{Catalog, DownloadJob};
 use crate::civitai::CivitaiClient;
-use crate::civitai::types::{ModelFile, ModelImage, ModelVersion};
+use crate::civitai::types::{ModelFile, ModelImage, ModelInfo, ModelVersion};
 use crate::config::Config;
 use crate::daemon::notifier;
 use crate::daemon::queue::{DownloadProgress, ProgressMap};
@@ -43,26 +43,67 @@ struct VersionResolution {
     preview_nsfw_level: Option<u32>,
     /// Full version API response, stored for metadata serialization.
     model_version: Option<ModelVersion>,
+    /// Model info from CivitAI API, contains tags and description.
+    model_info: Option<ModelInfo>,
 }
 
 #[derive(serde::Serialize)]
 struct ModelMetadata {
     file_name: String,
-    model_name: Option<String>,
+    model_name: String,
     version_name: Option<String>,
     file_path: String,
     size: u64,
     modified: f64,
     sha256: String,
-    base_model: Option<String>,
+    base_model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     preview_url: Option<String>,
+    #[serde(default = "default_preview_nsfw_level")]
+    preview_nsfw_level: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    preview_nsfw_level: Option<u32>,
-    notes: String,
+    #[serde(rename = "modelDescription")]
+    model_description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<String>,
     from_civitai: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     civitai: Option<serde_json::Value>,
+    #[serde(default = "default_tags")]
+    tags: Vec<String>,
+    #[serde(default)]
+    civitai_deleted: bool,
+    #[serde(default)]
+    favorite: bool,
+    #[serde(default)]
+    exclude: bool,
+    #[serde(default)]
+    db_checked: bool,
+    #[serde(default)]
+    skip_metadata_refresh: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata_source: Option<String>,
+    #[serde(default)]
+    last_checked_at: f64,
+    #[serde(default = "default_hash_status")]
+    hash_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    autov3: Option<String>,
+}
+
+#[allow(dead_code)]
+fn default_preview_nsfw_level() -> u32 {
+    0
+}
+
+#[allow(dead_code)]
+fn default_tags() -> Vec<String> {
+    Vec::new()
+}
+
+#[allow(dead_code)]
+fn default_hash_status() -> String {
+    "completed".to_string()
 }
 
 /// Resolve the authoritative download URL, expected SHA-256, model type, and base model
@@ -120,7 +161,7 @@ async fn resolve_version(
             let preview_image = select_preview_image(&version.images);
             let preview_image_url = preview_image.map(|img| img.url.clone());
             let preview_nsfw_level = preview_image.and_then(|img| img.nsfw_level);
-            let model_name = Some(model_info.name);
+            let model_name = Some(model_info.name.clone());
             info!(
                 "Resolved: type={:?} base_model={:?} file={}",
                 model_type_subdir, base_model, filename
@@ -135,6 +176,7 @@ async fn resolve_version(
                 preview_image_url,
                 preview_nsfw_level,
                 model_version: Some(version),
+                model_info: Some(model_info),
             })
         }
 
@@ -176,6 +218,7 @@ async fn resolve_version(
                 preview_image_url,
                 preview_nsfw_level,
                 model_version: Some(version),
+                model_info: None,
             })
         }
 
@@ -213,7 +256,7 @@ async fn resolve_version(
             let preview_image = select_preview_image(&version.images);
             let preview_image_url = preview_image.map(|img| img.url.clone());
             let preview_nsfw_level = preview_image.and_then(|img| img.nsfw_level);
-            let model_name = Some(model_info.name);
+            let model_name = Some(model_info.name.clone());
             info!(
                 "Resolved: type={:?} base_model={:?} file={}",
                 model_type_subdir, base_model, filename
@@ -228,6 +271,7 @@ async fn resolve_version(
                 preview_image_url,
                 preview_nsfw_level,
                 model_version: Some(version),
+                model_info: Some(model_info),
             })
         }
 
@@ -246,6 +290,7 @@ async fn resolve_version(
                 preview_image_url: None,
                 preview_nsfw_level: None,
                 model_version: None,
+                model_info: None,
             })
         }
     }
@@ -294,6 +339,7 @@ async fn resolve_huggingface(
         preview_image_url: None,
         preview_nsfw_level: None,
         model_version: None,
+        model_info: None,
     })
 }
 
@@ -754,20 +800,89 @@ async fn write_metadata(
         .as_ref()
         .and_then(|v| serde_json::to_value(v).ok());
 
+    // Extract tags and description from CivitAI metadata
+    // Try model_info first (has full model details), then fall back to version.model
+    let (tags, model_description) = if let Some(ref model_info) = resolution.model_info {
+        let tags: Vec<String> = model_info
+            .tags
+            .clone()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        let description = model_info.description.clone().filter(|d| !d.is_empty());
+        (tags, description)
+    } else if let Some(ref version) = resolution.model_version {
+        let tags: Vec<String> = version
+            .model
+            .as_ref()
+            .map(|m| m.tags.clone())
+            .map(|t| t.into_iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        let description = version
+            .model
+            .as_ref()
+            .and_then(|m| m.description.clone())
+            .filter(|d| !d.is_empty());
+        (tags, description)
+    } else {
+        (Vec::new(), None)
+    };
+
+    // Extract AutoV3 hash from CivitAI file hashes
+    let autov3 = resolution
+        .model_version
+        .as_ref()
+        .and_then(|v| {
+            v.files
+                .iter()
+                .find(|f| {
+                    f.hashes
+                        .sha256
+                        .as_deref()
+                        .map(|h| h.eq_ignore_ascii_case(sha256))
+                        .unwrap_or(false)
+                })
+                .and_then(|f| f.hashes.auto_v3.clone())
+        })
+        .filter(|h| !h.is_empty());
+
+    // Determine base_model - fall back to Unknown if not provided
+    let base_model = resolution
+        .base_model
+        .clone()
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    // Determine model_name - fall back to file_name if not provided
+    let model_name = resolution
+        .model_name
+        .clone()
+        .unwrap_or_else(|| file_name.clone());
+
     let meta = ModelMetadata {
         file_name,
-        model_name: resolution.model_name.clone(),
+        model_name,
         version_name,
         file_path,
         size,
         modified,
         sha256: sha256.to_string(),
-        base_model: resolution.base_model.clone(),
+        base_model,
         preview_url,
-        preview_nsfw_level: resolution.preview_nsfw_level,
-        notes: String::new(),
+        preview_nsfw_level: resolution.preview_nsfw_level.unwrap_or(0),
+        model_description,
+        notes: None,
         from_civitai: resolution.model_version.is_some(),
         civitai,
+        tags,
+        civitai_deleted: false,
+        favorite: false,
+        exclude: false,
+        db_checked: false,
+        skip_metadata_refresh: false,
+        metadata_source: None,
+        last_checked_at: 0.0,
+        hash_status: "completed".to_string(),
+        autov3,
     };
     match serde_json::to_string_pretty(&meta) {
         Ok(json) => {
@@ -859,6 +974,7 @@ pub(crate) async fn save_artifacts(
         preview_image_url: preview_image_url.clone(),
         preview_nsfw_level,
         model_version: Some(version),
+        model_info: None,
     };
     if write_meta {
         write_metadata(dest, &resolution, sha256, preview_path.as_ref()).await;
