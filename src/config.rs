@@ -65,6 +65,9 @@ pub struct DaemonConfig {
     /// Skip model versions marked as EarlyAccess when selecting the latest version.
     #[serde(default = "default_true")]
     pub skip_early_access: bool,
+    /// Enable system tray icon (requires `tray-icon` feature and GUI environment).
+    #[serde(default)]
+    pub enable_tray_icon: bool,
 }
 
 impl Default for PathsConfig {
@@ -82,6 +85,7 @@ impl Default for DaemonConfig {
             update_interval_hours: 24,
             max_concurrent_downloads: 1,
             skip_early_access: true,
+            enable_tray_icon: true,
             socket_path: PathBuf::from(format!("/run/user/{}/comfyui-downloader.sock", uid)),
         }
     }

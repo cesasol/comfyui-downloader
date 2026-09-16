@@ -53,5 +53,15 @@ dialoguer = "0.11"
 console = "0.15"
 secret-service = { version = "5.2.0", default-features = false, features = ["rt-async-io-crypto-rust"] }
 
+# Optional system tray support (Linux only)
+[features]
+default = ["tray-icon"]
+tray-icon = ["dep:tray-item"]
+
+[dependencies.tray-item]
+optional = true
+version = "0.10"
+features = ["libappindicator"]
+
 [dev-dependencies]
 tempfile = "3"

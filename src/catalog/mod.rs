@@ -272,6 +272,14 @@ impl Catalog {
         Ok(count as u64)
     }
 
+    pub fn list_jobs_by_status(&self, status: JobStatus) -> Result<Vec<DownloadJob>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE status = ?1 ORDER BY created_at ASC"
+        ))?;
+        let rows = stmt.query_map(params![status.to_string()], |row| Ok(row_to_job(row)))?;
+        rows.map(|r| r?.map_err(anyhow::Error::from)).collect()
+    }
+
     pub fn delete_job(&self, id: Uuid) -> Result<()> {
         self.conn
             .execute("DELETE FROM jobs WHERE id = ?1", params![id.to_string()])?;

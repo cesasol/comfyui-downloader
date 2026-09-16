@@ -2,6 +2,8 @@ pub mod downloader;
 pub mod notifier;
 pub mod queue;
 pub mod scanner;
+#[cfg(feature = "tray-icon")]
+pub mod systray;
 pub mod updater;
 
 use crate::catalog::{Catalog, DownloadJob};
@@ -26,6 +28,13 @@ pub async fn run() -> Result<()> {
     config.save()?; // Persist any new fields added since the config was last written.
     info!("Loaded config from {}", Config::config_path().display());
     let config = Arc::new(config);
+
+    // Initialize system tray state (no-op if feature not enabled)
+    #[cfg(feature = "tray-icon")]
+    let tray_state: Arc<crate::daemon::systray::TrayState> = {
+        use crate::daemon::systray::TrayState;
+        Arc::new(TrayState::new())
+    };
 
     let catalog = Arc::new(Mutex::new(Catalog::open(
         &crate::config::xdg_data_home()
@@ -95,6 +104,39 @@ pub async fn run() -> Result<()> {
         })
     };
 
+    // Spawn system tray icon (if feature and config enabled)
+    #[cfg(feature = "tray-icon")]
+    let tray_handle = if config.daemon.enable_tray_icon {
+        use crate::daemon::systray::spawn_tray_icon;
+        let cfg = config.clone();
+        let cat = catalog.clone();
+        let state = tray_state.clone();
+        match spawn_tray_icon(cfg, cat, state) {
+            Ok(handle) => {
+                info!("System tray icon started");
+                Some(handle)
+            }
+            Err(e) => {
+                warn!("Failed to start system tray icon: {e:#}");
+                None
+            }
+        }
+    } else {
+        info!("System tray icon disabled in config");
+        None
+    };
+
+    // Spawn tray state watcher to update counts
+    #[cfg(feature = "tray-icon")]
+    let tray_watcher = {
+        use crate::daemon::systray::watch_catalog;
+        let cat = catalog.clone();
+        let state = tray_state.clone();
+        tokio::spawn(async move {
+            watch_catalog(cat, state).await;
+        })
+    };
+
     let server = IpcServer::bind(&config.daemon.socket_path)?;
     info!("Daemon ready");
 
@@ -122,6 +164,20 @@ pub async fn run() -> Result<()> {
     scanner_handle.abort();
     queue_handle.abort();
     updater_handle.abort();
+
+    // Cleanup system tray
+    #[cfg(feature = "tray-icon")]
+    {
+        use std::sync::atomic::Ordering;
+        if let Some(handle) = tray_handle {
+            // Signal the tray icon thread to exit
+            tray_state.should_exit.store(true, Ordering::Relaxed);
+            // Wait for the thread to finish
+            let _ = handle.join();
+        }
+        tray_watcher.abort();
+    }
+
     Ok(())
 }
 

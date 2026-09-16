@@ -20,15 +20,15 @@ USER_SYSTEMD := USER_CONFIG + "/systemd/user"
 
 # Build the daemon and CLI binaries
 build:
-    cargo build --release -p comfyui-downloader
+    cargo build --release --all-features -p comfyui-downloader
 
 # Run tests
 test:
-    cargo test -p comfyui-downloader
+    cargo test --all-features -p comfyui-downloader
 
 # Run clippy lints
 lint:
-    cargo clippy -p comfyui-downloader -- -D warnings
+    cargo clippy --all-features -p comfyui-downloader -- -D warnings
 
 # Format source code
 fmt:
@@ -40,7 +40,7 @@ fmt-check:
 
 # Fast type/borrow check (no codegen)
 check:
-    cargo check -p comfyui-downloader
+    cargo check --all-features -p comfyui-downloader
 
 # One command, three callers: the developer, the hook, and the pipeline.
 ci: fmt-check lint test

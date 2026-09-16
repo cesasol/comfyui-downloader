@@ -6,7 +6,7 @@ pkgdesc="CivitAI model downloader daemon for ComfyUI"
 arch=('x86_64')
 url="https://gitlab.com/cesasol/comfyui-downloader"
 license=('GPL-3.0-only')
-depends=('gcc-libs' 'glibc' 'libnotify')
+depends=('gcc-libs' 'glibc' 'libnotify' 'gtk3' 'libappindicator3')
 makedepends=('cargo' 'rust')
 optdepends=('gnome-keyring: store API credentials in the system keyring'
             'kwallet: store API credentials in the system keyring')
@@ -30,7 +30,7 @@ build() {
   cd "$pkgname"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
-  cargo build --release --frozen -p comfyui-downloader
+  cargo build --release --frozen --all-features -p comfyui-downloader
 }
 
 package() {
