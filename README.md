@@ -4,21 +4,27 @@ A Rust daemon that downloads, catalogs, and manages AI models from CivitAI and H
 
 ## Overview
 
-`comfyui-downloader` runs as a SystemD user service on GNU/Linux. It exposes a Unix socket IPC interface so a companion CLI tool can enqueue downloads, manage models, review available updates, and configure the daemon — all without requiring root privileges.
+`comfyui-downloader` runs as a SystemD user service on GNU/Linux. It exposes a Unix socket IPC interface so a companion CLI tool can enqueue downloads, manage models, review available updates, and
+configure the daemon — all without requiring root privileges.
 
 ## Features
 
 - **Download queue** — enqueue model downloads; the daemon processes them with configurable concurrency (default: 1)
-- **HuggingFace downloads** — enqueue any HuggingFace file URL; the subdirectory is derived from the path inside the repo, and the LFS SHA-256 is verified after download (a token is only needed for gated repos)
-- **ComfyUI template picker** — `comfyui-dl templates` browses the official ComfyUI workflow templates, filters them by generation type, task, or model family, and queues one, many, or all of them with their complete model dependency set
+- **HuggingFace downloads** — enqueue any HuggingFace file URL; the subdirectory is derived from the path inside the repo, and the LFS SHA-256 is verified after download (a token is only needed for
+  gated repos)
+- **ComfyUI template picker** — `comfyui-dl templates` browses the official ComfyUI workflow templates, filters them by generation type, task, or model family, and queues one, many, or all of them
+  with their complete model dependency set
 - **VRAM feasibility tiers** — detects the local GPU and classifies every template as fitting in VRAM, needing CPU offload for the text encoders and VAE, or unable to run at all (hidden by default)
 - **Download resume** — resumes interrupted downloads using HTTP range requests when the server supports it
 - **Metadata sidecars** — writes a `.metadata.json` file alongside each downloaded model containing the SHA-256 hash, CivitAI API response, base model, preview path, and more
 - **Preview images** — downloads and saves the CivitAI preview image (`model.preview.jpg/webp`) next to each model file
-- **Startup scanner** — on daemon start, scans the models directory for existing files missing metadata or preview images and fetches them from CivitAI using SHA-256 hash lookup; registers discovered models in the catalog for update tracking
+- **Startup scanner** — on daemon start, scans the models directory for existing files missing metadata or preview images and fetches them from CivitAI using SHA-256 hash lookup; registers discovered
+  models in the catalog for update tracking
 - **Duplicate detection** — skips the download if the target file already exists on disk
-- **Update notifications** — periodically polls CivitAI for newer versions of tracked models (once per model every 24 hours) and flags them in the database; updates are never auto-downloaded, giving you full control over which versions to install
-- **Smart model routing** — automatically places checkpoint models in the correct ComfyUI subdirectory by inspecting the safetensors file header for bundled VAE/CLIP components; GGUF checkpoints are always routed to `diffusion_models/`
+- **Update notifications** — periodically polls CivitAI for newer versions of tracked models (once per model every 24 hours) and flags them in the database; updates are never auto-downloaded, giving
+  you full control over which versions to install
+- **Smart model routing** — automatically places checkpoint models in the correct ComfyUI subdirectory by inspecting the safetensors file header for bundled VAE/CLIP components; GGUF checkpoints are
+  always routed to `diffusion_models/`
 - **Early access filtering** — skips EarlyAccess model versions by default (configurable)
 - **Checksum verification** — validates SHA-256 hashes reported by CivitAI after each download
 - **Retry logic** — handles CivitAI rate-limit responses (HTTP 429) with exponential backoff
@@ -76,7 +82,8 @@ Templates are tagged with a VRAM tier: **fits in VRAM**, **needs CPU offload**, 
 
 ### 4. Queue a template
 
-The interactive picker starts with **nothing selected**. Move with the arrow keys, toggle a row with **space** or **x**, select every visible match with **a**, clear all selections with **backspace**, confirm with **Enter**, and cancel with **Esc**:
+The interactive picker starts with **nothing selected**. Move with the arrow keys, toggle a row with **space** or **x**, select every visible match with **a**, clear all selections with **backspace**,
+confirm with **Enter**, and cancel with **Esc**:
 
 ```sh
 # Interactive — picks interactively
@@ -89,7 +96,8 @@ comfyui-dl templates --type image --yes
 comfyui-dl templates --name "Flux.1 Dev" --yes
 ```
 
-Queuing a template always downloads its **complete dependency set**: the diffusion model (or checkpoint), text encoders, VAE, LoRAs, and any helper models — each routed to the correct ComfyUI `models/` subdirectory. Files shared between templates are queued only once.
+Queuing a template always downloads its **complete dependency set**: the diffusion model (or checkpoint), text encoders, VAE, LoRAs, and any helper models — each routed to the correct ComfyUI
+`models/` subdirectory. Files shared between templates are queued only once.
 
 ### 5. Wait for downloads
 
@@ -101,7 +109,8 @@ Active downloads show progress; completed jobs appear in the catalog. The daemon
 
 ### 6. Load the workflow in ComfyUI
 
-Once downloads finish, the model files are in your ComfyUI `models/` directory (default: `~/.local/share/comfyui/models/`). The workflow itself ships with ComfyUI — this tool only fetches the weights it needs. Launch ComfyUI, open **Workflow → Browse Templates**, and pick the template you queued: its nodes now resolve to the downloaded files automatically, with no manual path configuration.
+Once downloads finish, the model files are in your ComfyUI `models/` directory (default: `~/.local/share/comfyui/models/`). The workflow itself ships with ComfyUI — this tool only fetches the weights
+it needs. Launch ComfyUI, open **Workflow → Browse Templates**, and pick the template you queued: its nodes now resolve to the downloaded files automatically, with no manual path configuration.
 
 ### Full example
 
@@ -116,7 +125,7 @@ comfyui-dl status          # watch progress
 
 ## Architecture
 
-```
+```text
 comfyui-downloader/
 ├── src/
 │   ├── main.rs           # Daemon binary entry point
@@ -156,7 +165,7 @@ comfyui-downloader/
 
 Models are saved under a configurable root (default: `$XDG_DATA_HOME/comfyui/models/`) using the path `{type}/{baseModel}/{filename}`:
 
-```
+```text
 models/
 ├── checkpoints/          # Full checkpoints (bundling VAE + CLIP + UNet)
 │   └── SDXL 1.0/
@@ -307,7 +316,9 @@ The catalog is cached under `$XDG_CACHE_HOME/comfyui-downloader/templates`
 
 ### Update Workflow
 
-The daemon periodically checks CivitAI for newer versions of tracked models (rate-limited to once per model every 24 hours). When an update is found, it is flagged in the database and a desktop notification is sent — but **no automatic download occurs**. This is intentional: CivitAI model "versions" often represent quantizations, different base models, or unrelated variants rather than true updates.
+The daemon periodically checks CivitAI for newer versions of tracked models (rate-limited to once per model every 24 hours). When an update is found, it is flagged in the database and a desktop
+notification is sent — but **no automatic download occurs**. This is intentional: CivitAI model "versions" often represent quantizations, different base models, or unrelated variants rather than true
+updates.
 
 To review and install updates:
 

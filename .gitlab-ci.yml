@@ -2,6 +2,7 @@
 
 stages:
   - prepare
+  - quality
   - test
   - build
   - release
@@ -23,25 +24,22 @@ cargo-version:
   script:
     - rustc --version && cargo --version
 
-cargo-test:
-  stage: test
+# One command, three callers: the developer, the hook, and the pipeline all
+# run the same checks. `just ci` == fmt-check + lint + test.
+quality:
+  stage: quality
   image: rust:latest
+  variables:
+    SKIP: no-commit-to-branch
   script:
-    - cargo test -p comfyui-downloader --verbose
+    - rustup component add clippy rustfmt
+    - curl -LsSf https://astral.sh/uv/install.sh | sh
+    - export PATH="$HOME/.local/bin:$PATH"
+    - curl -LsSf https://github.com/casey/just/releases/latest/download/just-1.36.0-x86_64-unknown-linux-musl.tar.gz | tar -xz -C /usr/local/bin just
+    - uvx prek run --all-files
+    - just ci
 
-cargo-clippy:
-  stage: test
-  image: rust:latest
-  script:
-    - rustup component add clippy
-    - cargo clippy -p comfyui-downloader -- -D warnings
-
-cargo-fmt:
-  stage: test
-  image: rust:latest
-  script:
-    - rustup component add rustfmt
-    - cargo fmt --check
+# Formatting, clippy, and tests all run through `just ci` in the quality stage.
 
 cargo-build:
   stage: build

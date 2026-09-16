@@ -1,0 +1,18 @@
+#:schema https://raw.githubusercontent.com/rvben/rumdl/refs/heads/main/rumdl.schema.json
+
+[global]
+disable = ["MD041"]
+respect-gitignore = true
+exclude = [".claude", ".pi", "target"]
+
+[MD013]
+line-length = 200
+code-blocks = false
+tables = false
+reflow = true
+
+[MD029]
+style = "ordered"
+
+[MD033]
+allowed_elements = ["br", "details", "summary"]

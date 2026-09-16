@@ -9,12 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Credentials in the system keyring** — the CivitAI API key and the HuggingFace token are stored in the freedesktop Secret Service (`org.freedesktop.secrets`) instead of plaintext `config.toml`; `comfyui-dl set-key` writes there and gained `--service civitai|huggingface`. Existing plaintext values are migrated into the keyring on daemon startup and removed from the file, and remain a fallback when no Secret Service is reachable
+- **Credentials in the system keyring** — the CivitAI API key and the HuggingFace token are stored in the freedesktop Secret Service (`org.freedesktop.secrets`) instead of plaintext `config.toml`;
+  `comfyui-dl set-key` writes there and gained `--service civitai|huggingface`. Existing plaintext values are migrated into the keyring on daemon startup and removed from the file, and remain a
+  fallback when no Secret Service is reachable
 
 ### Removed
 
 - **Tauri desktop app** — the Svelte GUI, the `src-tauri` crate, the desktop entry and its icon, and the AppImage build are gone; the daemon is driven by `comfyui-dl` only
-- **Streaming subscription IPC** — the `subscribe` request, its `Frame` snapshot stream, and the daemon event bus that fed the planned terminal UI; `get_status` still reports queue and progress on demand
+- **Streaming subscription IPC** — the `subscribe` request, its `Frame` snapshot stream, and the daemon event bus that fed the planned terminal UI; `get_status` still reports queue and progress on
+  demand
 
 ## [0.1.0] - 2026-03-26
 
@@ -24,10 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Download resume** — resumes interrupted downloads using HTTP range requests when the server supports it
 - **Metadata sidecars** — writes a `.metadata.json` file alongside each model containing SHA-256 hash, CivitAI API response, base model, and preview path
 - **Preview images** — downloads and saves the CivitAI preview image next to each model file
-- **Startup scanner** — on daemon start, scans the models directory for existing files missing metadata or preview images and fetches them via SHA-256 hash lookup; registers discovered models in the catalog
+- **Startup scanner** — on daemon start, scans the models directory for existing files missing metadata or preview images and fetches them via SHA-256 hash lookup; registers discovered models in the
+  catalog
 - **Duplicate detection** — skips the download if the target file already exists on disk
 - **Update notifications** — periodically polls CivitAI for newer versions of tracked models and flags them in the database; updates are never auto-downloaded
-- **Smart model routing** — automatically places checkpoint models in the correct ComfyUI subdirectory by inspecting the safetensors file header for bundled VAE/CLIP components; GGUF checkpoints are always routed to `diffusion_models/`
+- **Smart model routing** — automatically places checkpoint models in the correct ComfyUI subdirectory by inspecting the safetensors file header for bundled VAE/CLIP components; GGUF checkpoints are
+  always routed to `diffusion_models/`
 - **Early access filtering** — skips EarlyAccess model versions by default (configurable)
 - **Checksum verification** — validates SHA-256 hashes reported by CivitAI after each download
 - **Retry logic** — handles CivitAI rate-limit responses (HTTP 429) with exponential backoff

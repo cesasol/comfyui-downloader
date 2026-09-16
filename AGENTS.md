@@ -15,13 +15,15 @@ RUST_LOG=debug cargo run --bin comfyui-downloader   # daemon with debug logging
 RUST_LOG=debug cargo run --bin comfyui-dl -- status # CLI with debug logging
 ```
 
-**Workflow**: `cargo check` → `cargo clippy -- -D warnings` → `cargo test`. Fix all clippy warnings before considering work done. There is no `rustfmt.toml`; use default `rustfmt` settings (`cargo fmt`).
+**Workflow**: `cargo check` → `cargo clippy -- -D warnings` → `cargo test`. Fix all clippy warnings before considering work done. There is no `rustfmt.toml`; use default `rustfmt` settings
+(`cargo fmt`).
 
 ---
 
 ## Project Structure
 
 Two binaries share the same library:
+
 - `src/main.rs` — daemon entry point, calls `daemon::run()`
 - `src/cli_main.rs` — CLI entry point, calls `cli::run()`
 - `src/lib.rs` — library root, re-exports modules
@@ -34,10 +36,12 @@ Two binaries share the same library:
 ## Code Style
 
 ### Formatting
+
 - Default `rustfmt` (no config file). Run `cargo fmt` before committing.
 - 4-space indentation. No trailing whitespace.
 
 ### Imports
+
 - Group: `crate::` imports first, then external crates, then `std`.
 - No blank lines required between groups (convention in this codebase is loose ordering).
 - Prefer explicit paths over glob imports except in `#[cfg(test)]` where `use super::*` is standard.
@@ -53,12 +57,14 @@ use tracing::info;
 ```
 
 ### Naming
+
 - `snake_case`: functions, variables, modules, fields
 - `PascalCase`: types, structs, enums, traits
 - `SCREAMING_SNAKE_CASE`: constants (`const`, `static`)
 - Short names for cloned `Arc`s inside `tokio::spawn` closures: `cfg`, `cat`, `civ`, `act`, `prog`, `wake`
 
 ### Types
+
 - `Uuid` (v4) for all job/entity IDs
 - `DateTime<Utc>` (chrono) for all timestamps; stored as RFC 3339 strings in SQLite
 - `PathBuf` for owned paths, `&Path` for borrowed path arguments
@@ -66,6 +72,7 @@ use tracing::info;
 - `serde_json::Value` for ad-hoc/dynamic JSON responses in IPC handlers
 
 ### Structs and Enums
+
 Derive order convention: `#[derive(Debug, Clone, Serialize, Deserialize)]`
 
 ```rust
@@ -171,7 +178,7 @@ let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
 - **Scope**: One logical change per commit. Split unrelated changes into separate commits.
 - **Footer**: Every commit includes attribution trailers:
 
-```
+```text
 feat: add update checker for tracked models
 
 Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-opencode)

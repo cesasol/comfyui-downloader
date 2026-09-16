@@ -25,6 +25,7 @@ Two binaries share the same library code:
 - **`comfyui-dl`** (`src/cli_main.rs`) — one-shot CLI; connects to the daemon socket, sends a JSON command, prints the response, exits
 
 ### Daemon startup sequence (`src/daemon/mod.rs`)
+
 1. Load `Config` from `~/.config/comfyui-downloader/config.toml`
 2. Open SQLite catalog at `~/.local/share/comfyui-downloader/catalog.db`
 3. Spawn `queue::run` task — processes pending jobs from the catalog
@@ -32,20 +33,25 @@ Two binaries share the same library code:
 5. Bind Unix socket and call `IpcServer::serve` — handles CLI requests until shutdown
 
 ### IPC layer (`src/ipc/`)
+
 - `protocol.rs` — `Request` enum (tagged JSON: `{"cmd":"...", "payload":{...}}`) and `Response` enum (`{"status":"ok"/"err", "data":...}`)
 - `server.rs` — `IpcServer` accepts connections, deserialises a `Request`, invokes the handler closure, serialises the `Response`
 - `client.rs` — `IpcClient` used by the CLI binary to send a single request and read back the response
 
 ### Catalog (`src/catalog/`)
-SQLite database accessed through `rusqlite`. `Catalog` wraps a `Connection` behind `Arc<Mutex<Catalog>>` shared across async tasks. Jobs have a `JobStatus` enum (`Queued`, `Running`, `Done`, `Failed`, `Cancelled`). Schema migrations live in `schema.rs`.
+
+SQLite database accessed through `rusqlite`. `Catalog` wraps a `Connection` behind `Arc<Mutex<Catalog>>` shared across async tasks. Jobs have a `JobStatus` enum (`Queued`, `Running`, `Done`, `Failed`,
+`Cancelled`). Schema migrations live in `schema.rs`.
 
 ### Download pipeline (`src/daemon/`)
+
 - `queue.rs` — polls catalog for `Queued` jobs, respects `max_concurrent_downloads`, calls the downloader
 - `downloader.rs` — streams bytes from CivitAI via `reqwest`, verifies SHA-256 checksum, checks disk space via `libc::statvfs`, supports resume via HTTP Range
 - `updater.rs` — compares catalog model versions against CivitAI API; enqueues new versions if found
 - `notifier.rs` — wraps `notify-rust` for desktop notifications on completion/error/update
 
 ### CivitAI client (`src/civitai/`)
+
 `CivitaiClient` uses `reqwest` with automatic retry on HTTP 429 (exponential backoff). Response types are in `types.rs`.
 
 ## Key design constraints

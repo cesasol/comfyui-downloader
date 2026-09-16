@@ -42,6 +42,17 @@ fmt-check:
 check:
     cargo check -p comfyui-downloader
 
+# One command, three callers: the developer, the hook, and the pipeline.
+ci: fmt-check lint test
+
+# Run the full hook suite across every file (used by CI).
+hooks:
+    uvx prek run --all-files
+
+# Install git hooks locally.
+setup:
+    uvx prek install
+
 # Clean build artifacts
 clean:
     cargo clean

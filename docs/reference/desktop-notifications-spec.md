@@ -2,11 +2,12 @@
 
 > Source: [specifications.freedesktop.org/notification/1.3](https://specifications.freedesktop.org/notification/1.3)
 > Version 1.3, 18 August 2024
-> Authors: Mike Hearn, Christian Hammond, William Jon McCann
+> Authors: Mike Hearn, Christian Hammond, William Jon McCan
 
 ## Overview
 
-A D-BUS–based standard for desktop notification services. Applications send passive popups that notify the user asynchronously. It explicitly does **not** cover modal dialogs, window-manager decorations, or window-list annotations.
+A D-BUS–based standard for desktop notification services. Applications send passive popups that notify the user asynchronously. It explicitly does **not** cover modal dialogs, window-manager
+decorations, or window-list annotations.
 
 Use cases: chat messages, alarms, file-transfer completion, new mail, low disk/battery warnings.
 
@@ -40,6 +41,7 @@ Each notification gets a **unique uint32 ID** (never 0). IDs are not recycled un
 ### Methods
 
 #### `GetCapabilities` → `as`
+
 Returns an array of capability strings the server supports:
 
 | Capability | Meaning |
@@ -58,12 +60,15 @@ Returns an array of capability strings the server supports:
 Vendor extensions: prefix with `x-vendor` (e.g. `x-gnome-foo-cap`).
 
 #### `Notify (app_name, replaces_id, app_icon, summary, body, actions, hints, expire_timeout)` → `UINT32`
+
 Sends a notification. Returns the new (or replacement) ID.
 
 #### `CloseNotification (id)`
+
 Force-close a notification by ID. Emits `NotificationClosed`.
 
 #### `GetServerInformation ()` → `(name, vendor, version, spec_version)`
+
 Returns server metadata.
 
 ### Signals
@@ -118,6 +123,7 @@ A D-Bus struct of signature `(iiibiiay)` matching gdk-pixbuf:
 ### Path-based images
 
 `app_icon` and `image-path` accept:
+
 - A `file://` URI (only supported scheme)
 - A name from a freedesktop.org–compliant icon theme (not a GTK+ stock ID)
 
@@ -192,6 +198,7 @@ Passed via the `urgency` hint (BYTE):
 ## Key Implementations
 
 Well-known notification daemons implementing this spec:
+
 - **GNOME**: `gnome-shell` (built-in), `notification-daemon`
 - **KDE**: `plasma-workspace` (built-in)
 - **Xfce**: `xfce4-notifyd`

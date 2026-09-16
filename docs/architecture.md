@@ -1,6 +1,7 @@
 # Architecture
 
-`comfyui-downloader` is a GNU/Linux user-space daemon that downloads AI models from CivitAI into a ComfyUI-compatible directory layout. It is built as two separate binaries that communicate through a Unix domain socket.
+`comfyui-downloader` is a GNU/Linux user-space daemon that downloads AI models from CivitAI into a ComfyUI-compatible directory layout. It is built as two separate binaries that communicate through a
+Unix domain socket.
 
 ---
 
@@ -27,17 +28,19 @@ The CLI binary does **not** share in-process state with the daemon. It connects 
 6. Spawn **updater task** (`daemon::updater::run`) — periodically checks for newer model versions.
 7. Bind the Unix socket and enter the IPC accept loop.
 
-The three shared resources (`Config`, `Catalog`, `CivitaiClient`) are wrapped in `Arc` and cloned into each task. `Catalog` additionally uses `tokio::sync::Mutex` because the lock is held across `.await` points.
+The three shared resources (`Config`, `Catalog`, `CivitaiClient`) are wrapped in `Arc` and cloned into each task. `Catalog` additionally uses `tokio::sync::Mutex` because the lock is held across
+`.await` points.
 
 ---
 
 ## IPC layer (`src/ipc/`)
 
-Communication between the CLI and daemon uses a Unix domain socket at `/run/user/<UID>/comfyui-downloader.sock`. The wire format is **newline-delimited JSON** — one JSON object per line in each direction.
+Communication between the CLI and daemon uses a Unix domain socket at `/run/user/<UID>/comfyui-downloader.sock`. The wire format is **newline-delimited JSON** — one JSON object per line in each
+direction.
 
 ### Protocol (`protocol.rs`)
 
-```
+```text
 // Request (CLI → daemon)
 {"cmd": "<variant>", "payload": {...}}
 
@@ -59,24 +62,29 @@ Communication between the CLI and daemon uses a Unix domain socket at `/run/user
 
 ### Server (`server.rs`)
 
-`IpcServer::serve` accepts connections in a `tokio::spawn` loop. Each connection gets its own task that reads lines until EOF, deserialises each into a `Request`, calls the handler closure, serialises the `Response`, and writes it back — one connection therefore carries as many exchanges as the client sends, which the CLI depends on (`add` resolves version info first, `delete`/`cancel` resolve an ID prefix, the template picker lists before queueing). Stale socket files are deleted on bind.
+`IpcServer::serve` accepts connections in a `tokio::spawn` loop. Each connection gets its own task that reads lines until EOF, deserialises each into a `Request`, calls the handler closure, serialises
+the `Response`, and writes it back — one connection therefore carries as many exchanges as the client sends, which the CLI depends on (`add` resolves version info first, `delete`/`cancel` resolve an
+ID prefix, the template picker lists before queueing). Stale socket files are deleted on bind.
 
 ---
 
 ## Template catalog (`src/templates/`)
 
-The ComfyUI default workflow templates are published in `Comfy-Org/workflow_templates`. `TemplateCatalog` fetches `templates/index.json` (categories → templates with title, tags, model families and total size) and each matching template's workflow JSON, caching both under `$XDG_CACHE_HOME/comfyui-downloader/templates` (index 6 h, workflows 7 days).
+The ComfyUI default workflow templates are published in `Comfy-Org/workflow_templates`. `TemplateCatalog` fetches `templates/index.json` (categories → templates with title, tags, model families and
+total size) and each matching template's workflow JSON, caching both under `$XDG_CACHE_HOME/comfyui-downloader/templates` (index 6 h, workflows 7 days).
 
 Model files are extracted from two sources and merged, deduplicated by URL:
 
 1. `nodes[].properties.models` — `{name, url, directory}`, authoritative for the target subdirectory.
-2. The `MarkdownNote` "Model links" section — `**role**` headings followed by `- [file](url)` links, used by templates that predate the node field. Role headings are normalised (`"Diffusion model"` → `diffusion_models`), and non-HuggingFace links (input assets, documentation) are discarded.
+2. The `MarkdownNote` "Model links" section — `**role**` headings followed by `- [file](url)` links, used by templates that predate the node field. Role headings are normalised (`"Diffusion model"` →
+   `diffusion_models`), and non-HuggingFace links (input assets, documentation) are discarded.
 
 File sizes and checksums come from one HuggingFace tree request per `(repo, revision, directory)` group, covering every file the templates reference there.
 
 ### VRAM feasibility (`src/vram.rs`, `src/gpu.rs`)
 
-`gpu::detect_gpus` reads `mem_info_vram_total` for each `/sys/class/drm/card*` device (falling back to `nvidia-smi`), and `config.gpu.vram_bytes` overrides the result. A bundle's weights are split into GPU-resident roles (checkpoints, diffusion models, LoRAs, ControlNets) and offloadable roles (text encoders, VAE, CLIP vision, upscalers), then classified:
+`gpu::detect_gpus` reads `mem_info_vram_total` for each `/sys/class/drm/card*` device (falling back to `nvidia-smi`), and `config.gpu.vram_bytes` overrides the result. A bundle's weights are split
+into GPU-resident roles (checkpoints, diffusion models, LoRAs, ControlNets) and offloadable roles (text encoders, VAE, CLIP vision, upscalers), then classified:
 
 | Tier | Condition |
 |---|---|
@@ -117,7 +125,7 @@ WAL mode is enabled; an index on `status` speeds up `next_queued()`.
 
 ### `JobStatus` lifecycle
 
-```
+```text
 Queued → Downloading → Verifying → Done
                    ↘ Failed
         (any state) → Cancelled
@@ -151,9 +159,12 @@ The semaphore permit is held by the spawned task and released automatically when
 
 ### Downloader (`downloader.rs`)
 
-**Source routing**: A job whose URL parses as a HuggingFace file reference (`src/huggingface`) is resolved against the HuggingFace tree API instead of CivitAI: the download URL is deterministic, the expected SHA-256 comes from the LFS object ID, and the target subdirectory comes from the job's `model_type` or from the file's directory inside the repo (`split_files/vae/ae.safetensors` → `vae`). HuggingFace downloads need no CivitAI key; the optional `huggingface.token` is sent only when configured, and a 401/403 reports the repo as possibly gated.
+**Source routing**: A job whose URL parses as a HuggingFace file reference (`src/huggingface`) is resolved against the HuggingFace tree API instead of CivitAI: the download URL is deterministic, the
+expected SHA-256 comes from the LFS object ID, and the target subdirectory comes from the job's `model_type` or from the file's directory inside the repo (`split_files/vae/ae.safetensors` → `vae`).
+HuggingFace downloads need no CivitAI key; the optional `huggingface.token` is sent only when configured, and a 401/403 reports the repo as possibly gated.
 
-**API resolution** (`resolve_version`): For CivitAI jobs, the downloader calls the CivitAI API to obtain the authoritative download URL, expected SHA-256 hash, model type subdirectory, base model name, and preview image URL. Three resolution paths:
+**API resolution** (`resolve_version`): For CivitAI jobs, the downloader calls the CivitAI API to obtain the authoritative download URL, expected SHA-256 hash, model type subdirectory, base model
+name, and preview image URL. Three resolution paths:
 
 - Both `model_id` + `version_id` known → parallel `get_model` + `get_model_version` calls.
 - Only `version_id` → single `get_model_version` call.
@@ -180,7 +191,8 @@ Progress notifications are updated every 10% via `notify_download_start` / `upda
 
 ### Scanner (`scanner.rs`)
 
-Runs once at daemon startup. Walks every known model subdirectory (`checkpoints`, `diffusion_models`, `loras`, `vae`, `controlnet`, `embeddings`, `upscale_models`, `other`) looking for model files (`.safetensors`, `.gguf`, `.pt`, `.pth`, `.bin`, `.ckpt`) that are missing a `.metadata.json` or `.preview.*` sidecar. For each such file:
+Runs once at daemon startup. Walks every known model subdirectory (`checkpoints`, `diffusion_models`, `loras`, `vae`, `controlnet`, `embeddings`, `upscale_models`, `other`) looking for model files
+(`.safetensors`, `.gguf`, `.pt`, `.pth`, `.bin`, `.ckpt`) that are missing a `.metadata.json` or `.preview.*` sidecar. For each such file:
 
 1. Computes the SHA-256 hash of the file (blocking task pool).
 2. Calls `CivitaiClient::get_model_version_by_hash` to identify the model.
@@ -244,7 +256,8 @@ Thin wrapper around `notify-rust`:
 
 ## Configuration (`src/config.rs`)
 
-Read from `$XDG_CONFIG_HOME/comfyui-downloader/config.toml` (default: `~/.config/comfyui-downloader/config.toml`). Falls back to built-in defaults if the file is absent; the daemon re-saves the file on startup to persist any newly added default fields.
+Read from `$XDG_CONFIG_HOME/comfyui-downloader/config.toml` (default: `~/.config/comfyui-downloader/config.toml`). Falls back to built-in defaults if the file is absent; the daemon re-saves the file
+on startup to persist any newly added default fields.
 
 | Key | Default |
 |---|---|
@@ -262,7 +275,8 @@ The deprecated `civitai.api_key` and `huggingface.token` fields still deserialis
 
 ## Credentials (`src/secrets.rs`)
 
-Secrets are kept in the freedesktop Secret Service over D-Bus (`org.freedesktop.secrets`: gnome-keyring, KWallet, ...) rather than in `config.toml`. `Store::open` negotiates one encrypted session and is reused for every credential; items are addressed by the attributes `application=comfyui-downloader` and `credential=civitai-api-key` / `huggingface-token`, so labels are cosmetic.
+Secrets are kept in the freedesktop Secret Service over D-Bus (`org.freedesktop.secrets`: gnome-keyring, KWallet, ...) rather than in `config.toml`. `Store::open` negotiates one encrypted session and
+is reused for every credential; items are addressed by the attributes `application=comfyui-downloader` and `credential=civitai-api-key` / `huggingface-token`, so labels are cosmetic.
 
 `Config::resolve_credentials` runs once at daemon startup and fills `Config::secrets`, a `#[serde(skip)]` field that therefore can never be written back to disk. Resolution order per credential:
 
@@ -270,10 +284,13 @@ Secrets are kept in the freedesktop Secret Service over D-Bus (`org.freedesktop.
 2. otherwise the plaintext config field, which is written into the keyring and stripped from `config.toml`
 3. if the Secret Service is unreachable, the plaintext field is used as-is and a warning is logged
 
-Runtime code never touches the config fields directly; it calls `Config::civitai_api_key()` / `Config::huggingface_token()`, which prefer the resolved secret and treat a blank value as unset. `comfyui-dl set-key [--service civitai|huggingface] <VALUE>` writes to the keyring without a daemon connection and clears any plaintext leftover.
+Runtime code never touches the config fields directly; it calls `Config::civitai_api_key()` / `Config::huggingface_token()`, which prefer the resolved secret and treat a blank value as unset.
+`comfyui-dl set-key [--service civitai|huggingface] <VALUE>` writes to the keyring without a daemon connection and clears any plaintext leftover.
 
 ---
 
 ## SystemD integration
 
-The packaged unit file (`systemd/comfyui-downloader.service`) is a **user service** (`WantedBy=default.target`). It starts after `network-online.target`, sets `RUST_LOG=info`, and restarts on failure with a 5 s back-off. The packaged binary must be on `$PATH` because this unit uses a bare `ExecStart=comfyui-downloader`. Per-user installs use `systemd/comfyui-downloader-user.service`, installed as `comfyui-downloader.service`, with `ExecStart=%h/.local/bin/comfyui-downloader` so the unit does not depend on systemd's user-service PATH.
+The packaged unit file (`systemd/comfyui-downloader.service`) is a **user service** (`WantedBy=default.target`). It starts after `network-online.target`, sets `RUST_LOG=info`, and restarts on failure
+with a 5 s back-off. The packaged binary must be on `$PATH` because this unit uses a bare `ExecStart=comfyui-downloader`. Per-user installs use `systemd/comfyui-downloader-user.service`, installed as
+`comfyui-downloader.service`, with `ExecStart=%h/.local/bin/comfyui-downloader` so the unit does not depend on systemd's user-service PATH.
