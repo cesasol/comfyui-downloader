@@ -1,5 +1,12 @@
 # AGENTS.md — Coding Agent Guide
 
+## Agent Behavior
+
+- Distinguish facts from interpretation. Cite verifiable sources; never fabricate links, quotes, or stats.
+- If an statement can be verified, verify it.
+- No preamble. Lead with the answer or deliverable.
+- For any judgment call (architecture, copy, strategy), offer **2–3 alternatives with trade-offs** — never a single option.
+
 ## Build & Development Commands
 
 ```sh
