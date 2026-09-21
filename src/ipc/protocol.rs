@@ -11,6 +11,9 @@ pub enum Request {
         model_type: Option<String>,
         #[serde(default)]
         preferred_file_name: Option<String>,
+        /// Browsing label the user chose for this one file.
+        #[serde(default)]
+        family: Option<String>,
     },
     /// Enqueue several files at once (used by the template picker).
     AddDownloads {
@@ -54,6 +57,12 @@ pub enum Request {
     RedownloadModel {
         id: Uuid,
     },
+    /// Compare the catalog against the filesystem. Reports only, unless
+    /// `repair` is set.
+    Diagnose {
+        #[serde(default)]
+        repair: bool,
+    },
 }
 
 /// One file to enqueue, with the ComfyUI subdirectory it belongs in.
@@ -62,6 +71,15 @@ pub struct QueueItem {
     pub url: String,
     #[serde(default)]
     pub model_type: Option<String>,
+    /// Browsing label chosen for this specific file. A template bundle never
+    /// sets this for every file it contains.
+    #[serde(default)]
+    pub family: Option<String>,
+    /// Family labels of every selected template that references this file. Two
+    /// or more mean the file is shared across families and cannot be attributed
+    /// to any one of them.
+    #[serde(default)]
+    pub template_families: Vec<String>,
 }
 
 /// Response payload of [`Request::ListTemplates`].
@@ -169,6 +187,51 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnose_defaults_to_reporting_only() {
+        let request: Request = serde_json::from_str(r#"{"cmd":"diagnose","payload":{}}"#).unwrap();
+
+        match request {
+            Request::Diagnose { repair } => {
+                assert!(!repair, "doctor must not change anything unasked")
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_file_placement_overrides_round_trip() {
+        let request = Request::AddDownload {
+            url: "https://civitai.com/models/1".to_string(),
+            model_type: Some("diffusion_models".to_string()),
+            preferred_file_name: None,
+            family: Some("My Flux Pile".to_string()),
+        };
+
+        let text = serde_json::to_string(&request).unwrap();
+        let back: Request = serde_json::from_str(&text).unwrap();
+
+        match back {
+            Request::AddDownload {
+                model_type, family, ..
+            } => {
+                assert_eq!(model_type.as_deref(), Some("diffusion_models"));
+                assert_eq!(family.as_deref(), Some("My Flux Pile"));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_queue_item_without_an_override_decodes_as_absent() {
+        let item: QueueItem =
+            serde_json::from_str(r#"{"url":"https://example.com/m.safetensors"}"#).unwrap();
+
+        assert_eq!(item.model_type, None);
+        assert_eq!(item.family, None);
+        assert!(item.template_families.is_empty());
+    }
 
     #[test]
     fn snapshot_round_trips() {
