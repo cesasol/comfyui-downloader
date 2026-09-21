@@ -29,4 +29,12 @@ pub const ALTER_MIGRATIONS: &[&str] = &[
     "ALTER TABLE jobs ADD COLUMN preferred_file_name TEXT",
     "ALTER TABLE jobs ADD COLUMN sha256 TEXT",
     "CREATE INDEX IF NOT EXISTS idx_jobs_sha256 ON jobs(sha256)",
+    "ALTER TABLE jobs ADD COLUMN role_override TEXT",
+    "ALTER TABLE jobs ADD COLUMN family_override TEXT",
+    "ALTER TABLE jobs ADD COLUMN role_source TEXT",
+    "ALTER TABLE jobs ADD COLUMN family TEXT",
+    "ALTER TABLE jobs ADD COLUMN raw_family TEXT",
+    "ALTER TABLE jobs ADD COLUMN family_source TEXT",
+    "ALTER TABLE jobs ADD COLUMN template_declared_role TEXT",
+    "ALTER TABLE jobs ADD COLUMN template_families TEXT",
 ];

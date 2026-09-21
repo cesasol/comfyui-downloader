@@ -29,11 +29,62 @@ pub struct DownloadJob {
     /// metadata before download and reconciled with the computed digest after.
     /// Used to deduplicate byte-identical files across repos and platforms.
     pub sha256: Option<String>,
+    /// Role the user named for this specific file, replayed whenever placement
+    /// is resolved again. `None` means the user named none, never "unknown".
+    pub role_override: Option<String>,
+    /// Role a template declared for this file.
+    pub template_declared_role: Option<String>,
+    /// Family labels of the templates that asked for this file.
+    pub template_families: Vec<String>,
+    /// Browsing label the user chose for this specific file.
+    pub family_override: Option<String>,
+    /// How `model_type` was arrived at. `None` on rows written before
+    /// placement provenance existed; absence is not a declaration.
+    pub role_source: Option<crate::placement::RoleSource>,
+    /// Browsing label the file was filed under.
+    pub family: Option<String>,
+    /// Source label before aliasing.
+    pub raw_family: Option<String>,
+    /// Which evidence level supplied `family`.
+    pub family_source: Option<crate::placement::FamilySource>,
+}
+
+/// What the catalog and the filesystem disagree about.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CatalogReport {
+    /// Rows naming a file that is not on disk. Left alone, `redownload-missing`
+    /// would fetch every one of them again.
+    pub dangling: Vec<DownloadJob>,
+    /// Paths named by more than one row, with how many rows name them.
+    pub duplicate_paths: Vec<(String, u64)>,
+}
+
+/// What a repair changed, and what it refused to decide.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepairOutcome {
+    pub removed_duplicates: u64,
+    pub removed_dangling: u64,
+    /// Rows naming a missing file that nothing else accounts for. Kept, because
+    /// each is the only remaining record of that model.
+    pub unresolved: Vec<DownloadJob>,
+}
+
+/// Explicit per-file placement instructions carried with a queued job. A user
+/// override and a template declaration are stored apart: both are authoritative
+/// over inference, but only the user's outranks the template's.
+#[derive(Debug, Clone, Default)]
+pub struct PlacementOverrides {
+    pub user_role: Option<String>,
+    pub template_role: Option<String>,
+    pub user_family: Option<String>,
+    pub template_families: Vec<String>,
 }
 
 const JOB_COLUMNS: &str = "id, url, model_id, version_id, model_type, dest_path, status, \
      created_at, updated_at, error, download_reason, \
-     available_version_id, available_version_name, last_update_check, preferred_file_name, sha256";
+     available_version_id, available_version_name, last_update_check, preferred_file_name, sha256, \
+     role_override, family_override, role_source, family, raw_family, family_source, \
+     template_declared_role, template_families";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -110,13 +161,33 @@ impl Catalog {
         reason: DownloadReason,
         preferred_file_name: Option<&str>,
     ) -> Result<DownloadJob> {
+        self.enqueue_with_placement(
+            url,
+            model_type,
+            reason,
+            preferred_file_name,
+            &PlacementOverrides::default(),
+        )
+    }
+
+    /// Enqueue a job carrying explicit per-file placement instructions.
+    pub fn enqueue_with_placement(
+        &self,
+        url: &str,
+        model_type: Option<&str>,
+        reason: DownloadReason,
+        preferred_file_name: Option<&str>,
+        overrides: &PlacementOverrides,
+    ) -> Result<DownloadJob> {
         let (model_id, version_id) = parse_civitai_url(url);
 
-        // If we already have a non-terminal-or-completed job for this version,
-        // return it instead of inserting a duplicate. This prevents redownload-missing
-        // (and any caller) from accumulating duplicate done rows for the same file.
+        // If we already have a non-terminal-or-completed job for this exact
+        // request, return it instead of inserting a duplicate. This prevents
+        // redownload-missing (and any caller) from accumulating duplicate done
+        // rows for the same file. A version alone does not identify content.
         if let Some(vid) = version_id
-            && let Some(existing) = self.find_active_or_done_job_by_version(vid)?
+            && let Some(existing) =
+                self.find_active_or_done_job_by_version(vid, model_type, preferred_file_name)?
         {
             return Ok(existing);
         }
@@ -124,9 +195,9 @@ impl Catalog {
         let id = Uuid::new_v4();
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO jobs (id, url, model_id, version_id, model_type, status, created_at, updated_at, download_reason, preferred_file_name)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6, ?7, ?8)",
-            params![id.to_string(), url, model_id, version_id, model_type, now, reason.to_string(), preferred_file_name],
+            "INSERT INTO jobs (id, url, model_id, version_id, model_type, status, created_at, updated_at, download_reason, preferred_file_name, role_override, family_override, template_declared_role, template_families)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![id.to_string(), url, model_id, version_id, model_type, now, reason.to_string(), preferred_file_name, overrides.user_role, overrides.user_family, overrides.template_role, encode_template_families(&overrides.template_families)],
         )?;
         self.get_job(id)?.context("job not found after insert")
     }
@@ -135,10 +206,17 @@ impl Catalog {
     /// in flight (`queued`/`downloading`/`verifying`) or already completed
     /// (`done`). Failed/cancelled rows are ignored so the user can re-add and
     /// retry after a failure.
-    fn find_active_or_done_job_by_version(&self, version_id: u64) -> Result<Option<DownloadJob>> {
+    fn find_active_or_done_job_by_version(
+        &self,
+        version_id: u64,
+        model_type: Option<&str>,
+        preferred_file_name: Option<&str>,
+    ) -> Result<Option<DownloadJob>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {JOB_COLUMNS} FROM jobs \
              WHERE version_id = ?1 \
+               AND (model_type IS ?2 OR ?2 IS NULL) \
+               AND (preferred_file_name IS ?3 OR ?3 IS NULL) \
                AND status IN ('queued', 'downloading', 'verifying', 'done') \
              ORDER BY CASE status \
                         WHEN 'done' THEN 0 \
@@ -149,7 +227,7 @@ impl Catalog {
                       created_at ASC \
              LIMIT 1"
         ))?;
-        let mut rows = stmt.query(params![version_id])?;
+        let mut rows = stmt.query(params![version_id, model_type, preferred_file_name])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row_to_job(row)?))
         } else {
@@ -200,6 +278,29 @@ impl Catalog {
         self.conn.execute(
             "UPDATE jobs SET status = ?1, error = ?2, updated_at = ?3 WHERE id = ?4",
             params![status.to_string(), error, now, id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Store a resolved placement: the role, how it was reached, and the family
+    /// attribution behind it, so the decision can be explained after a restart.
+    pub fn record_placement(
+        &self,
+        id: Uuid,
+        placement: &crate::placement::Placement,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE jobs SET model_type = ?2, role_source = ?3, family = ?4, raw_family = ?5, \
+             family_source = ?6, updated_at = ?7 WHERE id = ?1",
+            params![
+                id.to_string(),
+                placement.role,
+                placement.role_source.as_str(),
+                placement.family,
+                placement.raw_family,
+                placement.family_source.as_str(),
+                Utc::now().to_rfc3339(),
+            ],
         )?;
         Ok(())
     }
@@ -263,6 +364,104 @@ impl Catalog {
         Ok(None)
     }
 
+    /// Compare the catalog against the filesystem without changing anything.
+    pub fn diagnose(&self) -> Result<CatalogReport> {
+        let mut dangling = Vec::new();
+        for job in self.list_jobs()? {
+            if let Some(path) = job.dest_path.as_deref()
+                && !std::path::Path::new(path).exists()
+            {
+                dangling.push(job);
+            }
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT dest_path, count(*) FROM jobs WHERE dest_path IS NOT NULL \
+             GROUP BY dest_path HAVING count(*) > 1 ORDER BY dest_path",
+        )?;
+        let duplicate_paths = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(CatalogReport {
+            dangling,
+            duplicate_paths,
+        })
+    }
+
+    /// Reconcile the catalog with the filesystem.
+    ///
+    /// Two rows naming one path collapse onto the one that still carries the
+    /// CivitAI identifiers, because losing those loses update tracking for that
+    /// model. A row naming a missing file is dropped only when another row
+    /// accounts for the same content; otherwise it is reported and kept.
+    pub fn repair(&self) -> Result<RepairOutcome> {
+        let mut outcome = RepairOutcome::default();
+        let jobs = self.list_jobs()?;
+        let exists = |p: &str| std::path::Path::new(p).exists();
+
+        let mut by_path: HashMap<&str, Vec<&DownloadJob>> = HashMap::new();
+        for job in &jobs {
+            if let Some(path) = job.dest_path.as_deref() {
+                by_path.entry(path).or_default().push(job);
+            }
+        }
+        let mut dropped: Vec<Uuid> = Vec::new();
+        for (_path, mut rows) in by_path {
+            if rows.len() < 2 {
+                continue;
+            }
+            rows.sort_by_key(|job| {
+                (
+                    job.model_id.is_none(),
+                    job.version_id.is_none(),
+                    job.sha256.is_none(),
+                    job.created_at,
+                )
+            });
+            for job in rows.into_iter().skip(1) {
+                dropped.push(job.id);
+                outcome.removed_duplicates += 1;
+            }
+        }
+
+        let live: Vec<&DownloadJob> = jobs
+            .iter()
+            .filter(|job| job.dest_path.as_deref().is_some_and(exists))
+            .collect();
+        for job in &jobs {
+            let Some(path) = job.dest_path.as_deref() else {
+                continue;
+            };
+            if exists(path) || dropped.contains(&job.id) {
+                continue;
+            }
+            let name = std::path::Path::new(path).file_name();
+            let covered = live.iter().any(|other| {
+                let same_content = match (job.sha256.as_deref(), other.sha256.as_deref()) {
+                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                    _ => false,
+                };
+                let same_name = name.is_some()
+                    && std::path::Path::new(other.dest_path.as_deref().unwrap_or_default())
+                        .file_name()
+                        == name;
+                same_content || same_name
+            });
+            if covered {
+                dropped.push(job.id);
+                outcome.removed_dangling += 1;
+            } else {
+                outcome.unresolved.push(job.clone());
+            }
+        }
+
+        for id in &dropped {
+            self.delete_job(*id)?;
+        }
+        Ok(outcome)
+    }
+
     pub fn count_by_status(&self, status: JobStatus) -> Result<u64> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM jobs WHERE status = ?1",
@@ -286,25 +485,52 @@ impl Catalog {
         Ok(())
     }
 
+    /// Delete one placement and return the files that belong to it.
+    ///
+    /// Only files this placement owns are returned. Older rows can share a
+    /// single path, and a distinct placement can hold the same bytes at another
+    /// path; neither may be unlinked because this one was deleted.
     pub fn delete_model(&self, id: Uuid) -> Result<Vec<std::path::PathBuf>> {
         let job = self.get_job(id)?.context("job not found")?;
 
         let mut paths_to_delete = Vec::new();
 
-        if let Some(dest_path) = job.dest_path {
+        if let Some(dest_path) = job.dest_path.filter(|path| {
+            self.other_jobs_sharing_path(id, path)
+                .map(|count| count == 0)
+                .unwrap_or(false)
+        }) {
             let model_path = std::path::PathBuf::from(&dest_path);
             let metadata_path = model_path.with_extension("metadata.json");
+            let placement_path = model_path.with_extension("placement.json");
             let preview_path_jpg = model_path.with_extension("preview.jpg");
             let preview_path_webp = model_path.with_extension("preview.webp");
 
             paths_to_delete.push(model_path);
             paths_to_delete.push(metadata_path);
+            paths_to_delete.push(placement_path);
             paths_to_delete.push(preview_path_jpg);
             paths_to_delete.push(preview_path_webp);
         }
 
-        self.delete_job(id)?;
         Ok(paths_to_delete)
+    }
+
+    /// Drop the catalog row once its files are known to be gone. Kept separate
+    /// from [`Catalog::delete_model`] so a failed unlink leaves the information
+    /// needed to retry rather than an orphaned file with no record.
+    pub fn forget_model(&self, id: Uuid) -> Result<()> {
+        self.delete_job(id)
+    }
+
+    /// How many other rows still name this exact path.
+    fn other_jobs_sharing_path(&self, id: Uuid, dest_path: &str) -> Result<u64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM jobs WHERE dest_path = ?1 AND id != ?2",
+            params![dest_path, id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
     }
 
     pub fn done_jobs_for_model(&self, model_id: u64) -> Result<Vec<DownloadJob>> {
@@ -348,26 +574,18 @@ impl Catalog {
         reason: DownloadReason,
         preferred_file_name: Option<&str>,
     ) -> Result<Option<DownloadJob>> {
-        // Deduplicate: prefer version_id; fall back to dest_path.
-        if let Some(vid) = version_id {
-            let count: i64 = self.conn.query_row(
-                "SELECT COUNT(*) FROM jobs WHERE version_id = ?1",
-                params![vid],
-                |row| row.get(0),
-            )?;
-            if count > 0 {
-                return Ok(None);
-            }
-        } else {
-            let dest_str = dest_path.to_string_lossy();
-            let count: i64 = self.conn.query_row(
-                "SELECT COUNT(*) FROM jobs WHERE dest_path = ?1",
-                params![dest_str.as_ref()],
-                |row| row.get(0),
-            )?;
-            if count > 0 {
-                return Ok(None);
-            }
+        // A placement is identified by its path. A path already in the catalog
+        // must not gain a second record, and a path that is not in the catalog
+        // is a placement of its own even when its version is known elsewhere:
+        // one file can legitimately sit in two folders.
+        let dest_str = dest_path.to_string_lossy();
+        let tracked: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM jobs WHERE dest_path = ?1",
+            params![dest_str.as_ref()],
+            |row| row.get(0),
+        )?;
+        if tracked > 0 {
+            return Ok(None);
         }
 
         let id = Uuid::new_v4();
@@ -619,6 +837,15 @@ impl Catalog {
     }
 }
 
+/// Store template family labels as JSON. `None` when there are none, so an
+/// absent value stays absent rather than becoming an empty claim.
+fn encode_template_families(labels: &[String]) -> Option<String> {
+    if labels.is_empty() {
+        return None;
+    }
+    serde_json::to_string(labels).ok()
+}
+
 /// Extract (model_id, version_id) from a CivitAI URL.
 pub(crate) fn parse_civitai_url(url: &str) -> (Option<u64>, Option<u64>) {
     let (path, query) = url.split_once('?').unwrap_or((url, ""));
@@ -665,6 +892,23 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadJob> {
         .map(|dt| dt.with_timezone(&Utc));
     let preferred_file_name: Option<String> = row.get(14)?;
     let sha256: Option<String> = row.get(15)?;
+    let role_override: Option<String> = row.get(16)?;
+    let family_override: Option<String> = row.get(17)?;
+    let role_source = row
+        .get::<_, Option<String>>(18)?
+        .as_deref()
+        .and_then(crate::placement::RoleSource::parse);
+    let family: Option<String> = row.get(19)?;
+    let raw_family: Option<String> = row.get(20)?;
+    let family_source = row
+        .get::<_, Option<String>>(21)?
+        .as_deref()
+        .and_then(crate::placement::FamilySource::parse);
+    let template_declared_role: Option<String> = row.get(22)?;
+    let template_families: Vec<String> = row
+        .get::<_, Option<String>>(23)?
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
     Ok(DownloadJob {
         id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
         url: row.get(1)?,
@@ -686,12 +930,478 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadJob> {
         last_update_check,
         preferred_file_name,
         sha256,
+        role_override,
+        template_declared_role,
+        template_families,
+        family_override,
+        role_source,
+        family,
+        raw_family,
+        family_source,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn done_job_at(catalog: &Catalog, url: &str, dest: &str, sha256: &str) -> Uuid {
+        let job = catalog
+            .enqueue(url, Some("loras"), DownloadReason::CliAdd, None)
+            .unwrap();
+        catalog
+            .set_dest_path(job.id, std::path::Path::new(dest))
+            .unwrap();
+        catalog.set_sha256(job.id, sha256).unwrap();
+        catalog.set_status(job.id, JobStatus::Done, None).unwrap();
+        job.id
+    }
+
+    #[test]
+    fn test_scanning_does_not_add_a_second_record_for_a_tracked_path() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let path = std::path::Path::new("/models/loras/m.safetensors");
+        done_job_at(
+            &catalog,
+            "https://civitai.com/models/30?modelVersionId=31",
+            "/models/loras/m.safetensors",
+            "dd",
+        );
+
+        let registered = catalog
+            .register_existing(
+                "https://civitai.com/models/30?modelVersionId=32",
+                Some(30),
+                Some(32),
+                Some("loras"),
+                path,
+                DownloadReason::StartupScan,
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            registered.is_none(),
+            "a path already in the catalog must not gain a second record"
+        );
+    }
+
+    #[test]
+    fn test_scanning_records_a_second_placement_of_a_known_version() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        done_job_at(
+            &catalog,
+            "https://civitai.com/models/40?modelVersionId=41",
+            "/models/loras/m.safetensors",
+            "ee",
+        );
+
+        let registered = catalog
+            .register_existing(
+                "https://civitai.com/models/40?modelVersionId=41",
+                Some(40),
+                Some(41),
+                Some("checkpoints"),
+                std::path::Path::new("/models/checkpoints/m.safetensors"),
+                DownloadReason::StartupScan,
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            registered.is_some(),
+            "a distinct path is a distinct placement even for a known version"
+        );
+    }
+
+    #[test]
+    fn test_one_version_wanted_in_two_roles_yields_two_jobs() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let url = "https://civitai.com/models/20?modelVersionId=21";
+
+        let first = catalog
+            .enqueue(url, Some("checkpoints"), DownloadReason::CliAdd, None)
+            .unwrap();
+        let second = catalog
+            .enqueue(url, Some("diffusion_models"), DownloadReason::CliAdd, None)
+            .unwrap();
+
+        assert_ne!(
+            first.id, second.id,
+            "two roles are two placements, not one job"
+        );
+    }
+
+    #[test]
+    fn test_repair_keeps_the_row_that_can_still_track_updates() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("model.safetensors");
+        std::fs::write(&live, b"weights").unwrap();
+        let path = live.to_str().unwrap();
+        // the rich row: a CivitAI url gives it a model_id, so the updater can use it
+        let rich = done_job_at(
+            &catalog,
+            "https://civitai.com/models/80?modelVersionId=81",
+            path,
+            "cc",
+        );
+        // the poor row: registered by a scan, hash only
+        let poor = done_job_at(
+            &catalog,
+            "https://huggingface.co/org/repo/resolve/main/m.safetensors",
+            path,
+            "cc",
+        );
+
+        let outcome = catalog.repair().unwrap();
+
+        assert_eq!(outcome.removed_duplicates, 1);
+        assert!(
+            catalog.get_job(rich).unwrap().is_some(),
+            "the update-trackable row must survive"
+        );
+        assert!(catalog.get_job(poor).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_repair_drops_a_dangling_row_whose_content_lives_elsewhere() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("model.safetensors");
+        std::fs::write(&live, b"weights").unwrap();
+        let kept = done_job_at(
+            &catalog,
+            "https://civitai.com/models/90",
+            live.to_str().unwrap(),
+            "dd",
+        );
+        let stale = done_job_at(
+            &catalog,
+            "https://civitai.com/models/91",
+            "/models/loras/old.safetensors",
+            "dd",
+        );
+
+        let outcome = catalog.repair().unwrap();
+
+        assert_eq!(outcome.removed_dangling, 1);
+        assert!(catalog.get_job(stale).unwrap().is_none());
+        assert!(catalog.get_job(kept).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_repair_keeps_a_dangling_row_nothing_else_covers() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let orphan = done_job_at(
+            &catalog,
+            "https://civitai.com/models/92",
+            "/models/loras/vanished.safetensors",
+            "ee",
+        );
+
+        let outcome = catalog.repair().unwrap();
+
+        assert_eq!(outcome.removed_dangling, 0);
+        assert_eq!(outcome.unresolved.len(), 1);
+        assert!(
+            catalog.get_job(orphan).unwrap().is_some(),
+            "a row that is the only record of a model must not be discarded silently"
+        );
+    }
+
+    #[test]
+    fn test_diagnose_reports_dangling_rows_and_duplicate_paths() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("present.safetensors");
+        std::fs::write(&live, b"weights").unwrap();
+
+        // one row whose file is gone
+        done_job_at(
+            &catalog,
+            "https://civitai.com/models/70",
+            "/models/loras/gone.safetensors",
+            "aa",
+        );
+        // two rows naming one live path
+        done_job_at(
+            &catalog,
+            "https://civitai.com/models/71",
+            live.to_str().unwrap(),
+            "bb",
+        );
+        done_job_at(
+            &catalog,
+            "https://civitai.com/models/72",
+            live.to_str().unwrap(),
+            "bb",
+        );
+
+        let report = catalog.diagnose().unwrap();
+
+        assert_eq!(report.dangling.len(), 1);
+        assert!(
+            report.dangling[0]
+                .dest_path
+                .as_deref()
+                .unwrap()
+                .ends_with("gone.safetensors")
+        );
+        assert_eq!(report.duplicate_paths.len(), 1);
+        assert_eq!(report.duplicate_paths[0].1, 2);
+    }
+
+    #[test]
+    fn test_a_routine_update_check_leaves_an_established_placement_alone() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog
+            .enqueue(
+                "https://civitai.com/models/60?modelVersionId=61",
+                Some("checkpoints"),
+                DownloadReason::CliAdd,
+                None,
+            )
+            .unwrap();
+        // A file the old routing rules put somewhere the current rules would not.
+        let established = "/models/checkpoints/Wan2.1/model.safetensors";
+        catalog
+            .set_dest_path(job.id, std::path::Path::new(established))
+            .unwrap();
+        catalog
+            .record_placement(
+                job.id,
+                &crate::placement::Placement {
+                    role: "checkpoints".to_string(),
+                    role_source: crate::placement::RoleSource::SourceMetadata,
+                    family: Some("Wan2.1".to_string()),
+                    raw_family: Some("Wan2.1".to_string()),
+                    family_source: crate::placement::FamilySource::FileSpecificMetadata,
+                    relative_dir: std::path::PathBuf::from("checkpoints/Wan2.1"),
+                },
+            )
+            .unwrap();
+        catalog.set_status(job.id, JobStatus::Done, None).unwrap();
+
+        catalog.flag_update_available(60, 62, "v2").unwrap();
+
+        let reloaded = catalog.get_job(job.id).unwrap().unwrap();
+        assert_eq!(reloaded.dest_path.as_deref(), Some(established));
+        assert_eq!(reloaded.model_type.as_deref(), Some("checkpoints"));
+        assert_eq!(reloaded.family.as_deref(), Some("Wan2.1"));
+        assert_eq!(reloaded.available_version_id, Some(62));
+    }
+
+    #[test]
+    fn test_one_version_wanted_as_two_file_variants_yields_two_jobs() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let url = "https://civitai.com/models/50?modelVersionId=51";
+
+        let fp16 = catalog
+            .enqueue(
+                url,
+                Some("checkpoints"),
+                DownloadReason::CliAdd,
+                Some("model-fp16.safetensors"),
+            )
+            .unwrap();
+        let fp8 = catalog
+            .enqueue(
+                url,
+                Some("checkpoints"),
+                DownloadReason::CliAdd,
+                Some("model-fp8.safetensors"),
+            )
+            .unwrap();
+
+        assert_ne!(
+            fp16.id, fp8.id,
+            "file selection changes the requested content, so these are two placements"
+        );
+    }
+
+    #[test]
+    fn test_one_version_wanted_twice_in_one_role_yields_one_job() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let url = "https://civitai.com/models/22?modelVersionId=23";
+
+        let first = catalog
+            .enqueue(url, Some("loras"), DownloadReason::CliAdd, None)
+            .unwrap();
+        let second = catalog
+            .enqueue(url, Some("loras"), DownloadReason::CliAdd, None)
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+    }
+
+    #[test]
+    fn test_a_placement_is_only_forgotten_after_its_files_are_gone() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let id = done_job_at(
+            &catalog,
+            "https://civitai.com/models/14",
+            "/models/loras/m.safetensors",
+            "cc",
+        );
+
+        let paths = catalog.delete_model(id).unwrap();
+
+        assert!(!paths.is_empty());
+        assert!(
+            catalog.get_job(id).unwrap().is_some(),
+            "the row must survive until the caller reports the files were removed"
+        );
+
+        catalog.forget_model(id).unwrap();
+
+        assert!(catalog.get_job(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_deleting_a_placement_spares_a_path_another_job_still_references() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let shared = "/models/loras/shared.safetensors";
+        let first = done_job_at(&catalog, "https://civitai.com/models/10", shared, "aa");
+        done_job_at(&catalog, "https://civitai.com/models/11", shared, "aa");
+
+        let paths = catalog.delete_model(first).unwrap();
+
+        assert!(
+            !paths.iter().any(|p| p == std::path::Path::new(shared)),
+            "a path another job still points at must not be unlinked: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn test_deleting_one_placement_leaves_a_distinct_placement_of_the_same_bytes() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let mine = "/models/loras/Flux.1 D/model.safetensors";
+        let first = done_job_at(&catalog, "https://civitai.com/models/12", mine, "bb");
+        let second = done_job_at(
+            &catalog,
+            "https://civitai.com/models/13",
+            "/models/checkpoints/Flux.1 D/model.safetensors",
+            "bb",
+        );
+
+        let paths = catalog.delete_model(first).unwrap();
+
+        assert!(paths.iter().any(|p| p == std::path::Path::new(mine)));
+        assert!(
+            catalog.get_job(second).unwrap().is_some(),
+            "the other placement of the same bytes must survive"
+        );
+    }
+
+    #[test]
+    fn test_a_template_declaration_is_not_stored_as_a_user_override() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let overrides = PlacementOverrides {
+            template_role: Some("checkpoints".to_string()),
+            ..PlacementOverrides::default()
+        };
+
+        let job = catalog
+            .enqueue_with_placement(
+                "https://huggingface.co/org/repo/resolve/main/m.safetensors",
+                Some("checkpoints"),
+                DownloadReason::CliAdd,
+                None,
+                &overrides,
+            )
+            .unwrap();
+        let reloaded = catalog.get_job(job.id).unwrap().unwrap();
+
+        assert_eq!(
+            reloaded.template_declared_role.as_deref(),
+            Some("checkpoints")
+        );
+        assert_eq!(reloaded.role_override, None);
+    }
+
+    #[test]
+    fn test_a_recorded_placement_decision_survives_a_round_trip() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let job = catalog
+            .enqueue(
+                "https://civitai.com/models/2",
+                None,
+                DownloadReason::CliAdd,
+                None,
+            )
+            .unwrap();
+        let placement = crate::placement::Placement {
+            role: "diffusion_models".to_string(),
+            role_source: crate::placement::RoleSource::SourceMetadata,
+            family: Some("Wan Video 2.2".to_string()),
+            raw_family: Some("Wan2.2".to_string()),
+            family_source: crate::placement::FamilySource::FileSpecificMetadata,
+            relative_dir: std::path::PathBuf::from("diffusion_models/Wan Video 2.2"),
+        };
+
+        catalog.record_placement(job.id, &placement).unwrap();
+        let reloaded = catalog.get_job(job.id).unwrap().unwrap();
+
+        assert_eq!(reloaded.model_type.as_deref(), Some("diffusion_models"));
+        assert_eq!(
+            reloaded.role_source,
+            Some(crate::placement::RoleSource::SourceMetadata)
+        );
+        assert_eq!(reloaded.family.as_deref(), Some("Wan Video 2.2"));
+        assert_eq!(reloaded.raw_family.as_deref(), Some("Wan2.2"));
+        assert_eq!(
+            reloaded.family_source,
+            Some(crate::placement::FamilySource::FileSpecificMetadata)
+        );
+    }
+
+    #[test]
+    fn test_a_legacy_row_reports_no_placement_provenance() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        catalog
+            .conn
+            .execute(
+                "INSERT INTO jobs (id, url, model_type, status, created_at, updated_at, download_reason)
+                 VALUES (?1, ?2, 'checkpoints', 'done', ?3, ?3, 'cli_add')",
+                params![id.to_string(), "https://civitai.com/models/3", now],
+            )
+            .unwrap();
+
+        let job = catalog.get_job(id).unwrap().unwrap();
+
+        assert_eq!(job.model_type.as_deref(), Some("checkpoints"));
+        assert_eq!(job.role_source, None);
+        assert_eq!(job.family, None);
+        assert_eq!(job.family_source, None);
+        assert_eq!(job.role_override, None);
+    }
+
+    #[test]
+    fn test_placement_overrides_survive_a_round_trip() {
+        let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
+        let overrides = PlacementOverrides {
+            user_role: Some("diffusion_models".to_string()),
+            user_family: Some("My Flux Pile".to_string()),
+            ..PlacementOverrides::default()
+        };
+
+        let job = catalog
+            .enqueue_with_placement(
+                "https://civitai.com/models/1",
+                None,
+                DownloadReason::CliAdd,
+                None,
+                &overrides,
+            )
+            .unwrap();
+        let reloaded = catalog.get_job(job.id).unwrap().unwrap();
+
+        assert_eq!(reloaded.role_override.as_deref(), Some("diffusion_models"));
+        assert_eq!(reloaded.family_override.as_deref(), Some("My Flux Pile"));
+    }
 
     #[test]
     fn test_parse_model_page_url() {
@@ -795,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn test_register_existing_deduplicates_by_version_id() {
+    fn test_register_existing_keeps_two_paths_of_one_version_apart() {
         let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
         let first = catalog
             .register_existing(
@@ -820,7 +1530,10 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(second.is_none(), "duplicate version_id must return None");
+        assert!(
+            second.is_some(),
+            "a second file of the same version at another path is another placement"
+        );
     }
 
     #[test]
@@ -994,12 +1707,17 @@ mod tests {
 
         let paths = catalog.delete_model(job.id).unwrap();
 
-        assert_eq!(paths.len(), 4);
+        assert_eq!(paths.len(), 5);
         assert!(paths.contains(&std::path::PathBuf::from("/tmp/model.safetensors")));
         assert!(paths.contains(&std::path::PathBuf::from("/tmp/model.metadata.json")));
         assert!(paths.contains(&std::path::PathBuf::from("/tmp/model.preview.jpg")));
         assert!(paths.contains(&std::path::PathBuf::from("/tmp/model.preview.webp")));
+        assert!(
+            paths.contains(&std::path::PathBuf::from("/tmp/model.placement.json")),
+            "the placement-local sidecar belongs to this placement: {paths:?}"
+        );
 
+        catalog.forget_model(job.id).unwrap();
         assert!(catalog.get_job(job.id).unwrap().is_none());
     }
 
