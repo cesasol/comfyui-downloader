@@ -74,8 +74,9 @@ install-user: build
     install -Dm755 target/release/comfyui-downloader {{ USER_BINDIR }}/comfyui-downloader
     install -Dm755 target/release/comfyui-dl         {{ USER_BINDIR }}/comfyui-dl
     install -Dm644 systemd/comfyui-downloader-user.service {{ USER_SYSTEMD }}/comfyui-downloader.service
+    systemctl --user daemon-reload
+    systemctl --user restart comfyui-downloader
     @echo "Installed to {{ USER_BINDIR }}. Reload the user units with:"
-    @echo "  systemctl --user daemon-reload"
     @echo "  systemctl --user enable --now comfyui-downloader.service"
 
 # Uninstall the per-user install
