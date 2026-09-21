@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod gpu;
 pub mod huggingface;
 pub mod ipc;
+pub mod placement;
 pub(crate) mod safetensor;
 pub mod secrets;
 pub mod templates;
