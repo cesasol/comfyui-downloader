@@ -2,6 +2,7 @@ pub mod downloader;
 pub mod notifier;
 pub mod queue;
 pub mod scanner;
+pub mod store;
 #[cfg(feature = "tray-icon")]
 pub mod systray;
 pub mod updater;
@@ -25,6 +26,9 @@ pub async fn run() -> Result<()> {
     // Credentials live in the Secret Service; this also migrates any plaintext
     // ones left in config.toml by an older version.
     config.resolve_credentials().await?;
+    if config.initialise_model_families(crate::placement::DEFAULT_FAMILY_ALIASES) {
+        info!("Initialised the model-family alias snapshot");
+    }
     config.save()?; // Persist any new fields added since the config was last written.
     info!("Loaded config from {}", Config::config_path().display());
     let config = Arc::new(config);
@@ -181,6 +185,44 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Model files present on disk that no catalog row names.
+fn untracked_models(
+    catalog: &Catalog,
+    models_dir: &std::path::Path,
+) -> anyhow::Result<Vec<String>> {
+    const MODEL_EXTENSIONS: [&str; 7] = ["safetensors", "gguf", "ckpt", "pt", "pth", "bin", "onnx"];
+    let tracked: std::collections::HashSet<String> = catalog
+        .list_jobs()?
+        .into_iter()
+        .filter_map(|job| job.dest_path)
+        .collect();
+    let mut untracked = Vec::new();
+    let mut stack = vec![models_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push(path),
+                Ok(t) if t.is_file() => {
+                    let is_model = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| MODEL_EXTENSIONS.contains(&e));
+                    if is_model && !tracked.contains(&path.to_string_lossy().to_string()) {
+                        untracked.push(path.to_string_lossy().into_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    untracked.sort();
+    Ok(untracked)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_request(
     req: Request,
@@ -197,13 +239,20 @@ async fn handle_request(
             url,
             model_type,
             preferred_file_name,
+            family,
         } => {
             let cat = catalog.lock().await;
-            match cat.enqueue(
+            let overrides = crate::catalog::PlacementOverrides {
+                user_role: model_type.clone(),
+                user_family: family,
+                ..Default::default()
+            };
+            match cat.enqueue_with_placement(
                 &url,
                 model_type.as_deref(),
                 crate::catalog::DownloadReason::CliAdd,
                 preferred_file_name.as_deref(),
+                &overrides,
             ) {
                 Ok(job) => Response::ok(job),
                 Err(e) => Response::err(e.to_string()),
@@ -214,11 +263,18 @@ async fn handle_request(
             let mut jobs = Vec::new();
             let mut errors = Vec::new();
             for item in &items {
-                match cat.enqueue(
+                let overrides = crate::catalog::PlacementOverrides {
+                    template_role: item.model_type.clone(),
+                    user_family: item.family.clone(),
+                    template_families: item.template_families.clone(),
+                    ..Default::default()
+                };
+                match cat.enqueue_with_placement(
                     &item.url,
                     item.model_type.as_deref(),
                     crate::catalog::DownloadReason::CliAdd,
                     None,
+                    &overrides,
                 ) {
                     Ok(job) => jobs.push(job),
                     Err(e) => errors.push(format!("{}: {e}", item.url)),
@@ -317,15 +373,54 @@ async fn handle_request(
             match cat.delete_model(id) {
                 Ok(deleted_paths) => {
                     drop(cat);
+                    let mut failures = Vec::new();
                     for path in deleted_paths {
-                        if let Err(e) = tokio::fs::remove_file(&path).await {
-                            warn!("Failed to delete file {}: {}", path.display(), e);
+                        match tokio::fs::remove_file(&path).await {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => {
+                                warn!("Failed to delete file {}: {}", path.display(), e);
+                                failures.push(format!("{}: {e}", path.display()));
+                            }
                         }
                     }
-                    Response::ok(serde_json::json!({ "deleted": id }))
+                    if failures.is_empty() {
+                        let cat = catalog.lock().await;
+                        if let Err(e) = cat.forget_model(id) {
+                            return Response::err(format!("removing catalog row: {e}"));
+                        }
+                        Response::ok(serde_json::json!({ "deleted": id }))
+                    } else {
+                        Response::err(format!(
+                            "kept the catalog entry because files could not be removed: {}",
+                            failures.join("; ")
+                        ))
+                    }
                 }
                 Err(e) => Response::err(e.to_string()),
             }
+        }
+        Request::Diagnose { repair } => {
+            let cat = catalog.lock().await;
+            let report = match cat.diagnose() {
+                Ok(report) => report,
+                Err(e) => return Response::err(format!("{e:#}")),
+            };
+            let repaired = if repair {
+                match cat.repair() {
+                    Ok(outcome) => Some(outcome),
+                    Err(e) => return Response::err(format!("{e:#}")),
+                }
+            } else {
+                None
+            };
+            let untracked = untracked_models(&cat, models_dir).unwrap_or_default();
+            Response::ok(serde_json::json!({
+                "dangling": report.dangling,
+                "duplicate_paths": report.duplicate_paths,
+                "untracked": untracked,
+                "repaired": repaired,
+            }))
         }
         Request::GetStatus => {
             let snap = build_snapshot(&catalog, &progress, models_dir).await;
