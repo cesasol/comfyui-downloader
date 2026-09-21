@@ -29,7 +29,7 @@ pub struct DownloadOutcome {
     pub deduplicated: bool,
 }
 
-struct VersionResolution {
+pub(crate) struct VersionResolution {
     download_url: String,
     expected_hash: Option<String>,
     /// ComfyUI models subdirectory derived from the CivitAI model type (e.g. "checkpoints").
@@ -380,56 +380,105 @@ pub async fn download(
 
     let resolution = resolve_version(job, civitai, config).await?;
 
-    // Content-addressed dedup: if the source declared a SHA-256 and another
-    // completed job already holds a file with that exact hash on disk, reuse it
-    // instead of downloading the same bytes again. This consolidates copies of
-    // the same file across repos and across HuggingFace and CivitAI.
-    if let Some(expected) = resolution.expected_hash.as_deref() {
-        let existing = {
-            let cat = catalog.lock().await;
-            cat.find_done_job_by_sha256(expected, job.id).ok().flatten()
-        };
-        if let Some(existing) = existing
-            && let Some(dest_path) = existing.dest_path.as_deref()
-        {
-            let dest = PathBuf::from(dest_path);
-            info!(
-                "Identical file already present (sha256 {expected}), reusing {}",
-                dest.display()
-            );
+    let aliases = config
+        .model_families
+        .alias_table()
+        .context("reading the model-family aliases from config.toml")?;
+    let (role_evidence, family_evidence) = placement_evidence(job, &resolution);
+    // Content evidence needs the bytes, so this placement is provisional: it is
+    // resolved again below once the file has been inspected.
+    let mut placement = crate::placement::resolve(
+        &role_evidence,
+        &crate::placement::ContentEvidence::default(),
+        &family_evidence,
+        &aliases,
+    )?;
+    let mut dest_dir = config.paths.models_dir.join(&placement.relative_dir);
+
+    // An occupied destination is only reusable once the bytes there are known
+    // to be the requested content. A catalogued hash or a matching filename is
+    // not evidence about the file that is on disk now.
+    if let Some(ref name) = resolution.filename {
+        let existing = dest_dir.join(name);
+        if existing.exists() {
+            let Some(expected) = resolution.expected_hash.as_deref() else {
+                bail!(
+                    "{} already exists and the source published no SHA-256, so its content cannot be verified",
+                    existing.display()
+                );
+            };
+            let digest = crate::daemon::store::sha256_of_file(&existing)
+                .await
+                .map_err(|cause| {
+                    anyhow::anyhow!("cannot verify {}: {cause}", existing.display())
+                })?;
+            if !digest.eq_ignore_ascii_case(expected) {
+                bail!(
+                    "{} already holds different content (found {digest}, expected {expected})",
+                    existing.display()
+                );
+            }
+            info!("Verified content already present at {}", existing.display());
             return Ok(DownloadOutcome {
-                dest,
-                model_type: resolution.model_type_subdir.clone(),
-                sha256: Some(expected.to_ascii_lowercase()),
+                dest: existing,
+                model_type: Some(placement.role.clone()),
+                sha256: Some(digest),
                 deduplicated: true,
             });
         }
     }
 
-    let mut model_type_str = resolution
-        .model_type_subdir
-        .clone()
-        .or_else(|| job.model_type.clone())
-        .unwrap_or_else(|| "other".to_string());
-    let mut dest_dir = config.paths.models_dir.join(&model_type_str);
-    if let Some(ref base_model) = resolution.base_model {
-        dest_dir = dest_dir.join(sanitize_dir_name(base_model));
-    }
-    // Check if the target file already exists before downloading.
-    if let Some(ref name) = resolution.filename {
-        let existing = dest_dir.join(name);
-        if existing.exists() {
+    // Content already verified elsewhere is reused by cloning it into this
+    // placement, so both are independent files. A clone that cannot be made
+    // fails this placement: a byte copy, a link, or a fresh download would each
+    // produce something other than what was asked for.
+    if let (Some(expected), Some(name)) = (
+        resolution.expected_hash.as_deref(),
+        resolution.filename.as_deref(),
+    ) {
+        let existing = {
+            let cat = catalog.lock().await;
+            cat.find_done_job_by_sha256(expected, job.id).ok().flatten()
+        };
+        if let Some(source_path) = existing.and_then(|job| job.dest_path) {
+            let source = PathBuf::from(&source_path);
+            let dest = dest_dir.join(name);
             info!(
-                "File already exists, skipping download: {}",
-                existing.display()
+                "Reusing verified content from {} for {}",
+                source.display(),
+                dest.display()
             );
+            let outcome =
+                crate::daemon::store::publish_by_clone(&crate::daemon::store::ClonedPlacement {
+                    source: &source,
+                    dest: &dest,
+                    expected_sha256: expected,
+                    requested_url: &job.url,
+                })
+                .await?;
+            if let Err(e) = crate::daemon::store::write_placement_sidecar(
+                &dest, &placement, expected, &job.url, outcome,
+            )
+            .await
+            {
+                warn!(
+                    "Failed to write the placement sidecar for {}: {e:#}",
+                    dest.display()
+                );
+            }
+            {
+                let cat = catalog.lock().await;
+                if let Err(e) = cat.record_placement(job.id, &placement) {
+                    warn!(
+                        "Failed to record the placement decision for job {}: {e:#}",
+                        job.id
+                    );
+                }
+            }
             return Ok(DownloadOutcome {
-                dest: existing,
-                model_type: resolution.model_type_subdir.clone(),
-                sha256: resolution
-                    .expected_hash
-                    .clone()
-                    .map(|h| h.to_ascii_lowercase()),
+                dest,
+                model_type: Some(placement.role.clone()),
+                sha256: Some(expected.to_ascii_lowercase()),
                 deduplicated: true,
             });
         }
@@ -500,11 +549,18 @@ pub async fn download(
     }
 
     let total_bytes = resp.content_length();
-    let filename = resp
-        .headers()
-        .get("content-disposition")
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse_filename_from_cd)
+    // One filename policy, used by the existing-path check, content reuse and
+    // this transfer alike: the name the source published, else the one the
+    // response declares, else the last URL segment.
+    let filename = resolution
+        .filename
+        .clone()
+        .or_else(|| {
+            resp.headers()
+                .get("content-disposition")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_filename_from_cd)
+        })
         .unwrap_or_else(|| {
             resolution
                 .download_url
@@ -535,7 +591,9 @@ pub async fn download(
 
     info!(
         "Downloading '{}' → {}/{}",
-        filename, model_type_str, filename
+        filename,
+        placement.relative_dir.display(),
+        filename
     );
 
     if let (Some(url), Some(path)) = (
@@ -674,38 +732,53 @@ pub async fn download(
         info!("Checksum verified");
     } else {
         warn!("No SHA-256 hash available for this file, skipping verification");
-    }
-
-    if model_type_str == "checkpoints" && !is_video_checkpoint(resolution.base_model.as_deref()) {
-        let ext = dest.extension().and_then(|e| e.to_str());
-        let reroute = match ext {
-            Some("gguf") => true,
-            Some("safetensors") => match crate::safetensor::inspect_components(&tmp).await {
-                Ok(c) if !c.has_vae && !c.has_clip => true,
-                Ok(_) => {
-                    info!("VAE/CLIP found in safetensors header, keeping in checkpoints");
-                    false
-                }
-                Err(e) => {
-                    warn!("Failed to inspect safetensors header: {e:#}; defaulting to checkpoints");
-                    false
-                }
-            },
-            _ => false,
-        };
-        if reroute {
-            info!("Routing checkpoint to diffusion_models");
-            model_type_str = "diffusion_models".to_string();
-            dest_dir = config.paths.models_dir.join(&model_type_str);
-            if let Some(ref base_model) = resolution.base_model {
-                dest_dir = dest_dir.join(sanitize_dir_name(base_model));
-            }
-            fs::create_dir_all(&dest_dir)
-                .await
-                .with_context(|| format!("creating model directory {}", dest_dir.display()))?;
-            dest = dest_dir.join(&filename);
+        // Nothing has vouched for these bytes: an error page or a truncated
+        // transfer would otherwise be published and fail only at load time.
+        if dest.extension().and_then(|e| e.to_str()) == Some("safetensors")
+            && let Err(e) = crate::safetensor::verify_parseable(&tmp).await
+        {
+            fs::remove_file(&tmp).await.ok();
+            return Err(e.context(
+                "the download could not be verified by hash and its content is not a model",
+            ));
         }
     }
+
+    let extension = dest.extension().and_then(|e| e.to_str());
+    let inspected = if extension == Some("safetensors") {
+        match crate::safetensor::inspect_components(&tmp).await {
+            Ok(components) => Some(components),
+            Err(e) => {
+                warn!("Failed to inspect safetensors header: {e:#}; leaving the role as resolved");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let content = crate::placement::ContentEvidence {
+        bundles_components: inspected
+            .as_ref()
+            .map(|components| components.has_vae || components.has_clip),
+        is_gguf: extension == Some("gguf"),
+        is_standalone_vae: inspected
+            .as_ref()
+            .is_some_and(|components| components.is_standalone_vae),
+    };
+    let resolved = crate::placement::resolve(&role_evidence, &content, &family_evidence, &aliases)?;
+    if resolved.relative_dir != placement.relative_dir {
+        info!(
+            "Placing {} under {}",
+            filename,
+            resolved.relative_dir.display()
+        );
+        dest_dir = config.paths.models_dir.join(&resolved.relative_dir);
+        fs::create_dir_all(&dest_dir)
+            .await
+            .with_context(|| format!("creating model directory {}", dest_dir.display()))?;
+        dest = dest_dir.join(&filename);
+    }
+    placement = resolved;
 
     fs::rename(&tmp, &dest)
         .await
@@ -723,6 +796,15 @@ pub async fn download(
     {
         warn!("Failed to move preview sidecar: {e}");
     }
+    {
+        let cat = catalog.lock().await;
+        if let Err(e) = cat.record_placement(job.id, &placement) {
+            warn!(
+                "Failed to record the placement decision for job {}: {e:#}",
+                job.id
+            );
+        }
+    }
     write_metadata(&dest, &resolution, &digest, preview_path.as_ref()).await;
     if let (Some(url), Some(path)) = (
         resolution.preview_image_url.as_deref(),
@@ -732,7 +814,7 @@ pub async fn download(
     }
     Ok(DownloadOutcome {
         dest,
-        model_type: Some(model_type_str),
+        model_type: Some(placement.role.clone()),
         sha256: Some(digest),
         deduplicated: false,
     })
@@ -1005,35 +1087,34 @@ pub(crate) fn free_disk_bytes(path: &std::path::Path) -> Result<u64> {
     Ok(stat.f_bavail * stat.f_frsize)
 }
 
-/// Check whether a checkpoint model is a video-generation model (LTXV, CogVideo,
-/// WAN, Mochi, HunyuanVideo, etc.) These are full checkpoints that do not bundle
-/// VAE/CLIP weights, so the standard "no VAE/CLIP → diffusion_models" reroute
-/// should not apply to them.
-pub(crate) fn is_video_checkpoint(base_model: Option<&str>) -> bool {
-    let Some(bm) = base_model else {
-        return false;
+/// Map a queued job and its resolved source metadata onto placement evidence.
+///
+/// The two role fields stay separate on purpose: a template declaration is
+/// authoritative and never rerouted, while a role derived from a CivitAI model
+/// type or a HuggingFace repository path is only inference.
+pub(crate) fn placement_evidence(
+    job: &DownloadJob,
+    resolution: &VersionResolution,
+) -> (
+    crate::placement::RoleEvidence,
+    crate::placement::FamilyEvidence,
+) {
+    let role = crate::placement::RoleEvidence {
+        user_override: job.role_override.clone(),
+        template_declared: job.template_declared_role.clone(),
+        source_inferred: resolution
+            .model_type_subdir
+            .clone()
+            .or_else(|| job.model_type.clone()),
+        raw_source_family: resolution.base_model.clone(),
     };
-    let bm_lower = bm.to_ascii_lowercase();
-    // Known video model base_model prefixes on CivitAI.
-    bm_lower.starts_with("ltxv")
-        || bm_lower.starts_with("cogvideo")
-        || bm_lower.starts_with("wan")
-        || bm_lower.starts_with("mochi")
-        || bm_lower.starts_with("hunyuanvideo")
-        || bm_lower.starts_with("hunyuan")
-}
-
-/// Sanitize a string for use as a directory name component.
-/// Strips characters that are unsafe on common filesystems (slashes, null bytes, etc.).
-pub(crate) fn sanitize_dir_name(s: &str) -> String {
-    s.chars()
-        .filter(|c| {
-            !matches!(
-                c,
-                '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
-            )
-        })
-        .collect()
+    let family = crate::placement::FamilyEvidence {
+        user_override: job.family_override.clone(),
+        file_specific: resolution.base_model.clone(),
+        umbrella: None,
+        template_labels: job.template_families.clone(),
+    };
+    (role, family)
 }
 
 fn parse_filename_from_cd(header: &str) -> Option<String> {
@@ -1141,34 +1222,77 @@ mod tests {
         assert_eq!(latest.availability.as_deref(), Some("EarlyAccess"));
     }
 
-    #[test]
-    fn test_is_video_checkpoint_ltxv() {
-        assert!(super::is_video_checkpoint(Some("LTXV 2.3")));
-        assert!(super::is_video_checkpoint(Some("ltxv 2")));
-        assert!(super::is_video_checkpoint(Some("LTXV")));
+    use super::{DownloadJob, VersionResolution};
+
+    fn job_fixture() -> DownloadJob {
+        DownloadJob {
+            id: uuid::Uuid::new_v4(),
+            url: "https://civitai.com/models/1?modelVersionId=2".to_string(),
+            model_id: Some(1),
+            version_id: Some(2),
+            model_type: None,
+            dest_path: None,
+            status: crate::catalog::JobStatus::Queued,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            error: None,
+            download_reason: crate::catalog::DownloadReason::CliAdd,
+            available_version_id: None,
+            available_version_name: None,
+            last_update_check: None,
+            preferred_file_name: None,
+            sha256: None,
+            role_override: None,
+            template_declared_role: None,
+            template_families: Vec::new(),
+            family_override: None,
+            role_source: None,
+            family: None,
+            raw_family: None,
+            family_source: None,
+        }
+    }
+
+    fn resolution_fixture() -> VersionResolution {
+        VersionResolution {
+            download_url: "https://example.invalid/model.safetensors".to_string(),
+            expected_hash: None,
+            model_type_subdir: Some("checkpoints".to_string()),
+            base_model: Some("Wan2.2".to_string()),
+            filename: Some("model.safetensors".to_string()),
+            model_name: None,
+            preview_image_url: None,
+            preview_nsfw_level: None,
+            model_version: None,
+            model_info: None,
+        }
     }
 
     #[test]
-    fn test_is_video_checkpoint_other_video_models() {
-        assert!(super::is_video_checkpoint(Some("CogVideoX")));
-        assert!(super::is_video_checkpoint(Some("WAN 2.1")));
-        assert!(super::is_video_checkpoint(Some("Wan2.1")));
-        assert!(super::is_video_checkpoint(Some("Mochi 1")));
-        assert!(super::is_video_checkpoint(Some("HunyuanVideo")));
-        assert!(super::is_video_checkpoint(Some("Hunyuan")));
+    fn test_a_template_role_stays_a_declaration_and_source_type_stays_inferred() {
+        let mut job = job_fixture();
+        job.template_declared_role = Some("checkpoints".to_string());
+        let resolution = resolution_fixture();
+
+        let (role, family) = super::placement_evidence(&job, &resolution);
+
+        assert_eq!(role.template_declared.as_deref(), Some("checkpoints"));
+        assert_eq!(role.user_override, None);
+        assert_eq!(role.source_inferred.as_deref(), Some("checkpoints"));
+        assert_eq!(role.raw_source_family.as_deref(), Some("Wan2.2"));
+        assert_eq!(family.file_specific.as_deref(), Some("Wan2.2"));
+        assert_eq!(family.user_override, None);
     }
 
     #[test]
-    fn test_is_video_checkpoint_non_video() {
-        assert!(!super::is_video_checkpoint(Some("Flux.1 D")));
-        assert!(!super::is_video_checkpoint(Some("SDXL 1.0")));
-        assert!(!super::is_video_checkpoint(Some("SD1.5")));
-        assert!(!super::is_video_checkpoint(Some("Pony")));
-        assert!(!super::is_video_checkpoint(Some("Illustrious")));
-    }
+    fn test_user_overrides_reach_the_placement_evidence() {
+        let mut job = job_fixture();
+        job.role_override = Some("diffusion_models".to_string());
+        job.family_override = Some("My Flux Pile".to_string());
 
-    #[test]
-    fn test_is_video_checkpoint_none() {
-        assert!(!super::is_video_checkpoint(None));
+        let (role, family) = super::placement_evidence(&job, &resolution_fixture());
+
+        assert_eq!(role.user_override.as_deref(), Some("diffusion_models"));
+        assert_eq!(family.user_override.as_deref(), Some("My Flux Pile"));
     }
 }
