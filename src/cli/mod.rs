@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use console::{Alignment, Key, Term, measure_text_width, pad_str, style, truncate_str};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use uuid::Uuid;
 
@@ -28,6 +28,10 @@ enum Command {
         url: String,
         #[arg(long)]
         model_type: Option<String>,
+        /// Browsing folder to file this one file under, overriding the label
+        /// derived from source metadata.
+        #[arg(long)]
+        family: Option<String>,
     },
     Status,
     List,
@@ -44,6 +48,26 @@ enum Command {
     ///
     /// Omit KEY to enter it at a hidden prompt; passing it inline leaks the
     /// secret into your shell history. The key can also be piped on stdin.
+    /// Report where the catalog and the models directory disagree.
+    Doctor {
+        /// Collapse duplicate rows and drop dangling ones that other rows
+        /// already account for.
+        #[arg(long)]
+        repair: bool,
+    },
+    /// Inspect the model-family browsing aliases, or merge in the defaults
+    /// shipped with a newer release.
+    Families {
+        /// Show what a merge would change and apply it.
+        #[arg(long)]
+        merge: bool,
+        /// Apply the merge instead of only previewing it.
+        #[arg(long, requires = "merge")]
+        apply: bool,
+        /// Also restore aliases previously removed from the snapshot.
+        #[arg(long, requires = "apply")]
+        restore_removed: bool,
+    },
     SetKey {
         /// The credential value. Omit to type it at a hidden prompt.
         key: Option<String>,
@@ -205,26 +229,7 @@ async fn run_templates(
         return Ok(());
     }
 
-    // Selecting a template takes its whole dependency set — diffusion model,
-    // text encoders, VAE, LoRAs — deduplicated across templates.
-    let mut seen = BTreeSet::new();
-    let mut queue = Vec::new();
-    let mut total_bytes: u64 = 0;
-    for index in &selected {
-        let Some(bundle) = bundles.get(*index) else {
-            continue;
-        };
-        for model in &bundle.models {
-            if !seen.insert(model.url.clone()) {
-                continue;
-            }
-            total_bytes += model.size_bytes.unwrap_or(0);
-            queue.push(QueueItem {
-                url: model.url.clone(),
-                model_type: Some(model.role.clone()),
-            });
-        }
-    }
+    let (queue, total_bytes) = queue_items_for(&bundles, &selected);
 
     println!(
         "\nQueueing {} file(s) from {} template(s), {} to download.",
@@ -254,7 +259,9 @@ fn parse_kind(raw: &str) -> Result<WorkloadKind> {
 
 /// One selectable template rendered as a set of aligned table cells.
 struct PickRow {
+    name: String,
     title: String,
+    description: String,
     kind: &'static str,
     size: String,
     tier: &'static str,
@@ -272,7 +279,9 @@ impl PickRow {
             None => "unknown",
         };
         Self {
+            name: bundle.template.name.clone(),
             title: bundle.template.title.clone(),
+            description: bundle.template.description.clone().unwrap_or_default(),
             kind: kind_label(bundle.template.kind),
             size: format_bytes(bundle.download_bytes),
             tier,
@@ -318,8 +327,35 @@ impl Drop for CursorGuard<'_> {
 /// Scrolling multi-select picker. Nothing is selected by default; returns the
 /// chosen indices, or `None` when the user cancels.
 ///
+/// Return true if every character in `query` appears in `text` in order
+/// (case-insensitive).
+fn fuzzy_match(query: &str, text: &str) -> bool {
+    let t = text.to_lowercase();
+    let mut t_chars = t.chars();
+    for qc in query.chars() {
+        loop {
+            match t_chars.next() {
+                Some(tc) if tc == qc => break,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+/// Return true if `query` fuzzy-matches any searchable field on `row`.
+fn fuzzy_matches(query: &str, row: &PickRow) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let haystacks = [&*row.name, &*row.title, &*row.description, &*row.files];
+    haystacks.iter().any(|hay| fuzzy_match(query, hay))
+}
+
 /// Keys: arrows move, space or `x` toggle the row, `a` toggles select-all,
-/// backspace clears every selection, enter confirms, esc/`q` cancels.
+/// backspace clears every selection, `/` toggles fuzzy search, enter confirms,
+/// esc/`q` cancels.
 fn multi_select(prompt: &str, rows: &[PickRow]) -> Result<Option<Vec<usize>>> {
     let len = rows.len();
     if len == 0 {
@@ -329,8 +365,9 @@ fn multi_select(prompt: &str, rows: &[PickRow]) -> Result<Option<Vec<usize>>> {
     let term = Term::stderr();
     let (term_rows, term_cols) = term.size();
     let cols = term_cols as usize;
-    // Reserve rows for the prompt, key legend, table header, footer and a spare.
-    let page = (term_rows as usize).saturating_sub(5).clamp(1, len);
+    // Reserve rows for the prompt, key legend, table header, possible search
+    // line, footer and a spare.
+    let page = (term_rows as usize).saturating_sub(6).clamp(1, len);
 
     // Column widths, sized to the widest cell (and the heading) in each column.
     let kind_w = rows.iter().map(|r| r.kind.len()).chain([4]).max().unwrap();
@@ -356,10 +393,19 @@ fn multi_select(prompt: &str, rows: &[PickRow]) -> Result<Option<Vec<usize>>> {
     let mut checked = vec![false; len];
     let mut cursor = 0usize;
     let mut offset = 0usize;
+    let mut search_mode = false;
+    let mut query = String::new();
+    let mut filtered_indices: Vec<usize> = (0..len).collect();
+
+    let apply_filter = |query: &str, rows: &[PickRow]| -> Vec<usize> {
+        (0..rows.len())
+            .filter(|&i| fuzzy_matches(query, &rows[i]))
+            .collect()
+    };
 
     term.write_line(&style(prompt).bold().to_string())?;
     term.write_line(
-        &style("  arrows move \u{b7} space/x toggle \u{b7} a select all \u{b7} backspace clear \u{b7} enter confirm \u{b7} esc cancel")
+        &style("  arrows move \u{b7} space/x toggle \u{b7} a select all \u{b7} backspace clear \u{b7} / search \u{b7} enter confirm \u{b7} esc cancel")
             .dim()
             .to_string(),
     )?;
@@ -378,10 +424,19 @@ fn multi_select(prompt: &str, rows: &[PickRow]) -> Result<Option<Vec<usize>>> {
 
     let mut drawn = 0usize;
     loop {
-        if cursor < offset {
-            offset = cursor;
-        } else if cursor >= offset + page {
-            offset = cursor + 1 - page;
+        let filt_len = filtered_indices.len();
+        if filt_len > 0 {
+            if cursor >= filt_len {
+                cursor = filt_len - 1;
+            }
+            if cursor < offset {
+                offset = cursor;
+            } else if cursor >= offset + page {
+                offset = cursor + 1 - page;
+            }
+        } else {
+            cursor = 0;
+            offset = 0;
         }
 
         if drawn > 0 {
@@ -389,77 +444,149 @@ fn multi_select(prompt: &str, rows: &[PickRow]) -> Result<Option<Vec<usize>>> {
         }
         drawn = 0;
 
-        let end = (offset + page).min(len);
-        for (i, row) in rows.iter().enumerate().take(end).skip(offset) {
-            let on_cursor = i == cursor;
-            let pointer = if on_cursor {
-                style('>').cyan().bold().to_string()
-            } else {
-                " ".to_string()
-            };
-            let checkbox = if checked[i] {
-                style("[x]").green().to_string()
-            } else {
-                style("[ ]").dim().to_string()
-            };
-            let title = fit(&row.title, title_w, Alignment::Left);
-            let title = if on_cursor {
-                style(title).bold().to_string()
-            } else {
-                title
-            };
-            let kind = style(pad_str(row.kind, kind_w, Alignment::Left, None))
-                .cyan()
-                .to_string();
-            let size = style(pad_str(&row.size, size_w, Alignment::Right, None))
-                .dim()
-                .to_string();
-            let tier = tier_cell(
-                pad_str(row.tier, tier_w, Alignment::Left, None),
-                row.feasibility,
-            );
-            let files = style(truncate_str(&row.files, files_w, "\u{2026}"))
-                .dim()
-                .to_string();
-            term.write_line(&format!(
-                "{pointer} {checkbox}  {title}  {kind}  {size}  {tier}  {files}"
-            ))?;
+        if filt_len > 0 {
+            for (fi, &orig_i) in filtered_indices.iter().enumerate().skip(offset).take(page) {
+                let row = &rows[orig_i];
+                let on_cursor = fi == cursor;
+                let pointer = if on_cursor {
+                    style('>').cyan().bold().to_string()
+                } else {
+                    " ".to_string()
+                };
+                let checkbox = if checked[orig_i] {
+                    style("[x]").green().to_string()
+                } else {
+                    style("[ ]").dim().to_string()
+                };
+                let title = fit(&row.title, title_w, Alignment::Left);
+                let title = if on_cursor {
+                    style(title).bold().to_string()
+                } else {
+                    title
+                };
+                let kind = style(pad_str(row.kind, kind_w, Alignment::Left, None))
+                    .cyan()
+                    .to_string();
+                let size = style(pad_str(&row.size, size_w, Alignment::Right, None))
+                    .dim()
+                    .to_string();
+                let tier = tier_cell(
+                    pad_str(row.tier, tier_w, Alignment::Left, None),
+                    row.feasibility,
+                );
+                let files = style(truncate_str(&row.files, files_w, "\u{2026}"))
+                    .dim()
+                    .to_string();
+                term.write_line(&format!(
+                    "{pointer} {checkbox}  {title}  {kind}  {size}  {tier}  {files}"
+                ))?;
+                drawn += 1;
+            }
+        } else {
+            term.write_line(&style("  (no matches)").dim().to_string())?;
+            drawn += 1;
+        }
+
+        if search_mode {
+            let search_line = format!("> /{}", query);
+            term.write_line(&style(search_line).cyan().to_string())?;
             drawn += 1;
         }
 
         let nsel = checked.iter().filter(|&&c| c).count();
-        let footer = if len > page {
-            format!(
-                "  {nsel}/{len} selected \u{b7} showing {}-{} of {len}",
-                offset + 1,
-                end
-            )
+        let visible = if filt_len < len {
+            format!("{} of {len} visible", filt_len)
         } else {
-            format!("  {nsel}/{len} selected")
+            String::new()
         };
-        term.write_line(&style(footer).dim().to_string())?;
+        let footer = if len > page {
+            if filt_len > 0 {
+                format!(
+                    "  {nsel}/{len} selected \u{b7} showing {}-{} of {filt_len} {}",
+                    offset + 1,
+                    (offset + page).min(filt_len),
+                    visible,
+                )
+            } else {
+                format!("  {nsel}/{len} selected \u{b7} {visible}")
+            }
+        } else {
+            format!("  {nsel}/{len} selected {visible}")
+        };
+        term.write_line(&style(footer.trim()).dim().to_string())?;
         drawn += 1;
 
         match term.read_key()? {
-            Key::ArrowUp => cursor = if cursor == 0 { len - 1 } else { cursor - 1 },
-            Key::ArrowDown => cursor = (cursor + 1) % len,
-            Key::Char(' ') | Key::Char('x') | Key::Char('X') => checked[cursor] = !checked[cursor],
-            Key::Char('a') | Key::Char('A') => {
+            Key::Char('/') if !search_mode => {
+                search_mode = true;
+                query.clear();
+                filtered_indices = apply_filter(&query, rows);
+                cursor = 0;
+                offset = 0;
+            }
+            Key::Escape => {
+                if search_mode {
+                    search_mode = false;
+                    query.clear();
+                    filtered_indices = apply_filter(&query, rows);
+                    cursor = 0;
+                    offset = 0;
+                } else {
+                    term.clear_last_lines(drawn)?;
+                    return Ok(None);
+                }
+            }
+            Key::Enter => {
+                if search_mode {
+                    search_mode = false;
+                } else {
+                    term.clear_last_lines(drawn)?;
+                    let sel = checked
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &c)| c)
+                        .map(|(i, _)| i)
+                        .collect();
+                    return Ok(Some(sel));
+                }
+            }
+            Key::Backspace => {
+                if search_mode {
+                    query.pop();
+                    filtered_indices = apply_filter(&query, rows);
+                    cursor = 0;
+                    offset = 0;
+                } else {
+                    checked.iter_mut().for_each(|c| *c = false);
+                }
+            }
+            Key::Char(' ') | Key::Char('x') | Key::Char('X') if filt_len > 0 => {
+                let orig_i = filtered_indices[cursor];
+                checked[orig_i] = !checked[orig_i];
+            }
+            Key::Char('a') | Key::Char('A') if !search_mode => {
                 let all = checked.iter().all(|&c| c);
                 checked.iter_mut().for_each(|c| *c = !all);
             }
-            Key::Backspace => checked.iter_mut().for_each(|c| *c = false),
-            Key::Enter => {
-                term.clear_last_lines(drawn)?;
-                let sel = checked
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &c)| c)
-                    .map(|(i, _)| i)
-                    .collect();
-                return Ok(Some(sel));
+            Key::Char(c) if search_mode => {
+                query.push(c);
+                filtered_indices = apply_filter(&query, rows);
+                cursor = 0;
+                offset = 0;
             }
-            Key::Escape | Key::CtrlC | Key::Char('q') => {
+            Key::ArrowUp if filt_len > 0 => {
+                cursor = if cursor == 0 {
+                    filt_len - 1
+                } else {
+                    cursor - 1
+                }
+            }
+            Key::ArrowDown if filt_len > 0 => cursor = (cursor + 1) % filt_len,
+            Key::CtrlC => {
+                term.clear_last_lines(drawn)?;
+                return Ok(None);
+            }
+            Key::Char('q') if !search_mode => {
                 term.clear_last_lines(drawn)?;
                 return Ok(None);
             }
@@ -578,12 +705,136 @@ async fn set_key(key: Option<String>, service: &str) -> Result<()> {
     Ok(())
 }
 
+/// Assemble the queue for the selected templates.
+///
+/// One url in one role is one placement, however many templates ask for it, so
+/// those requests collapse and their sizes are counted once. Every referencing
+/// template's family labels are kept: a file two unrelated families both use
+/// has no single family, and attribution must be able to see that.
+fn queue_items_for(
+    bundles: &[crate::templates::TemplateBundle],
+    selected: &[usize],
+) -> (Vec<QueueItem>, u64) {
+    let mut position: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut queue: Vec<QueueItem> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for index in selected {
+        let Some(bundle) = bundles.get(*index) else {
+            continue;
+        };
+        for model in &bundle.models {
+            let key = (model.url.clone(), model.role.clone());
+            match position.get(&key) {
+                Some(&at) => {
+                    merge_families(
+                        &mut queue[at].template_families,
+                        &bundle.template.model_families,
+                    );
+                }
+                None => {
+                    total_bytes += model.size_bytes.unwrap_or(0);
+                    position.insert(key, queue.len());
+                    let mut template_families = Vec::new();
+                    merge_families(&mut template_families, &bundle.template.model_families);
+                    queue.push(QueueItem {
+                        url: model.url.clone(),
+                        model_type: Some(model.role.clone()),
+                        family: None,
+                        template_families,
+                    });
+                }
+            }
+        }
+    }
+    (queue, total_bytes)
+}
+
+fn merge_families(into: &mut Vec<String>, labels: &[String]) {
+    for label in labels {
+        if !into.contains(label) {
+            into.push(label.clone());
+        }
+    }
+    into.sort();
+}
+
+fn families(merge: bool, apply: bool, restore_removed: bool) -> Result<()> {
+    let mut config = Config::load()?;
+    if !merge {
+        if config.model_families.aliases.is_empty() {
+            println!("No model-family aliases configured.");
+        } else {
+            println!(
+                "Model-family aliases ({}):",
+                Config::config_path().display()
+            );
+            for (source_label, browsing_label) in &config.model_families.aliases {
+                println!("  {source_label} -> {browsing_label}");
+            }
+        }
+        config.model_families.alias_table()?;
+        return Ok(());
+    }
+
+    let plan = config.preview_alias_merge(crate::placement::DEFAULT_FAMILY_ALIASES);
+    if plan.additions.is_empty() && plan.conflicts.is_empty() && plan.previously_removed.is_empty()
+    {
+        println!("Nothing to merge: this release ships no aliases your config lacks.");
+        return Ok(());
+    }
+    if !plan.additions.is_empty() {
+        println!("Additions:");
+        for (source_label, browsing_label) in &plan.additions {
+            println!("  + {source_label} -> {browsing_label}");
+        }
+    }
+    if !plan.conflicts.is_empty() {
+        println!("Conflicts (your value is kept):");
+        for conflict in &plan.conflicts {
+            println!(
+                "  ! {} -> {} (default is {})",
+                conflict.source_label, conflict.user_value, conflict.default_value
+            );
+        }
+    }
+    if !plan.previously_removed.is_empty() {
+        println!("Previously removed (restored only with --restore-removed):");
+        for (source_label, browsing_label) in &plan.previously_removed {
+            println!("  - {source_label} -> {browsing_label}");
+        }
+    }
+    if !apply {
+        println!("\nPreview only. Re-run with --merge --apply to write these changes.");
+        return Ok(());
+    }
+    let restore = if restore_removed {
+        crate::config::RestoreRemoved::Yes
+    } else {
+        crate::config::RestoreRemoved::No
+    };
+    config.apply_alias_merge(&plan, restore);
+    config.model_families.alias_table()?;
+    config.save()?;
+    println!("\nMerged into {}.", Config::config_path().display());
+    Ok(())
+}
+
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // SetKey runs without a daemon connection — it writes to the keyring.
     if let Some(Command::SetKey { key, service }) = cli.command {
         return set_key(key, &service).await;
+    }
+
+    // Aliases live in config.toml, which the CLI owns directly.
+    if let Some(Command::Families {
+        merge,
+        apply,
+        restore_removed,
+    }) = cli.command
+    {
+        return families(merge, apply, restore_removed);
     }
 
     let config = Config::load()?;
@@ -623,10 +874,15 @@ pub async fn run() -> Result<()> {
     }
 
     let is_status = cli.command.is_none() || matches!(cli.command, Some(Command::Status));
+    let is_doctor = matches!(cli.command, Some(Command::Doctor { .. }));
 
     let req = match cli.command {
         None | Some(Command::Status) => Request::GetStatus,
-        Some(Command::Add { url, model_type }) => {
+        Some(Command::Add {
+            url,
+            model_type,
+            family,
+        }) => {
             let preferred = match client
                 .send(&Request::GetVersionInfo { url: url.clone() })
                 .await
@@ -640,8 +896,10 @@ pub async fn run() -> Result<()> {
                 url,
                 model_type,
                 preferred_file_name: preferred,
+                family,
             }
         }
+        Some(Command::Doctor { repair }) => Request::Diagnose { repair },
         Some(Command::List) => Request::ListModels,
         Some(Command::Delete { id }) => Request::DeleteModel {
             id: resolve_model_id(&mut client, &id).await?,
@@ -659,7 +917,9 @@ pub async fn run() -> Result<()> {
             version_id,
         },
         Some(Command::RedownloadMissing { all }) => Request::RedownloadMissing { all },
-        Some(Command::SetKey { .. }) | Some(Command::Templates { .. }) => unreachable!(),
+        Some(Command::SetKey { .. })
+        | Some(Command::Templates { .. })
+        | Some(Command::Families { .. }) => unreachable!(),
     };
 
     let is_updates = matches!(req, Request::ListUpdates);
@@ -670,8 +930,93 @@ pub async fn run() -> Result<()> {
         print_status(&response)?;
     } else if is_updates {
         print_updates(&response)?;
+    } else if is_doctor {
+        print_doctor(&response)?;
     } else {
         println!("{}", serde_json::to_string_pretty(&response)?);
+    }
+    Ok(())
+}
+
+fn print_doctor(response: &Response) -> Result<()> {
+    let data = match response {
+        Response::Ok(data) => data,
+        Response::Err { message } => bail!("daemon error: {message}"),
+    };
+    let empty = Vec::new();
+    let dangling = data["dangling"].as_array().unwrap_or(&empty);
+    let duplicates = data["duplicate_paths"].as_array().unwrap_or(&empty);
+    let untracked = data["untracked"].as_array().unwrap_or(&empty);
+
+    if dangling.is_empty() && duplicates.is_empty() && untracked.is_empty() {
+        println!("Catalog and models directory agree.");
+    }
+
+    if !dangling.is_empty() {
+        println!(
+            "{} catalog entr{} name a file that is not on disk:",
+            dangling.len(),
+            if dangling.len() == 1 { "y" } else { "ies" }
+        );
+        for job in dangling {
+            let id = job["id"].as_str().unwrap_or("?");
+            let path = job["dest_path"].as_str().unwrap_or("?");
+            println!("  {} {}", &id[..8.min(id.len())], path);
+        }
+        println!("  `comfyui-dl redownload-missing --all` would fetch these again.");
+    }
+
+    if !duplicates.is_empty() {
+        println!(
+            "\n{} path(s) named by more than one entry:",
+            duplicates.len()
+        );
+        for pair in duplicates {
+            let path = pair[0].as_str().unwrap_or("?");
+            let count = pair[1].as_u64().unwrap_or(0);
+            println!("  {count} entries -> {path}");
+        }
+    }
+
+    if !untracked.is_empty() {
+        println!("\n{} model file(s) no entry names:", untracked.len());
+        for path in untracked {
+            println!("  {}", path.as_str().unwrap_or("?"));
+        }
+    }
+
+    match &data["repaired"] {
+        serde_json::Value::Null => {
+            if !dangling.is_empty() || !duplicates.is_empty() {
+                println!(
+                    "\nRe-run with --repair to collapse duplicates and drop entries that others already cover."
+                );
+            }
+        }
+        repaired => {
+            println!(
+                "\nRepaired: {} duplicate entr{} collapsed, {} dangling entr{} dropped.",
+                repaired["removed_duplicates"].as_u64().unwrap_or(0),
+                if repaired["removed_duplicates"].as_u64() == Some(1) {
+                    "y"
+                } else {
+                    "ies"
+                },
+                repaired["removed_dangling"].as_u64().unwrap_or(0),
+                if repaired["removed_dangling"].as_u64() == Some(1) {
+                    "y"
+                } else {
+                    "ies"
+                },
+            );
+            if let Some(unresolved) = repaired["unresolved"].as_array().filter(|u| !u.is_empty()) {
+                println!(
+                    "{} entr{} kept: nothing else accounts for that model.",
+                    unresolved.len(),
+                    if unresolved.len() == 1 { "y" } else { "ies" }
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -942,6 +1287,86 @@ fn format_duration(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod comfyui_test_support {
+        use crate::templates::{TemplateBundle, TemplateEntry, TemplateModel};
+        use crate::vram::{VramRequirement, WorkloadKind};
+
+        pub fn bundle(families: &[&str], models: &[(&str, &str)]) -> TemplateBundle {
+            TemplateBundle {
+                template: TemplateEntry {
+                    name: "t".to_string(),
+                    title: "T".to_string(),
+                    description: None,
+                    tags: Vec::new(),
+                    model_families: families.iter().map(|f| (*f).to_string()).collect(),
+                    category: "Image".to_string(),
+                    kind: WorkloadKind::Image,
+                    total_size_bytes: None,
+                    tutorial_url: None,
+                    is_api: false,
+                },
+                models: models
+                    .iter()
+                    .map(|(url, role)| TemplateModel {
+                        file_name: "m.safetensors".to_string(),
+                        url: (*url).to_string(),
+                        role: (*role).to_string(),
+                        size_bytes: Some(10),
+                        sha256: None,
+                    })
+                    .collect(),
+                requirement: VramRequirement::default(),
+                feasibility: None,
+                download_bytes: 10,
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_single_family_template_labels_its_files() {
+        let bundles = vec![comfyui_test_support::bundle(
+            &["Flux.1 D"],
+            &[("https://example.invalid/a.safetensors", "vae")],
+        )];
+
+        let (items, _) = queue_items_for(&bundles, &[0]);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].template_families, vec!["Flux.1 D".to_string()]);
+    }
+
+    #[test]
+    fn test_a_file_shared_by_two_families_carries_both_labels() {
+        let shared = "https://example.invalid/shared_encoder.safetensors";
+        let bundles = vec![
+            comfyui_test_support::bundle(&["Flux.1 D"], &[(shared, "text_encoders")]),
+            comfyui_test_support::bundle(&["SD1.5"], &[(shared, "text_encoders")]),
+        ];
+
+        let (items, bytes) = queue_items_for(&bundles, &[0, 1]);
+
+        assert_eq!(items.len(), 1, "one url in one role is one placement");
+        assert_eq!(
+            items[0].template_families,
+            vec!["Flux.1 D".to_string(), "SD1.5".to_string()],
+            "both templates' labels survive so attribution can abstain"
+        );
+        assert_eq!(bytes, 10, "the shared file is counted once");
+    }
+
+    #[test]
+    fn test_one_file_wanted_in_two_roles_stays_two_items() {
+        let url = "https://example.invalid/m.safetensors";
+        let bundles = vec![comfyui_test_support::bundle(
+            &["Flux.1 D"],
+            &[(url, "vae"), (url, "loras")],
+        )];
+
+        let (items, _) = queue_items_for(&bundles, &[0]);
+
+        assert_eq!(items.len(), 2);
+    }
 
     #[test]
     fn test_format_bytes() {
