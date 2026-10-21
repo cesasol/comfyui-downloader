@@ -31,6 +31,8 @@ configure the daemon — all without requiring root privileges.
 - **Disk space guard** — checks available disk space before starting a download
 - **Desktop notifications** — emits libnotify notifications on download completion, errors, and available updates; progress notifications every 10%
 - **Model management** — list downloaded models, delete models (removes files and catalog entry), and relocate misplaced files during update checks
+- **Inline preview thumbnails** — `comfyui-dl list` prints a readable, paginated table, and on a kitty or iTerm2 terminal draws each model's saved preview beside it (`--json` for scripts,
+  `--images` to control it)
 - **IPC interface** — Unix domain socket with a simple JSON protocol for daemon ↔ CLI communication
 - **CLI client** — `comfyui-dl` command for all daemon interactions
 - **SystemD integration** — ships a `.service` unit file for `systemctl --user`
@@ -258,8 +260,14 @@ comfyui-dl add https://huggingface.co/org/repo/resolve/main/model.safetensors --
 # Show daemon status, active downloads, and free disk space
 comfyui-dl status
 
-# List downloaded models in the catalog
-comfyui-dl list
+# List downloaded models in the catalog (see "Listing Models" below)
+comfyui-dl list                 # first 10 models
+comfyui-dl list --page 2        # the next 10
+comfyui-dl list --per-page 25   # a bigger page
+comfyui-dl list --all           # every model at once
+comfyui-dl list --json          # the raw catalog rows, for scripts
+comfyui-dl list --images never  # table even on a graphics terminal
+comfyui-dl list --images always # coloured half-blocks if no protocol is found
 
 # Check for available updates (flags models, does not auto-download)
 comfyui-dl check-updates
@@ -276,6 +284,47 @@ comfyui-dl cancel <uuid>
 # Delete a model by job ID (removes files and catalog entry)
 comfyui-dl delete <uuid>
 ```
+
+### Listing Models
+
+`comfyui-dl list` prints a table: one row per catalogued model, with the ID
+prefix the `delete` and `cancel` commands accept, the name and version from the
+sidecar metadata, the ComfyUI subdirectory it was filed under, its base model
+and its size.
+
+![comfyui-dl list printing a table of catalogued models](docs/screenshots/list-table.png)
+
+A page holds **10 models** by default. `--page N` steps through them,
+`--per-page N` resizes the page, and `--all` prints the whole catalog.
+
+On a terminal that speaks the **kitty** or **iTerm2** inline-image protocol,
+each model is instead drawn as a card: its preview thumbnail on the left,
+behind a border rule, with a separator between models.
+
+![comfyui-dl list drawing preview thumbnails inline in kitty](docs/screenshots/list-thumbnails.png)
+
+Every thumbnail occupies the same box. Previews are scaled to cover it and
+centre-cropped, so a portrait and a landscape preview come out the same shape
+instead of each sizing its own. A model with no preview, or one whose preview
+file will not decode, gets the pixel-art stand-in above, which keeps the list's
+shape and alignment intact.
+
+Thumbnails are chosen by `--images`:
+
+| `--images` | Behaviour |
+| ---------- | --------- |
+| `auto` (default) | Draw them when stdout is a terminal that announces kitty or iTerm2 support |
+| `never` | Always print the table |
+| `always` | Draw them even on an unidentified terminal, falling back to coloured half-blocks |
+
+Piped output is never a terminal, so `comfyui-dl list | less` and
+`comfyui-dl list > file` always get the plain table and never an escape
+sequence. Previews are scaled down before they are sent, so a long listing does
+not push megabytes of base64 through the terminal.
+
+For scripting, `--json` returns the daemon's raw catalog rows, unpaginated and
+including the placement provenance (`family`, `role_source`,
+`template_families`) that the table does not show.
 
 ### ComfyUI Template Picker
 

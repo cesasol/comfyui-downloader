@@ -51,6 +51,16 @@ bytes = "1"
 libc = "0.2"
 dialoguer = "0.11"
 console = "0.15"
+# Inline terminal images (kitty / iTerm2 graphics protocols)
+viuer = "0.11"
+# Preview decoding for the formats the downloader saves
+image = { version = "0.25", default-features = false, features = [
+    "bmp",
+    "gif",
+    "jpeg",
+    "png",
+    "webp",
+] }
 secret-service = { version = "5.2.0", default-features = false, features = ["rt-async-io-crypto-rust"] }
 
 # Optional system tray support (Linux only)

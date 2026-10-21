@@ -1,15 +1,19 @@
 use crate::config::Config;
-use crate::ipc::protocol::{FileVariantInfo, QueueItem, TemplateListing, VersionInfo};
+use crate::ipc::protocol::{
+    EnrichedModel, FileVariantInfo, QueueItem, TemplateListing, VersionInfo,
+};
 use crate::ipc::{IpcClient, Request, Response};
 use crate::secrets;
 use crate::templates::{TemplateBundle, TemplateFilter};
 use crate::vram::{Feasibility, WorkloadKind};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use console::{Alignment, Key, Term, measure_text_width, pad_str, style, truncate_str};
+use image::DynamicImage;
 use std::collections::BTreeMap;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -34,7 +38,26 @@ enum Command {
         family: Option<String>,
     },
     Status,
-    List,
+    /// List the catalogued models as a table, with preview thumbnails on
+    /// terminals that can draw inline images.
+    List {
+        /// Print the daemon's raw model list as JSON instead of the table.
+        /// Never paginated.
+        #[arg(long)]
+        json: bool,
+        /// When to draw preview thumbnails inline.
+        #[arg(long, value_enum, default_value_t = ImageMode::Auto, value_name = "WHEN")]
+        images: ImageMode,
+        /// Which page to show, counting from 1.
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        page: usize,
+        /// How many models a page holds.
+        #[arg(long, value_name = "N", default_value_t = DEFAULT_PAGE_SIZE)]
+        per_page: usize,
+        /// Show every model at once instead of one page.
+        #[arg(long, conflicts_with_all = ["page", "per_page"])]
+        all: bool,
+    },
     /// Delete a catalogued model by ID (full UUID or unique prefix).
     Delete {
         id: String,
@@ -127,6 +150,489 @@ enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+}
+
+/// When `list` should draw preview thumbnails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ImageMode {
+    /// Draw them when stdout is a terminal that speaks an inline-image
+    /// protocol.
+    Auto,
+    /// Never draw them.
+    Never,
+    /// Draw them even when no support was detected.
+    Always,
+}
+
+/// Cell box every thumbnail occupies. Wide enough to recognise the preview,
+/// short enough that a model still reads as one entry in a long list.
+const THUMB_CELLS_WIDE: u32 = 14;
+const THUMB_CELLS_TALL: u32 = 7;
+
+/// Generous pixel size of one terminal cell, used to scale a preview down
+/// before it is transmitted. The protocols send whole images and let the
+/// terminal shrink them, so a full-resolution preview would put megabytes of
+/// base64 on the wire for a thumbnail a few cells wide.
+const CELL_PIXELS_WIDE: u32 = 10;
+const CELL_PIXELS_TALL: u32 = 20;
+
+/// Columns a card reserves on the left: the thumbnail, a space, the border
+/// rule, and a space before the text.
+const CARD_GUTTER: usize = THUMB_CELLS_WIDE as usize + 3;
+
+const DEFAULT_PAGE_SIZE: usize = 10;
+
+async fn run_list(
+    client: &mut IpcClient,
+    json: bool,
+    images: ImageMode,
+    page: usize,
+    per_page: usize,
+    all: bool,
+) -> Result<()> {
+    // The JSON form stays on `ListModels`: catalog rows carry placement
+    // provenance and template labels that the enriched view drops. It is the
+    // scripting interface, so it is never paginated.
+    if json {
+        let response = client.send(&Request::ListModels).await?;
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
+
+    let data = ok_data(client.send(&Request::ListModelsEnriched).await?)?;
+    let models: Vec<EnrichedModel> =
+        serde_json::from_value(data).context("parsing the enriched model list")?;
+
+    if models.is_empty() {
+        println!("No models downloaded yet. Add one with `comfyui-dl add <url>`.");
+        return Ok(());
+    }
+
+    let rows: Vec<ModelRow> = models.iter().map(ModelRow::from_model).collect();
+    let total: u64 = models.iter().filter_map(|m| m.file_size).sum();
+    let window = Page::of(rows.len(), page, per_page, all)?;
+
+    println!(
+        "{} model{} \u{b7} {}",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" },
+        format_bytes(total)
+    );
+    if let Some(line) = window.caption() {
+        println!("{}", style(line).dim());
+    }
+    println!();
+
+    // Not a terminal means a pipe, where neither image escapes nor a width
+    // guess belong, so nothing is truncated either.
+    let term_width = Term::stdout().size_checked().map(|(_, cols)| cols as usize);
+    let shown = &rows[window.start..window.end];
+
+    match thumbnail_protocol(images) {
+        Some(protocol) => print_model_cards(shown, term_width.unwrap_or(100), protocol),
+        None => {
+            print_model_table(shown, term_width.unwrap_or(usize::MAX));
+            Ok(())
+        }
+    }
+}
+
+/// The slice of the catalog one run prints.
+#[derive(Debug, PartialEq, Eq)]
+struct Page {
+    start: usize,
+    end: usize,
+    total: usize,
+    /// `None` when every model is on show and there is nothing to page through.
+    next_page: Option<usize>,
+}
+
+impl Page {
+    fn of(total: usize, page: usize, per_page: usize, all: bool) -> Result<Self> {
+        if all || per_page == 0 {
+            return Ok(Self {
+                start: 0,
+                end: total,
+                total,
+                next_page: None,
+            });
+        }
+        if page == 0 {
+            bail!("--page counts from 1");
+        }
+        let pages = total.div_ceil(per_page);
+        if page > pages {
+            bail!("--page {page} is past the end; {total} model(s) make {pages} page(s)");
+        }
+        let start = (page - 1) * per_page;
+        let end = (start + per_page).min(total);
+        Ok(Self {
+            start,
+            end,
+            total,
+            next_page: (page < pages).then_some(page + 1),
+        })
+    }
+
+    /// The "showing x-y of n" line, or `None` when the page is the whole list.
+    fn caption(&self) -> Option<String> {
+        if self.start == 0 && self.end == self.total {
+            return None;
+        }
+        let mut caption = format!("showing {}-{} of {}", self.start + 1, self.end, self.total);
+        match self.next_page {
+            Some(next) => caption.push_str(&format!(" \u{b7} --page {next} for the next")),
+            None => caption.push_str(" \u{b7} --all for every model"),
+        }
+        Some(caption)
+    }
+}
+
+/// How a preview gets onto the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageProtocol {
+    Kitty,
+    ITerm,
+    /// Coloured half-blocks. Not a graphics protocol and far coarser, but it
+    /// needs nothing of the terminal beyond ANSI colour.
+    HalfBlocks,
+}
+
+/// Pick the protocol to draw previews with, or `None` to print the table.
+///
+/// Only a terminal that names itself in the environment is ever asked to
+/// answer kitty's graphics handshake: that handshake reads a reply from the
+/// terminal and hangs forever on a tty that stays silent, which is what a
+/// pty with nothing driving it does.
+fn thumbnail_protocol(mode: ImageMode) -> Option<ImageProtocol> {
+    if mode == ImageMode::Never || !std::io::stdout().is_terminal() {
+        return None;
+    }
+    // This check only reads environment variables, so it cannot block.
+    if viuer::is_iterm_supported() {
+        return Some(ImageProtocol::ITerm);
+    }
+    if kitty_announced_itself() && kitty_answered_its_handshake() {
+        return Some(ImageProtocol::Kitty);
+    }
+    // `always` is for a terminal we could not identify. Neither protocol can
+    // be emitted blind -- kitty needs its handshake and an unannounced iTerm
+    // would just print the escape -- so draw the coarse version instead.
+    (mode == ImageMode::Always).then_some(ImageProtocol::HalfBlocks)
+}
+
+/// Whether the environment names a terminal that implements the kitty
+/// graphics protocol, and so will answer its handshake.
+fn kitty_announced_itself() -> bool {
+    announces_kitty(
+        std::env::var_os("KITTY_WINDOW_ID").is_some(),
+        std::env::var("TERM").ok().as_deref(),
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+    )
+}
+
+fn announces_kitty(kitty_window_id: bool, term: Option<&str>, term_program: Option<&str>) -> bool {
+    kitty_window_id
+        || term.is_some_and(|term| term.contains("kitty"))
+        || term_program.is_some_and(|program| program.eq_ignore_ascii_case("ghostty"))
+}
+
+/// A real terminal replies in microseconds, and even a slow link answers well
+/// inside this.
+const KITTY_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Run kitty's handshake under a deadline.
+///
+/// The handshake reads the terminal's reply with no timeout of its own, so a
+/// tty that answers neither it nor the device-attributes query behind it would
+/// wedge the command for good. Running it on a thread we are willing to
+/// abandon bounds that: the query has already been written by the time we stop
+/// waiting, so a stranded thread emits nothing more and ends with the process.
+fn kitty_answered_its_handshake() -> bool {
+    let (answer, wait) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = answer.send(viuer::get_kitty_support() != viuer::KittySupport::None);
+    });
+    wait.recv_timeout(KITTY_HANDSHAKE_TIMEOUT).unwrap_or(false)
+}
+
+/// One catalogued model as plain, unstyled display cells.
+struct ModelRow {
+    id: String,
+    name: String,
+    version: String,
+    model_type: String,
+    base_model: String,
+    size: String,
+    added: String,
+    path: String,
+    preview: Option<PathBuf>,
+}
+
+impl ModelRow {
+    fn from_model(model: &EnrichedModel) -> Self {
+        let id = model.id.to_string();
+        let path = model.dest_path.clone().unwrap_or_default();
+        // Sidecar metadata is the best name; a bare filename beats the URL.
+        let name = model
+            .model_name
+            .clone()
+            .or_else(|| {
+                Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| model.url.clone());
+        Self {
+            id: short_id(&id).to_string(),
+            name,
+            version: model.version_name.clone().unwrap_or_default(),
+            model_type: model
+                .model_type
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            base_model: model.base_model.clone().unwrap_or_default(),
+            size: model.file_size.map(format_bytes).unwrap_or_default(),
+            added: model.created_at.format("%Y-%m-%d").to_string(),
+            path,
+            preview: model.preview_path.as_deref().map(PathBuf::from),
+        }
+    }
+}
+
+/// Widths of the listing table's variable columns, in display columns.
+struct Columns {
+    name: usize,
+    kind: usize,
+    base: usize,
+    size: usize,
+}
+
+/// Size every column to its widest cell, then give the name column whatever
+/// the terminal has left over.
+fn columns_for(rows: &[ModelRow], term_width: usize) -> Columns {
+    let widest = |cell: fn(&ModelRow) -> &str, heading: usize| {
+        rows.iter()
+            .map(|r| measure_text_width(cell(r)))
+            .chain([heading])
+            .max()
+            .unwrap_or(heading)
+    };
+    let kind = widest(|r| &r.model_type, 4);
+    let base = widest(|r| &r.base_model, 4);
+    let size = widest(|r| &r.size, 4);
+    let added = 10;
+    // Fixed chrome: the 8-column id, the date, and the five 2-space gaps.
+    let fixed = 8 + added + kind + base + size + 10;
+    let name = widest(|r| &r.name, 5).min(term_width.saturating_sub(fixed).max(12));
+    Columns {
+        name,
+        kind,
+        base,
+        size,
+    }
+}
+
+fn print_model_table(rows: &[ModelRow], term_width: usize) {
+    let cols = columns_for(rows, term_width);
+    let header = format!(
+        "{}  {}  {}  {}  {}  {}",
+        pad_str("ID", 8, Alignment::Left, None),
+        pad_str("MODEL", cols.name, Alignment::Left, None),
+        pad_str("TYPE", cols.kind, Alignment::Left, None),
+        pad_str("BASE", cols.base, Alignment::Left, None),
+        pad_str("SIZE", cols.size, Alignment::Right, None),
+        "ADDED",
+    );
+    println!("{}", style(header).bold().underlined());
+
+    for row in rows {
+        println!(
+            "{}  {}  {}  {}  {}  {}",
+            style(pad_str(&row.id, 8, Alignment::Left, None)).dim(),
+            fit(&row.name, cols.name, Alignment::Left),
+            style(fit(&row.model_type, cols.kind, Alignment::Left)).cyan(),
+            style(fit(&row.base_model, cols.base, Alignment::Left)).dim(),
+            style(pad_str(&row.size, cols.size, Alignment::Right, None)).dim(),
+            style(&row.added).dim(),
+        );
+    }
+}
+
+/// Print each model as a short block of text with its preview drawn into a
+/// reserved left gutter, separated by a rule.
+fn print_model_cards(rows: &[ModelRow], term_width: usize, protocol: ImageProtocol) -> Result<()> {
+    let mut stdout = std::io::stdout();
+    let text_width = term_width.saturating_sub(CARD_GUTTER).max(20);
+    let rule = style("\u{2500}".repeat(term_width.min(100)))
+        .dim()
+        .to_string();
+
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 {
+            writeln!(stdout, "{rule}")?;
+        }
+        let thumbnail = row
+            .preview
+            .as_deref()
+            .filter(|path| path.is_file())
+            .and_then(load_thumbnail)
+            // A model with no preview, or one whose file will not decode,
+            // still gets a thumbnail so the list keeps its shape.
+            .unwrap_or_else(missing_preview_art);
+        let lines = card_lines(row, text_width);
+        let height = lines.len().max(THUMB_CELLS_TALL as usize);
+
+        // Reserve the rows first: the text goes down the right of the gutter,
+        // with the border rule standing between the two columns.
+        for offset in 0..height {
+            let border = style('\u{2502}').dim();
+            match lines.get(offset) {
+                Some(line) => writeln!(
+                    stdout,
+                    "{:pad$}{border} {line}",
+                    "",
+                    pad = THUMB_CELLS_WIDE as usize + 1
+                )?,
+                None => writeln!(
+                    stdout,
+                    "{:pad$}{border}",
+                    "",
+                    pad = THUMB_CELLS_WIDE as usize + 1
+                )?,
+            }
+        }
+
+        // Step back over those rows and draw into the empty gutter, then
+        // return to the end of the block.
+        stdout.flush()?;
+        let config = viuer::Config {
+            absolute_offset: false,
+            x: 0,
+            y: -(height as i16),
+            width: Some(THUMB_CELLS_WIDE),
+            height: Some(THUMB_CELLS_TALL),
+            restore_cursor: true,
+            // Pinned, so viuer never probes for a protocol we ruled out.
+            // Both off is what selects its half-block renderer.
+            use_kitty: protocol == ImageProtocol::Kitty,
+            use_iterm: protocol == ImageProtocol::ITerm,
+            ..Default::default()
+        };
+        // A terminal that lied about its support must not abort the list.
+        let _ = viuer::print(&thumbnail, &config);
+        writeln!(stdout)?;
+    }
+    Ok(())
+}
+
+/// The text of one card: name, placement, provenance and location.
+fn card_lines(row: &ModelRow, width: usize) -> Vec<String> {
+    let joined = |parts: [&str; 3]| {
+        parts
+            .iter()
+            .filter(|p| !p.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" \u{b7} ")
+    };
+    let mut lines = vec![
+        style(truncate_str(&row.name, width, "\u{2026}"))
+            .bold()
+            .to_string(),
+        truncate_str(
+            &joined([&row.model_type, &row.base_model, &row.size]),
+            width,
+            "\u{2026}",
+        )
+        .into_owned(),
+    ];
+    if !row.version.is_empty() {
+        lines.push(
+            style(truncate_str(&row.version, width, "\u{2026}"))
+                .dim()
+                .to_string(),
+        );
+    }
+    lines.push(
+        style(truncate_str(
+            &format!("{}  {}", row.id, row.path),
+            width,
+            "\u{2026}",
+        ))
+        .dim()
+        .to_string(),
+    );
+    lines.push(style(format!("added {}", row.added)).dim().to_string());
+    lines
+}
+
+/// Pixel size of the one thumbnail shape every card uses.
+fn thumbnail_pixels() -> (u32, u32) {
+    (
+        THUMB_CELLS_WIDE * CELL_PIXELS_WIDE,
+        THUMB_CELLS_TALL * CELL_PIXELS_TALL,
+    )
+}
+
+/// Decode a preview into that one shape.
+///
+/// Scaled to cover the box and centre-cropped, so previews of any proportion
+/// come out at a single aspect ratio instead of each sizing its own box. The
+/// format is sniffed from the bytes rather than the suffix: a preview's
+/// extension comes from its source URL and can disagree with its content.
+fn load_thumbnail(path: &Path) -> Option<DynamicImage> {
+    let image = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    if image.width() == 0 || image.height() == 0 {
+        return None;
+    }
+    let (wide, tall) = thumbnail_pixels();
+    Some(image.resize_to_fill(wide, tall, image::imageops::FilterType::Triangle))
+}
+
+/// Stand-in drawn when a model has no preview, or its preview will not decode.
+///
+/// One pixel per character, scaled up with nearest-neighbour so it stays
+/// deliberately pixelated rather than looking like a failed photograph.
+#[rustfmt::skip]
+const MISSING_PREVIEW_ART: [&str; 14] = [
+    "##############",
+    "#............#",
+    "#...OO.......#",
+    "#..OOOO......#",
+    "#...OO.......#",
+    "#............#",
+    "#.........m..#",
+    "#........mmm.#",
+    "#...m...mmmmm#",
+    "#..mmm.mmmmmm#",
+    "#.mmmmmmmmmmm#",
+    "#mmmmmmmmmmmm#",
+    "##############",
+    "##############",
+];
+
+fn missing_preview_art() -> DynamicImage {
+    let side = MISSING_PREVIEW_ART.len() as u32;
+    let mut art = image::RgbaImage::new(side, side);
+    for (y, line) in MISSING_PREVIEW_ART.iter().enumerate() {
+        for (x, cell) in line.chars().enumerate() {
+            let colour = match cell {
+                '#' => [88, 92, 104, 255],  // frame
+                'O' => [222, 165, 74, 255], // sun
+                'm' => [78, 124, 116, 255], // hills
+                _ => [38, 42, 52, 255],     // sky
+            };
+            art.put_pixel(x as u32, y as u32, image::Rgba(colour));
+        }
+    }
+    let (wide, tall) = thumbnail_pixels();
+    DynamicImage::ImageRgba8(art).resize_to_fill(wide, tall, image::imageops::FilterType::Nearest)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -889,6 +1395,19 @@ pub async fn run() -> Result<()> {
         .await;
     }
 
+    // `list` renders its own table and may need the enriched listing, so it
+    // does not go through the single request/response path either.
+    if let Some(Command::List {
+        json,
+        images,
+        page,
+        per_page,
+        all,
+    }) = cli.command
+    {
+        return run_list(&mut client, json, images, page, per_page, all).await;
+    }
+
     let is_status = cli.command.is_none() || matches!(cli.command, Some(Command::Status));
     let is_doctor = matches!(cli.command, Some(Command::Doctor { .. }));
 
@@ -916,7 +1435,6 @@ pub async fn run() -> Result<()> {
             }
         }
         Some(Command::Doctor { repair }) => Request::Diagnose { repair },
-        Some(Command::List) => Request::ListModels,
         Some(Command::Delete { id }) => Request::DeleteModel {
             id: resolve_model_id(&mut client, &id).await?,
         },
@@ -935,7 +1453,8 @@ pub async fn run() -> Result<()> {
         Some(Command::RedownloadMissing { all }) => Request::RedownloadMissing { all },
         Some(Command::SetKey { .. })
         | Some(Command::Templates { .. })
-        | Some(Command::Families { .. }) => unreachable!(),
+        | Some(Command::Families { .. })
+        | Some(Command::List { .. }) => unreachable!(),
     };
 
     let is_updates = matches!(req, Request::ListUpdates);
@@ -1404,6 +1923,193 @@ mod tests {
         let (items, _) = queue_items_for(&bundles, &[0]);
 
         assert_eq!(items.len(), 2);
+    }
+
+    fn enriched(name: Option<&str>, dest: Option<&str>) -> EnrichedModel {
+        EnrichedModel {
+            id: Uuid::parse_str("3f2504e0-4f89-41d3-9a0c-0305e82c3301").unwrap(),
+            url: "https://example.invalid/m.safetensors".to_string(),
+            model_id: None,
+            version_id: None,
+            model_type: Some("loras".to_string()),
+            dest_path: dest.map(String::from),
+            created_at: "2026-01-02T03:04:05Z".parse().unwrap(),
+            updated_at: "2026-01-02T03:04:05Z".parse().unwrap(),
+            model_name: name.map(String::from),
+            version_name: None,
+            base_model: Some("Flux.1 D".to_string()),
+            preview_path: None,
+            preview_nsfw_level: None,
+            file_size: Some(2048),
+            sha256: None,
+        }
+    }
+
+    #[test]
+    fn test_a_row_prefers_the_sidecar_name() {
+        let row = ModelRow::from_model(&enriched(Some("Pretty Name"), Some("/m/a.safetensors")));
+
+        assert_eq!(row.name, "Pretty Name");
+        assert_eq!(row.id, "3f2504e0");
+        assert_eq!(row.size, "2 KiB");
+        assert_eq!(row.added, "2026-01-02");
+    }
+
+    #[test]
+    fn test_a_row_without_metadata_falls_back_to_the_filename() {
+        let row = ModelRow::from_model(&enriched(None, Some("/models/loras/a.safetensors")));
+
+        assert_eq!(row.name, "a.safetensors");
+    }
+
+    #[test]
+    fn test_a_row_with_neither_name_nor_path_falls_back_to_the_url() {
+        let row = ModelRow::from_model(&enriched(None, None));
+
+        assert_eq!(row.name, "https://example.invalid/m.safetensors");
+    }
+
+    #[test]
+    fn test_the_name_column_absorbs_the_leftover_width() {
+        let rows = vec![ModelRow::from_model(&enriched(
+            Some("a name that is comfortably long"),
+            Some("/m/a.safetensors"),
+        ))];
+
+        let wide = columns_for(&rows, 200);
+        let narrow = columns_for(&rows, 60);
+
+        assert_eq!(wide.name, "a name that is comfortably long".len());
+        assert!(
+            narrow.name < wide.name,
+            "a narrow terminal must squeeze the name column, got {}",
+            narrow.name
+        );
+        assert_eq!(narrow.kind, "loras".len());
+        assert_eq!(narrow.base, "Flux.1 D".len());
+    }
+
+    #[test]
+    fn test_the_name_column_keeps_a_floor_on_a_tiny_terminal() {
+        let rows = vec![ModelRow::from_model(&enriched(
+            Some("a name that is comfortably long"),
+            None,
+        ))];
+
+        assert_eq!(columns_for(&rows, 1).name, 12);
+    }
+
+    #[test]
+    fn test_the_placeholder_matches_the_one_thumbnail_shape() {
+        let art = missing_preview_art();
+
+        assert_eq!((art.width(), art.height()), thumbnail_pixels());
+    }
+
+    #[test]
+    fn test_the_placeholder_art_is_square_and_fully_specified() {
+        let side = MISSING_PREVIEW_ART.len();
+        for line in MISSING_PREVIEW_ART {
+            assert_eq!(
+                line.chars().count(),
+                side,
+                "every row must be as wide as the art is tall: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_page_defaults_to_the_first_ten() {
+        let page = Page::of(300, 1, DEFAULT_PAGE_SIZE, false).unwrap();
+
+        assert_eq!((page.start, page.end), (0, 10));
+        assert_eq!(page.next_page, Some(2));
+        assert_eq!(
+            page.caption().unwrap(),
+            "showing 1-10 of 300 \u{b7} --page 2 for the next"
+        );
+    }
+
+    #[test]
+    fn test_the_last_page_is_short_and_offers_no_next() {
+        let page = Page::of(25, 3, 10, false).unwrap();
+
+        assert_eq!((page.start, page.end), (20, 25));
+        assert_eq!(page.next_page, None);
+        assert!(page.caption().unwrap().contains("showing 21-25 of 25"));
+    }
+
+    #[test]
+    fn test_all_shows_everything_and_captions_nothing() {
+        let page = Page::of(300, 1, DEFAULT_PAGE_SIZE, true).unwrap();
+
+        assert_eq!((page.start, page.end), (0, 300));
+        assert_eq!(page.caption(), None, "nothing is being paged through");
+    }
+
+    #[test]
+    fn test_a_page_past_the_end_is_refused_with_the_count() {
+        let err = Page::of(25, 4, 10, false).unwrap_err().to_string();
+
+        assert!(err.contains("25 model(s) make 3 page(s)"), "got {err:?}");
+    }
+
+    #[test]
+    fn test_page_zero_is_refused() {
+        assert!(Page::of(25, 0, 10, false).is_err());
+    }
+
+    #[test]
+    fn test_a_catalog_shorter_than_one_page_is_not_captioned() {
+        let page = Page::of(4, 1, 10, false).unwrap();
+
+        assert_eq!((page.start, page.end), (0, 4));
+        assert_eq!(page.caption(), None);
+    }
+
+    #[test]
+    fn test_cards_never_exceed_the_width_they_are_given() {
+        let row = ModelRow::from_model(&enriched(
+            Some("an extremely long model name that would overflow a narrow terminal"),
+            Some("/a/very/deep/models/tree/loras/some-long-file-name.safetensors"),
+        ));
+
+        for line in card_lines(&row, 30) {
+            assert!(
+                measure_text_width(&line) <= 30,
+                "card line overflows: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_never_suppresses_thumbnails_without_probing_the_terminal() {
+        assert_eq!(thumbnail_protocol(ImageMode::Never), None);
+    }
+
+    #[test]
+    fn test_a_piped_run_draws_no_images_even_when_forced() {
+        // Tests capture stdout, so this run is never a terminal.
+        assert_eq!(thumbnail_protocol(ImageMode::Always), None);
+        assert_eq!(thumbnail_protocol(ImageMode::Auto), None);
+    }
+
+    #[test]
+    fn test_an_unremarkable_terminal_is_never_asked_to_answer_the_handshake() {
+        assert!(!announces_kitty(false, Some("xterm-256color"), None));
+        assert!(!announces_kitty(false, Some("screen"), Some("herdr")));
+        assert!(!announces_kitty(false, None, None));
+    }
+
+    #[test]
+    fn test_a_terminal_that_names_itself_kitty_is_probed() {
+        assert!(announces_kitty(false, Some("xterm-kitty"), None));
+        assert!(announces_kitty(true, Some("xterm-256color"), None));
+        assert!(announces_kitty(
+            false,
+            Some("xterm-ghostty"),
+            Some("ghostty")
+        ));
     }
 
     #[test]
