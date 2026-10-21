@@ -20,13 +20,17 @@ The CLI binary does **not** share in-process state with the daemon. It connects 
 
 `daemon::run()` (`src/daemon/mod.rs`):
 
-1. Load `Config` from TOML (`src/config.rs`); immediately re-save it to sync any new fields added since last run.
-2. Open SQLite catalog at `$XDG_DATA_HOME/comfyui-downloader/catalog.db` and run schema migrations.
-3. Construct a `CivitaiClient` wrapping a `reqwest::Client`.
-4. Spawn **scanner task** (`daemon::scanner::run`) — walks existing model files and backfills missing metadata/preview images.
-5. Spawn **queue task** (`daemon::queue::run`) — processes pending download jobs.
-6. Spawn **updater task** (`daemon::updater::run`) — periodically checks for newer model versions.
-7. Bind the Unix socket and enter the IPC accept loop.
+1. Load `Config` from TOML (`src/config.rs`).
+2. Resolve credentials from the Secret Service (`Config::resolve_credentials`), migrating any plaintext ones out of `config.toml`; then re-save the config to sync any new fields added since last run.
+   This runs **before** the IPC socket binds and can block startup on the keyring's unlock prompt, so `comfyui-dl` commands are refused until the prompt is answered or dismissed (see
+   [Credentials](#credentials-srcsecretsrs)).
+3. Open SQLite catalog at `$XDG_DATA_HOME/comfyui-downloader/catalog.db` and run schema migrations.
+4. Construct a `CivitaiClient` wrapping a `reqwest::Client` and the shared credential cache.
+5. Spawn **scanner task** (`daemon::scanner::run`) — walks existing model files and backfills missing metadata/preview images; it blocks until an API key exists, so it is not skipped forever when
+   the daemon outlives the keyring's absence.
+6. Spawn **queue task** (`daemon::queue::run`) — processes pending download jobs.
+7. Spawn **updater task** (`daemon::updater::run`) — periodically checks for newer model versions.
+8. Bind the Unix socket and enter the IPC accept loop.
 
 The three shared resources (`Config`, `Catalog`, `CivitaiClient`) are wrapped in `Arc` and cloned into each task. `Catalog` additionally uses `tokio::sync::Mutex` because the lock is held across
 `.await` points.
@@ -278,13 +282,29 @@ The deprecated `civitai.api_key` and `huggingface.token` fields still deserialis
 Secrets are kept in the freedesktop Secret Service over D-Bus (`org.freedesktop.secrets`: gnome-keyring, KWallet, ...) rather than in `config.toml`. `Store::open` negotiates one encrypted session and
 is reused for every credential; items are addressed by the attributes `application=comfyui-downloader` and `credential=civitai-api-key` / `huggingface-token`, so labels are cosmetic.
 
-`Config::resolve_credentials` runs once at daemon startup and fills `Config::secrets`, a `#[serde(skip)]` field that therefore can never be written back to disk. Resolution order per credential:
+`Config::resolve_credentials` runs once at daemon startup and fills `Config::secrets`, an `Arc<secrets::Cache>` behind `#[serde(skip)]` that therefore can never be written back to disk. It opens the
+store with `Store::open_ready(STARTUP_WAIT)` rather than `Store::open`: the user service starts alongside the graphical session, so the first connection races gnome-keyring-daemon claiming
+`org.freedesktop.secrets` and the login keyring being unlocked. `open_ready` retries the connection with exponential back-off for up to 30 s and asks the Secret Service to unlock the default
+collection, which is what raises the keyring's unlock prompt. The 30 s bounds only the connection retries: the unlock call blocks until the prompt is answered or dismissed, and since
+`resolve_credentials` runs before `IpcServer::bind`, a locked keyring holds up every CLI command until the user responds. Only transient failures are retried: a dismissed prompt
+(`Prompt`/`PromptDisconnected`) or a still-sealed item (`Locked`) ends the wait immediately rather than
+re-raising the prompt the user just declined. A machine with no session bus (no `DBUS_SESSION_BUS_ADDRESS` and no `$XDG_RUNTIME_DIR/bus`) is not waited on, since no provider can appear there.
+Resolution order per credential:
 
 1. keyring item, if present
 2. otherwise the plaintext config field, which is written into the keyring and stripped from `config.toml`
-3. if the Secret Service is unreachable, the plaintext field is used as-is and a warning is logged
+3. if the Secret Service is still unreachable after the wait, the plaintext field is used as-is and a warning is logged
 
-Runtime code never touches the config fields directly; it calls `Config::civitai_api_key()` / `Config::huggingface_token()`, which prefer the resolved secret and treat a blank value as unset.
+The plaintext fallback is seeded into the cache before the keyring is touched, so a credential that could not be read from the keyring keeps working.
+
+`secrets::Cache` is shared (by `Arc`) with `CivitaiClient` and read by `Config::civitai_api_key()` / `Config::huggingface_token()`, which treat a blank value as unset. Because a keyring may only
+become available after startup, whoever needs a credential and finds it missing — `CivitaiClient::get_json`, the pre-flight check in `daemon::downloader::download` (for either host), and
+`daemon::list_templates` — calls `Cache::refresh(REFRESH_WAIT)`, which retries the keyring for up to 5 s and fills every credential still missing. Refreshes are rate-limited to one per minute, so a
+genuinely absent key cannot make every request open a D-Bus session. This is what makes a credential stored with `comfyui-dl set-key` visible to a running daemon without a restart, for the CivitAI
+key and the HuggingFace token alike. The scanner calls it too: it polls `Cache::refresh` on that same one-minute cadence until a key appears, so a daemon that started without one still runs
+its startup scan later instead of never.
+
+Runtime code never touches the config fields directly.
 `comfyui-dl set-key [--service civitai|huggingface] <VALUE>` writes to the keyring without a daemon connection and clears any plaintext leftover.
 
 ---

@@ -7,10 +7,16 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::sleep;
 use tracing::{info, warn};
 
 const MODEL_EXTENSIONS: &[&str] = &["safetensors", "gguf", "pt", "pth", "bin", "ckpt"];
+
+/// How often a scan that is waiting for a key asks the keyring again. Matches
+/// the refresh cooldown, so every poll actually reaches D-Bus.
+const API_KEY_POLL: Duration = Duration::from_secs(60);
 
 /// All subdirectories of the models root that may contain model files.
 /// Must stay in sync with `ModelType::models_subdir` and `models_subdir_for_file`.
@@ -26,10 +32,7 @@ const KNOWN_SUBDIRS: &[&str] = &[
 ];
 
 pub async fn run(config: Arc<Config>, civitai: Arc<CivitaiClient>, catalog: Arc<Mutex<Catalog>>) {
-    if config.civitai_api_key().is_none() {
-        warn!("Skipping startup scan: no CivitAI API key configured");
-        return;
-    }
+    wait_for_api_key(&config).await;
     info!("Scanning models directory for files missing artifacts or not yet tracked in catalog");
     let models_dir = config.paths.models_dir.clone();
     let mut artifacts_updated = 0usize;
@@ -69,6 +72,29 @@ pub async fn run(config: Arc<Config>, civitai: Arc<CivitaiClient>, catalog: Arc<
         "Startup scan complete: artifacts updated for {artifacts_updated} file(s), \
          {catalog_registered} new catalog entries"
     );
+}
+
+/// Blocks the scan until a CivitAI API key is available, asking the keyring
+/// again on a slow cadence.
+///
+/// The scan resolves artifacts by hash through the API, so a daemon that
+/// started before the keyring was ready — or before the first `comfyui-dl
+/// set-key` — must not skip it for the rest of its life. Waiting costs nothing
+/// while the key is genuinely absent: the poll sleeps between attempts, and a
+/// machine with no session bus fails each attempt immediately.
+async fn wait_for_api_key(config: &Config) {
+    if config.civitai_api_key().is_some() {
+        return;
+    }
+    info!("No CivitAI API key yet; the startup scan runs once one is configured");
+    loop {
+        config.refresh_secrets().await;
+        if config.civitai_api_key().is_some() {
+            info!("CivitAI API key available; running the startup scan");
+            return;
+        }
+        sleep(API_KEY_POLL).await;
+    }
 }
 
 fn is_model_file(path: &Path) -> bool {
@@ -274,6 +300,20 @@ async fn compute_sha256(path: PathBuf) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scan must not sit waiting when the key is already in hand: the poll
+    /// would otherwise delay every startup by one interval.
+    #[tokio::test]
+    async fn test_wait_for_api_key_returns_at_once_when_a_key_is_present() {
+        let config = Config::default();
+        config
+            .secrets
+            .set(crate::secrets::Credential::CivitaiApiKey, "key");
+
+        tokio::time::timeout(Duration::from_secs(1), wait_for_api_key(&config))
+            .await
+            .expect("a configured key must not make the scan wait");
+    }
 
     #[test]
     fn test_model_type_from_path_loras() {

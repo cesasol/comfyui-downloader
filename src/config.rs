@@ -1,9 +1,10 @@
 use crate::placement::AliasConfigError;
-use crate::secrets::{ALL_CREDENTIALS, Credential, Store};
+use crate::secrets::{ALL_CREDENTIALS, Cache, Credential, REFRESH_WAIT, STARTUP_WAIT, Store};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -20,18 +21,10 @@ pub struct Config {
     pub gpu: GpuConfig,
     #[serde(default)]
     pub model_families: ModelFamiliesConfig,
-    /// Credentials read from the Secret Service. Never serialised, so they
-    /// cannot leak back into `config.toml`.
+    /// Credentials read from the Secret Service, shared with the HTTP clients.
+    /// Never serialised, so they cannot leak back into `config.toml`.
     #[serde(skip)]
-    pub secrets: ResolvedSecrets,
-}
-
-/// Credentials resolved for this process, keyed by credential rather than by
-/// config section because their storage is the keyring, not the file.
-#[derive(Debug, Clone, Default)]
-pub struct ResolvedSecrets {
-    pub civitai_api_key: Option<String>,
-    pub huggingface_token: Option<String>,
+    pub secrets: Arc<Cache>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -243,33 +236,54 @@ impl Config {
 
     /// The CivitAI API key for this process: the keyring value when resolved,
     /// otherwise the deprecated plaintext field.
-    pub fn civitai_api_key(&self) -> Option<&str> {
-        self.secrets
-            .civitai_api_key
-            .as_deref()
-            .or(self.plaintext(Credential::CivitaiApiKey))
+    pub fn civitai_api_key(&self) -> Option<String> {
+        self.credential(Credential::CivitaiApiKey)
     }
 
     /// The HuggingFace token for this process, resolved like the API key.
-    pub fn huggingface_token(&self) -> Option<&str> {
+    pub fn huggingface_token(&self) -> Option<String> {
+        self.credential(Credential::HuggingfaceToken)
+    }
+
+    /// Asks the keyring again for anything still missing, so a credential that
+    /// appeared after startup is picked up without restarting the daemon.
+    /// Returns whether anything was filled in. Rate-limited by
+    /// [`crate::secrets::Cache`], so calling it on a miss is cheap.
+    pub async fn refresh_secrets(&self) -> bool {
+        self.secrets.refresh(REFRESH_WAIT).await
+    }
+
+    fn credential(&self, cred: Credential) -> Option<String> {
         self.secrets
-            .huggingface_token
-            .as_deref()
-            .or(self.plaintext(Credential::HuggingfaceToken))
+            .get(cred)
+            .or_else(|| self.plaintext(cred).map(str::to_owned))
     }
 
     /// Loads credentials from the Secret Service and moves any plaintext ones
     /// out of `config.toml`.
     ///
     /// A value already in the keyring wins; a value still in the file is
-    /// migrated into the keyring and stripped from disk. If the Secret Service
-    /// is unreachable the plaintext values keep working so downloads do not
-    /// break on a headless machine, and the reason is logged.
+    /// migrated into the keyring and stripped from disk. The store is opened
+    /// with [`STARTUP_WAIT`] grace so a daemon that starts alongside the login
+    /// session does not lose the race against the Secret Service. If the Secret
+    /// Service stays unreachable the plaintext values keep working so downloads
+    /// do not break on a headless machine, and the reason is logged.
     pub async fn resolve_credentials(&mut self) -> Result<()> {
-        let store = match Store::open().await {
+        // Seed the runtime cache with the plaintext fallback first, so a value
+        // still in `config.toml` keeps working even if the keyring never opens.
+        for cred in ALL_CREDENTIALS {
+            if let Some(plaintext) = self.plaintext(cred).map(str::to_owned) {
+                self.secrets.set(cred, &plaintext);
+            }
+        }
+
+        let store = match Store::open_ready(STARTUP_WAIT).await {
             Ok(store) => store,
             Err(e) => {
-                warn!("Secret Service unavailable, using config.toml credentials: {e:#}");
+                warn!(
+                    "Secret Service still unavailable after up to {:?}, using config.toml credentials: {e:#}",
+                    STARTUP_WAIT
+                );
                 return Ok(());
             }
         };
@@ -277,7 +291,7 @@ impl Config {
         let mut stripped = false;
         for cred in ALL_CREDENTIALS {
             let plaintext = self.plaintext(cred).map(str::to_owned);
-            let resolved = match store.get(cred).await {
+            match store.get(cred).await {
                 Ok(Some(secret)) => {
                     if plaintext.is_some() {
                         warn!(
@@ -285,16 +299,15 @@ impl Config {
                             cred.config_field()
                         );
                     }
-                    Some(secret)
+                    self.secrets.set(cred, &secret);
                 }
-                Ok(None) => match plaintext.clone() {
+                Ok(None) => match plaintext {
                     Some(value) => match store.set(cred, &value).await {
                         Ok(()) => {
                             info!(
                                 "Moved {} from config.toml into the keyring",
                                 cred.config_field()
                             );
-                            Some(value)
                         }
                         Err(e) => {
                             warn!(
@@ -313,9 +326,8 @@ impl Config {
                     );
                     continue;
                 }
-            };
+            }
 
-            *self.resolved_mut(cred) = resolved;
             if self.plaintext_mut(cred).take().is_some() {
                 stripped = true;
             }
@@ -352,13 +364,6 @@ impl Config {
         match cred {
             Credential::CivitaiApiKey => &mut self.civitai.api_key,
             Credential::HuggingfaceToken => &mut self.huggingface.token,
-        }
-    }
-
-    fn resolved_mut(&mut self, cred: Credential) -> &mut Option<String> {
-        match cred {
-            Credential::CivitaiApiKey => &mut self.secrets.civitai_api_key,
-            Credential::HuggingfaceToken => &mut self.secrets.huggingface_token,
         }
     }
 }
@@ -408,15 +413,17 @@ mod tests {
     fn test_keyring_credential_wins_over_plaintext() {
         let mut config = Config::default();
         config.civitai.api_key = Some("from-file".into());
-        config.secrets.civitai_api_key = Some("from-keyring".into());
-        assert_eq!(config.civitai_api_key(), Some("from-keyring"));
+        config
+            .secrets
+            .set(Credential::CivitaiApiKey, "from-keyring");
+        assert_eq!(config.civitai_api_key(), Some("from-keyring".to_string()));
     }
 
     #[test]
     fn test_plaintext_credential_is_the_fallback() {
         let mut config = Config::default();
         config.huggingface.token = Some("from-file".into());
-        assert_eq!(config.huggingface_token(), Some("from-file"));
+        assert_eq!(config.huggingface_token(), Some("from-file".to_string()));
     }
 
     #[test]
@@ -626,8 +633,8 @@ vram_bytes = 12000000000
 
     #[test]
     fn test_resolved_credentials_are_not_serialised() {
-        let mut config = Config::default();
-        config.secrets.civitai_api_key = Some("top-secret".into());
+        let config = Config::default();
+        config.secrets.set(Credential::CivitaiApiKey, "top-secret");
         let text = toml::to_string_pretty(&config).unwrap();
         assert!(!text.contains("top-secret"), "config.toml text: {text}");
     }

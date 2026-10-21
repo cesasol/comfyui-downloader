@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Streaming subscription IPC** — the `subscribe` request, its `Frame` snapshot stream, and the daemon event bus that fed the planned terminal UI; `get_status` still reports queue and progress on
   demand
 
+### Fixed
+
+- **Keyring race at login** — the daemon opened the Secret Service once and, if it lost the race against gnome-keyring-daemon claiming `org.freedesktop.secrets`, ran without credentials; it now waits
+  up to 30 s for the service to appear and then asks the keyring to unlock — startup blocks until that prompt is answered or dismissed — and stops retrying as soon as the user dismisses the prompt
+  instead of re-raising it
+- **Credentials appearing after startup** — a credential stored while the daemon is running (for example with `comfyui-dl set-key`, which no longer suggests a restart) is now picked up by the next
+  request that needs it; the resolved credentials are shared with the HTTP clients and re-read from the keyring at most once a minute
+- **Startup scan skipped forever** — the scan bailed out when the daemon had no API key yet (keyring not ready, or none configured), so files already on disk never had their artifacts backfilled; it
+  now waits for the key and runs once one is configured
+
 ## [0.1.0] - 2026-03-26
 
 ### Added

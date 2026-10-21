@@ -1,8 +1,10 @@
 pub mod types;
 
 use crate::civitai::types::{ModelInfo, ModelVersion};
+use crate::secrets::{Cache, Credential, REFRESH_WAIT};
 use anyhow::{Context, Result};
 use reqwest::{Client, StatusCode};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::warn;
@@ -17,13 +19,24 @@ pub struct CivitaiAccessError {
 
 pub struct CivitaiClient {
     http: Client,
-    api_key: Option<String>,
+    /// Shared with the daemon, so a keyring that only became available after
+    /// startup is picked up by the next request instead of needing a restart.
+    secrets: Arc<Cache>,
 }
 
 impl CivitaiClient {
-    pub fn new(api_key: Option<String>) -> Result<Self> {
+    pub fn new(secrets: Arc<Cache>) -> Result<Self> {
         let http = Client::builder().timeout(Duration::from_secs(30)).build()?;
-        Ok(Self { http, api_key })
+        Ok(Self { http, secrets })
+    }
+
+    /// The API key, asking the keyring again once if it is missing.
+    async fn api_key(&self) -> Option<String> {
+        if let Some(key) = self.secrets.get(Credential::CivitaiApiKey) {
+            return Some(key);
+        }
+        self.secrets.refresh(REFRESH_WAIT).await;
+        self.secrets.get(Credential::CivitaiApiKey)
     }
 
     pub async fn get_model(&self, model_id: u64) -> Result<ModelInfo> {
@@ -42,7 +55,7 @@ impl CivitaiClient {
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
-        let key = self.api_key.as_deref().ok_or_else(|| {
+        let key = self.api_key().await.ok_or_else(|| {
             anyhow::anyhow!(
                 "CivitAI API key is not configured (run `comfyui-dl set-key <KEY>` to store it in the keyring)"
             )
@@ -52,7 +65,7 @@ impl CivitaiClient {
             let resp = self
                 .http
                 .get(url)
-                .bearer_auth(key)
+                .bearer_auth(&key)
                 .send()
                 .await
                 .context("sending request")?;

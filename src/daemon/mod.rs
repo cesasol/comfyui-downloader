@@ -71,9 +71,7 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    let civitai = Arc::new(CivitaiClient::new(
-        config.civitai_api_key().map(str::to_owned),
-    )?);
+    let civitai = Arc::new(CivitaiClient::new(config.secrets.clone())?);
     let active: ActiveTasks = Arc::new(Mutex::new(HashMap::new()));
     let progress: ProgressMap = Arc::new(Mutex::new(HashMap::new()));
     let update_wake: Arc<Notify> = Arc::new(Notify::new());
@@ -516,7 +514,12 @@ async fn list_templates(
         .filter(|entry| filter.matches(entry))
         .collect();
 
-    let hf = crate::huggingface::HfClient::new(config.huggingface_token().map(str::to_owned))?;
+    // Gated template repos need a token that may only have reached the keyring
+    // after startup, so ask it once more before resolving bundles without one.
+    if config.huggingface_token().is_none() {
+        config.refresh_secrets().await;
+    }
+    let hf = crate::huggingface::HfClient::new(config.huggingface_token())?;
     let resolved = catalog.bundles(entries, &hf, vram_bytes, refresh).await?;
     let (bundles, hidden_unrunnable) =
         crate::templates::prune_bundles(resolved, include_unrunnable);

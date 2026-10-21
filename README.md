@@ -226,6 +226,16 @@ the daemon moves it into the keyring on the next start and removes it from the
 file. If no Secret Service is reachable (for example on a headless box without
 a keyring daemon), the plaintext fields remain as a fallback.
 
+At startup the daemon waits for the keyring instead of failing on the first
+attempt: the unit starts alongside the login session, so gnome-keyring-daemon
+may not have claimed `org.freedesktop.secrets` yet. It retries the connection
+for up to 30 seconds and, if the keyring is locked, asks to unlock it. That
+prompt is not covered by the limit: startup blocks until it is answered or
+dismissed, and the daemon accepts no CLI connections before then. If the
+keyring is still missing when the daemon needs the key, it asks again on the
+next request that needs it (at most once a minute), so a key stored afterwards
+is picked up without a restart.
+
 ## CLI Usage
 
 ```sh

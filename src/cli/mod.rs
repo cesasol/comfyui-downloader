@@ -701,7 +701,7 @@ async fn set_key(key: Option<String>, service: &str) -> Result<()> {
             Config::config_path().display()
         );
     }
-    println!("Restart the daemon to pick it up.");
+    println!("A running daemon picks it up on its next request that needs it.");
     Ok(())
 }
 

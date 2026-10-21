@@ -305,7 +305,7 @@ async fn resolve_huggingface(
     reference: &crate::huggingface::HfFileRef,
     config: &Config,
 ) -> Result<VersionResolution> {
-    let client = crate::huggingface::HfClient::new(config.huggingface_token().map(str::to_owned))?;
+    let client = crate::huggingface::HfClient::new(config.huggingface_token())?;
     let meta = match client.file_meta(reference).await {
         Ok(meta) => Some(meta),
         Err(e) => {
@@ -367,16 +367,27 @@ pub async fn download(
     progress: ProgressMap,
 ) -> Result<DownloadOutcome> {
     let from_huggingface = crate::huggingface::is_huggingface_url(&job.url);
-    let auth_token: Option<&str> = if from_huggingface {
-        // Public HuggingFace files need no credentials; gated repos need a token.
+    let auth_token: Option<String> = if from_huggingface {
+        // Public HuggingFace files need no credentials; gated repos need a
+        // token that may only have reached the keyring after startup, so ask
+        // it once more before downloading without one.
+        if config.huggingface_token().is_none() {
+            config.refresh_secrets().await;
+        }
         config.huggingface_token()
     } else {
+        // A keyring that was not ready when the daemon started may hold the key
+        // by now, so ask it once more before failing the download.
+        if config.civitai_api_key().is_none() {
+            config.refresh_secrets().await;
+        }
         Some(config.civitai_api_key().ok_or_else(|| {
             anyhow::anyhow!(
                 "CivitAI API key is not configured (run `comfyui-dl set-key <KEY>` to store it in the keyring)"
             )
         })?)
     };
+    let auth_token = auth_token.as_deref();
 
     let resolution = resolve_version(job, civitai, config).await?;
 
