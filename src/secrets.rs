@@ -371,6 +371,85 @@ pub fn non_empty(value: &str) -> Option<String> {
     }
 }
 
+/// Rejects a value that cannot be a credential of this kind, before it reaches
+/// the keyring.
+///
+/// The usual mistake is pasting a whole `config.toml` or JSON line, which wraps
+/// the key in quotes and leaves a trailing comma. That value is stored as-is and
+/// every later request fails with HTTP 401, so name the stray characters.
+pub fn check_format(cred: Credential, value: &str) -> Result<()> {
+    let stray: String = value
+        .chars()
+        .filter(|c| matches!(c, '"' | '\'' | ',' | '=') || c.is_whitespace())
+        .collect();
+    if !stray.is_empty() {
+        anyhow::bail!(
+            "the {} credential contains {stray:?}; paste only the key itself, without quotes, commas or spaces",
+            cred.service_name()
+        );
+    }
+    match cred {
+        Credential::CivitaiApiKey => {
+            if value.len() != 32 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+                anyhow::bail!(
+                    "a CivitAI API key is 32 hexadecimal characters; this one has {} characters",
+                    value.chars().count()
+                );
+            }
+        }
+        Credential::HuggingfaceToken => {
+            let body = value.strip_prefix("hf_").unwrap_or_default();
+            if body.is_empty() || !body.chars().all(|c| c.is_ascii_alphanumeric()) {
+                anyhow::bail!(
+                    "a HuggingFace token starts with `hf_` followed by letters and digits"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What the service said about a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Accepted,
+    /// HTTP 401 or 403: the service does not recognise the credential.
+    Rejected(u16),
+}
+
+/// Asks the service whether it accepts `value`, using an endpoint that only
+/// identifies the caller. An `Err` means the question could not be asked
+/// (offline, timeout, server error), not that the credential is bad.
+pub async fn verify_online(cred: Credential, value: &str) -> Result<Verdict> {
+    let url = match cred {
+        Credential::CivitaiApiKey => "https://civitai.com/api/v1/me",
+        Credential::HuggingfaceToken => "https://huggingface.co/api/whoami-v2",
+    };
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("building the HTTP client")?;
+    let status = http
+        .get(url)
+        .bearer_auth(value)
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "asking {url} whether the {} credential is valid",
+                cred.service_name()
+            )
+        })?
+        .status();
+    match status {
+        s if s.is_success() => Ok(Verdict::Accepted),
+        s @ (reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN) => {
+            Ok(Verdict::Rejected(s.as_u16()))
+        }
+        s => anyhow::bail!("{url} answered HTTP {s}"),
+    }
+}
+
 /// Resolves a `--service` value to a credential.
 pub fn parse_service(name: &str) -> Option<Credential> {
     match name.trim().to_ascii_lowercase().as_str() {
@@ -408,6 +487,33 @@ mod tests {
         );
         assert_eq!(parse_service("hf"), Some(Credential::HuggingfaceToken));
         assert_eq!(parse_service("openai"), None);
+    }
+
+    #[test]
+    fn test_check_format_accepts_a_civitai_key() {
+        assert!(check_format(Credential::CivitaiApiKey, &"aB".repeat(16)).is_ok());
+    }
+
+    #[test]
+    fn test_check_format_names_quotes_and_commas_pasted_from_toml() {
+        let error = check_format(
+            Credential::CivitaiApiKey,
+            &format!("\"{}\",", "a".repeat(32)),
+        )
+        .expect_err("a quoted key must be rejected");
+        assert!(error.to_string().contains("quotes"), "{error}");
+    }
+
+    #[test]
+    fn test_check_format_rejects_a_civitai_key_of_the_wrong_length() {
+        assert!(check_format(Credential::CivitaiApiKey, &"a".repeat(16)).is_err());
+    }
+
+    #[test]
+    fn test_check_format_requires_the_huggingface_prefix() {
+        assert!(check_format(Credential::HuggingfaceToken, "hf_AbC123").is_ok());
+        assert!(check_format(Credential::HuggingfaceToken, "AbC123").is_err());
+        assert!(check_format(Credential::HuggingfaceToken, "hf_").is_err());
     }
 
     #[test]

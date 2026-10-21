@@ -221,6 +221,38 @@ fn untracked_models(
     Ok(untracked)
 }
 
+/// One line per credential describing the value this daemon is using right
+/// now, which can differ from the keyring until the daemon restarts.
+async fn diagnose_credentials(config: &crate::config::Config) -> Vec<serde_json::Value> {
+    use crate::secrets::{ALL_CREDENTIALS, Credential, Verdict, check_format, verify_online};
+    let mut out = Vec::new();
+    for cred in ALL_CREDENTIALS {
+        let value = match cred {
+            Credential::CivitaiApiKey => config.civitai_api_key(),
+            Credential::HuggingfaceToken => config.huggingface_token(),
+        };
+        let (ok, detail) = match value {
+            None => (None, "not configured".to_string()),
+            Some(value) => match check_format(cred, &value) {
+                Err(e) => (Some(false), format!("malformed: {e:#}")),
+                Ok(()) => match verify_online(cred, &value).await {
+                    Ok(Verdict::Accepted) => (Some(true), "accepted".to_string()),
+                    Ok(Verdict::Rejected(status)) => {
+                        (Some(false), format!("rejected (HTTP {status})"))
+                    }
+                    Err(e) => (None, format!("could not verify: {e:#}")),
+                },
+            },
+        };
+        out.push(serde_json::json!({
+            "service": cred.service_name(),
+            "ok": ok,
+            "detail": detail,
+        }));
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_request(
     req: Request,
@@ -413,11 +445,14 @@ async fn handle_request(
                 None
             };
             let untracked = untracked_models(&cat, models_dir).unwrap_or_default();
+            drop(cat);
+            let credentials = diagnose_credentials(&config).await;
             Response::ok(serde_json::json!({
                 "dangling": report.dangling,
                 "duplicate_paths": report.duplicate_paths,
                 "untracked": untracked,
                 "repaired": repaired,
+                "credentials": credentials,
             }))
         }
         Request::GetStatus => {

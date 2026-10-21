@@ -44,11 +44,8 @@ enum Command {
     Cancel {
         id: String,
     },
-    /// Store an API credential in the system keyring (Secret Service).
-    ///
-    /// Omit KEY to enter it at a hidden prompt; passing it inline leaks the
-    /// secret into your shell history. The key can also be piped on stdin.
-    /// Report where the catalog and the models directory disagree.
+    /// Report where the catalog and the models directory disagree, and whether
+    /// the daemon's credentials are accepted.
     Doctor {
         /// Collapse duplicate rows and drop dangling ones that other rows
         /// already account for.
@@ -68,6 +65,11 @@ enum Command {
         #[arg(long, requires = "apply")]
         restore_removed: bool,
     },
+    /// Store an API credential in the system keyring (Secret Service).
+    ///
+    /// Omit KEY to enter it at a hidden prompt; passing it inline leaks the
+    /// secret into your shell history. The key can also be piped on stdin.
+    /// The key is checked against the service before it is stored.
     SetKey {
         /// The credential value. Omit to type it at a hidden prompt.
         key: Option<String>,
@@ -678,6 +680,18 @@ async fn set_key(key: Option<String>, service: &str) -> Result<()> {
         }
     };
     let secret = secrets::non_empty(&raw).context("the credential is empty")?;
+    secrets::check_format(cred, &secret)?;
+    match secrets::verify_online(cred, &secret).await {
+        Ok(secrets::Verdict::Accepted) => {
+            println!("{} accepted the credential.", cred.service_name());
+        }
+        Ok(secrets::Verdict::Rejected(status)) => bail!(
+            "{} rejected the credential (HTTP {status}); it was not stored",
+            cred.service_name()
+        ),
+        // Offline is not proof of a bad key, so store it and say so.
+        Err(e) => eprintln!("warning: could not verify the credential, storing it anyway: {e:#}"),
+    }
 
     let store = secrets::Store::open().await.with_context(|| {
         format!(
@@ -701,7 +715,9 @@ async fn set_key(key: Option<String>, service: &str) -> Result<()> {
             Config::config_path().display()
         );
     }
-    println!("A running daemon picks it up on its next request that needs it.");
+    println!(
+        "A running daemon that had no key picks it up on its next request; one that already had a key needs `systemctl --user restart comfyui-downloader`."
+    );
     Ok(())
 }
 
@@ -982,6 +998,28 @@ fn print_doctor(response: &Response) -> Result<()> {
         println!("\n{} model file(s) no entry names:", untracked.len());
         for path in untracked {
             println!("  {}", path.as_str().unwrap_or("?"));
+        }
+    }
+
+    if let Some(credentials) = data["credentials"].as_array() {
+        println!("\nCredentials in use by the daemon:");
+        for entry in credentials {
+            let mark = match entry["ok"].as_bool() {
+                Some(true) => "ok ",
+                Some(false) => "BAD",
+                None => " - ",
+            };
+            println!(
+                "  [{mark}] {}: {}",
+                entry["service"].as_str().unwrap_or("?"),
+                entry["detail"].as_str().unwrap_or("?")
+            );
+            if entry["ok"].as_bool() == Some(false) {
+                println!(
+                    "        fix with `comfyui-dl set-key --service {}`, then restart the daemon",
+                    entry["service"].as_str().unwrap_or("civitai")
+                );
+            }
         }
     }
 
