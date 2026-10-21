@@ -183,14 +183,9 @@ let catalog = Catalog::open(std::path::Path::new(":memory:")).unwrap();
 - **Types**: `feat`, `fix`, `refactor`, `chore`, `docs`, `test`, `ci`, `perf`.
 - **Language**: English.
 - **Scope**: One logical change per commit. Split unrelated changes into separate commits.
-- **Footer**: Every commit includes attribution trailers:
 
 ```text
 feat: add update checker for tracked models
-
-Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-opencode)
-
-Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
 ```
 
 - Run `cargo fmt` before committing.
